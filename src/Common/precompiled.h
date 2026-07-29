@@ -154,7 +154,7 @@ inline std::string _tr(fmt::format_string<TArgs...> text, TArgs... args)
 
 // manual endian-swapping
 
-#if _MSC_VER
+#if defined(_MSC_VER)
 inline uint64 _swapEndianU64(uint64 v)
 {
 	return _byteswap_uint64(v);
@@ -168,6 +168,31 @@ inline uint32 _swapEndianU32(uint32 v)
 inline sint32 _swapEndianS32(sint32 v)
 {
 	return (sint32)_byteswap_ulong((uint32)v);
+}
+
+inline uint16 _swapEndianU16(uint16 v)
+{
+	return (v >> 8) | (v << 8);
+}
+
+inline sint16 _swapEndianS16(sint16 v)
+{
+	return (sint16)(((uint16)v >> 8) | ((uint16)v << 8));
+}
+#elif defined(__MINGW32__)
+inline uint64 _swapEndianU64(uint64 v)
+{
+	return __builtin_bswap64(v);
+}
+
+inline uint32 _swapEndianU32(uint32 v)
+{
+	return __builtin_bswap32(v);
+}
+
+inline sint32 _swapEndianS32(sint32 v)
+{
+	return (sint32)__builtin_bswap32((uint32)v);
 }
 
 inline uint16 _swapEndianU16(uint16 v)
@@ -241,6 +266,7 @@ inline uint64 _umul128(uint64 multiplier, uint64 multiplicand, uint64 *highProdu
     return x & 0xFFFFFFFFFFFFFFFF;
 }
 
+#if !BOOST_OS_WINDOWS
 typedef uint8_t BYTE;
 typedef uint32_t DWORD;
 typedef int32_t LONG;
@@ -257,6 +283,7 @@ typedef union _LARGE_INTEGER {
     } u;
     LONGLONG QuadPart;
 } LARGE_INTEGER, *PLARGE_INTEGER;
+#endif
 
 #define DEFINE_ENUM_FLAG_OPERATORS(T)                                                                                                                                            \
     inline T operator~ (T a) { return static_cast<T>( ~static_cast<std::underlying_type<T>::type>(a) ); }                                                                       \
@@ -310,6 +337,8 @@ inline uint64 _udiv128(uint64 highDividend, uint64 lowDividend, uint64 divisor, 
 
 #if defined(_MSC_VER)
     #define DEBUG_BREAK __debugbreak()
+#elif defined(__MINGW32__)
+    #define DEBUG_BREAK __builtin_trap()
 #else
     #include <csignal>
     #define DEBUG_BREAK raise(SIGTRAP) 
@@ -480,7 +509,7 @@ bool match_any_of(T1&& value, Types&&... others)
 // we cache the frequency in a static variable
 [[nodiscard]] static std::chrono::high_resolution_clock::time_point now_cached() noexcept
 {
-#ifdef _WIN32
+#if defined(_WIN32) && !defined(__MINGW32__)
     // get current time
 	static const long long _Freq = _Query_perf_frequency();	// doesn't change after system boot
 	const long long _Ctr = _Query_perf_counter();
@@ -495,7 +524,7 @@ bool match_any_of(T1&& value, Types&&... others)
 
 [[nodiscard]] static std::chrono::steady_clock::time_point tick_cached() noexcept
 {
-#if BOOST_OS_WINDOWS
+#if BOOST_OS_WINDOWS && !defined(__MINGW32__)
     // get current time
 	static const long long _Freq = _Query_perf_frequency();	// doesn't change after system boot
 	const long long _Ctr = _Query_perf_counter();

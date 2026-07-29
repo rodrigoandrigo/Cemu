@@ -1,0 +1,138 @@
+#pragma once
+
+#include "Cafe/HW/Latte/Renderer/Renderer.h"
+
+#include <d3d11_3.h>
+#include <dxgi1_4.h>
+#include <wrl/client.h>
+#include <array>
+#include <unordered_map>
+#include <unordered_set>
+
+class D3D11Renderer final : public Renderer
+{
+public:
+	D3D11Renderer();
+	~D3D11Renderer() override;
+
+	static D3D11Renderer* GetInstance();
+
+	void Initialize() override;
+	void Shutdown() override;
+	bool GetVRAMInfo(int& usageInMB, int& totalInMB) const override;
+	bool IsPadWindowActive() override;
+	void ClearColorbuffer(bool padView) override;
+	void DrawEmptyFrame(bool mainWindow) override;
+	void SwapBuffers(bool swapTV, bool swapDRC) override;
+	void HandleScreenshotRequest(LatteTextureView*, bool) override;
+	void DrawBackbufferQuad(LatteTextureView*, RendererOutputShader*, bool,
+		sint32, sint32, sint32, sint32, bool, bool) override;
+	bool BeginFrame(bool mainWindow) override;
+	void Flush(bool waitIdle) override;
+	void NotifyLatteCommandProcessorIdle() override;
+	bool ImguiBegin(bool mainWindow) override;
+	void ImguiEnd() override;
+	ImTextureID GenerateTexture(const std::vector<uint8>& data, const Vector2i& size) override;
+	void DeleteTexture(ImTextureID id) override;
+	void DeleteFontTextures() override;
+	void AppendOverlayDebugInfo() override;
+
+	void renderTarget_setViewport(float x, float y, float width, float height, float nearZ, float farZ, bool halfZ) override;
+	void renderTarget_setScissor(sint32 x, sint32 y, sint32 width, sint32 height) override;
+	LatteCachedFBO* rendertarget_createCachedFBO(uint64 key) override;
+	void rendertarget_deleteCachedFBO(LatteCachedFBO* fbo) override;
+	void rendertarget_bindFramebufferObject(LatteCachedFBO* fbo) override;
+
+	void* texture_acquireTextureUploadBuffer(uint32 size) override;
+	void texture_releaseTextureUploadBuffer(uint8* mem) override;
+	TextureDecoder* texture_chooseDecodedFormat(Latte::E_GX2SURFFMT format, bool isDepth,
+		Latte::E_DIM dim, uint32 width, uint32 height) override;
+	void texture_clearSlice(LatteTexture*, sint32, sint32) override;
+	void texture_loadSlice(LatteTexture*, sint32, sint32, sint32, void*, sint32, sint32, uint32) override;
+	void texture_clearColorSlice(LatteTexture*, sint32, sint32, float, float, float, float) override;
+	void texture_clearDepthSlice(LatteTexture*, uint32, sint32, bool, bool, float, uint32) override;
+	LatteTexture* texture_createTextureEx(Latte::E_DIM, MPTR, MPTR, Latte::E_GX2SURFFMT,
+		uint32, uint32, uint32, uint32, uint32, uint32, Latte::E_HWTILEMODE, bool) override;
+	void texture_setLatteTexture(LatteTextureView*, uint32) override;
+	void texture_copyImageSubData(LatteTexture*, sint32, sint32, sint32, sint32,
+		LatteTexture*, sint32, sint32, sint32, sint32, sint32, sint32, sint32) override;
+	LatteTextureReadbackInfo* texture_createReadback(LatteTextureView*) override;
+	void surfaceCopy_copySurfaceWithFormatConversion(LatteTexture*, sint32, sint32,
+		LatteTexture*, sint32, sint32, sint32, sint32) override;
+
+	void bufferCache_init(const sint32 size) override;
+	void bufferCache_upload(uint8* buffer, sint32 size, uint32 offset) override;
+	void bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size) override;
+	void bufferCache_copyStreamoutToMainBuffer(uint32 srcOffset, uint32 dstOffset, uint32 size) override;
+	void buffer_bindVertexBuffer(uint32, uint32, uint32) override;
+	void buffer_bindUniformBuffer(LatteConst::ShaderType, uint32, uint32, uint32) override;
+	RendererShader* shader_create(RendererShader::ShaderType, uint64, uint64,
+		const std::string&, bool, bool) override;
+	void streamout_setupXfbBuffer(uint32, sint32, uint32, uint32) override;
+	void streamout_begin() override;
+	void streamout_rendererFinishDrawcall() override;
+	void draw_beginSequence() override;
+	void draw_execute(uint32, uint32, uint32, uint32, MPTR,
+		Latte::LATTE_VGT_DMA_INDEX_TYPE::E_INDEX_TYPE, const LatteDrawcallContext&) override;
+	void draw_endSequence() override;
+	IndexAllocation indexData_reserveIndexMemory(uint32 size) override;
+	void indexData_releaseIndexMemory(IndexAllocation& allocation) override;
+	void indexData_uploadIndexMemory(IndexAllocation& allocation) override;
+	LatteQueryObject* occlusionQuery_create() override;
+	void occlusionQuery_destroy(LatteQueryObject*) override;
+	void occlusionQuery_flush() override;
+	void occlusionQuery_updateState() override;
+
+	ID3D11Device* GetDevice() const { return m_device.Get(); }
+	ID3D11DeviceContext* GetContext() const { return m_context.Get(); }
+
+private:
+	void RefreshBackBuffer();
+	void InitializePresentationPipeline();
+	void BindActiveShaders();
+	bool HasRequiredShaders() const;
+	void UpdateInputLayout();
+	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance);
+	void ApplyPipelineState();
+	void CheckDebugMessages(const char* scope);
+	ID3D11SamplerState* GetSamplerState(class LatteDecompilerShader* shader, uint32 textureIndex,
+		class LatteTexture* texture);
+	void UnbindTextureHazards();
+
+	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
+	Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
+	Microsoft::WRL::ComPtr<ID3D11DeviceContext1> m_context1;
+	Microsoft::WRL::ComPtr<ID3D11InfoQueue> m_infoQueue;
+	Microsoft::WRL::ComPtr<IDXGISwapChain> m_swapChain;
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_backBuffer;
+	Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_backBufferView;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCache;
+	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutBuffers{};
+	std::vector<uint8> m_bufferCacheShadow;
+	std::vector<uint8> m_uploadBuffer;
+	std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, Latte::GPU_LIMITS::NUM_TEXTURES_PER_STAGE * 3> m_boundTextures{};
+	std::array<UINT, 16> m_vertexOffsets{};
+	std::array<UINT, 16> m_vertexStrides{};
+	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 16> m_vertexBuffers{};
+	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBuffers{};
+	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_uniformVarsBuffers{};
+	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutOffsets{};
+	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
+	bool m_streamoutActive{};
+
+	Microsoft::WRL::ComPtr<ID3D11VertexShader> m_presentVS;
+	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_presentPS;
+	Microsoft::WRL::ComPtr<ID3D11SamplerState> m_presentSampler;
+	Microsoft::WRL::ComPtr<ID3D11SamplerState> m_presentPointSampler;
+	Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_rasterizerState;
+	Microsoft::WRL::ComPtr<ID3D11BlendState> m_blendState;
+	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
+	Microsoft::WRL::ComPtr<ID3D11InputLayout> m_inputLayout;
+	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11SamplerState>> m_samplerCache;
+	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11RasterizerState>> m_rasterizerCache;
+	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11BlendState>> m_blendCache;
+	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> m_depthStencilCache;
+	std::unordered_set<uint32> m_reportedDebugWarnings;
+	uint64 m_inputLayoutKey{};
+	bool m_imguiInitialized{};
+};

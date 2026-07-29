@@ -9,8 +9,10 @@
 #include "input/api/DSU/DSUController.h"
 #include "input/api/GameCube/GameCubeController.h"
 
-#if BOOST_OS_WINDOWS
+#if HAS_XINPUT
 #include "input/api/XInput/XInputController.h"
+#endif
+#if HAS_DIRECTINPUT
 #include "input/api/DirectInput/DirectInputController.h"
 #endif
 

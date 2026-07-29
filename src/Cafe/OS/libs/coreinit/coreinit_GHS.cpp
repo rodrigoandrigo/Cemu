@@ -4,6 +4,10 @@
 #include "Cafe/OS/libs/coreinit/coreinit_Thread.h"
 #include "Cafe/OS/RPL/rpl.h"
 
+#ifdef _iob
+#undef _iob
+#endif
+
 namespace coreinit
 {
 	struct iobbuf

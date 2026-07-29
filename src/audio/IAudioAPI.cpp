@@ -1,8 +1,10 @@
 #include "IAudioAPI.h"
 
-#if BOOST_OS_WINDOWS
+#if BOOST_OS_WINDOWS && defined(HAS_XAUDIO)
 #include "XAudio2API.h"
 #include "XAudio27API.h"
+#endif
+#if BOOST_OS_WINDOWS && defined(HAS_DIRECTAUDIO)
 #include "DirectSoundAPI.h"
 #endif
 #include "config/CemuConfig.h"
@@ -78,11 +80,15 @@ void IAudioAPI::InitializeStatic()
 {
 	s_audioDelay = GetConfig().audio_delay;
 
-#if BOOST_OS_WINDOWS
+#if BOOST_OS_WINDOWS && defined(HAS_DIRECTAUDIO)
 	s_availableApis[DirectSound] = true;
+#endif
+#if BOOST_OS_WINDOWS && defined(HAS_XAUDIO)
 	s_availableApis[XAudio2] = XAudio2API::InitializeStatic();
+	#if defined(HAS_XAUDIO27)
 	if (!s_availableApis[XAudio2]) // don't try to initialize the older lib if the newer version is available
 		s_availableApis[XAudio27] = XAudio27API::InitializeStatic();
+	#endif
 #endif
 #if HAS_CUBEB
 	s_availableApis[Cubeb] = CubebAPI::InitializeStatic();
@@ -110,11 +116,35 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
 
 	auto& config = GetConfig();
 
-	const auto audio_api = (IAudioAPI::AudioAPI)config.audio_api;
+	auto audio_api = (IAudioAPI::AudioAPI)config.audio_api;
 	auto selectedDevice = GetDeviceFromType(type);
 
 	if (selectedDevice.empty())
+	{
+#ifdef CEMU_UWP
+		// The embedded UWP host has a single system-selected render endpoint.
+		// Keep optional outputs disabled, but make an unset TV device resolve
+		// to the XAudio2 default endpoint.
+		if (type == AudioType::TV)
+			selectedDevice = L"default";
+		else
+			return {};
+#else
 		return {};
+#endif
+	}
+
+#ifdef CEMU_UWP
+	// Desktop configurations commonly persist DirectSound (enum value 0).
+	// DirectSound and endpoint enumeration are unavailable in an AppContainer,
+	// so use the supported XAudio 2.8 backend instead.
+	if (!IAudioAPI::IsAudioAPIAvailable(audio_api) &&
+		IAudioAPI::IsAudioAPIAvailable(IAudioAPI::XAudio2))
+	{
+		cemuLog_log(LogType::Force, "UWP audio: selected backend is unavailable; using XAudio 2.8");
+		audio_api = IAudioAPI::XAudio2;
+	}
+#endif
 
 	IAudioAPI::DeviceDescriptionPtr device_description;
 	if (IAudioAPI::IsAudioAPIAvailable(audio_api))
@@ -123,6 +153,15 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
 		const auto it = std::find_if(devices.begin(), devices.end(), [&selectedDevice](const auto& d) { return d->GetIdentifier() == selectedDevice; });
 		if (it != devices.end())
 			device_description = *it;
+#ifdef CEMU_UWP
+		// UWP cannot reopen a desktop endpoint identifier stored in settings.
+		// XAudio2 with an empty native device id follows the OS default route.
+		else if (audio_api == IAudioAPI::XAudio2 && !devices.empty())
+		{
+			cemuLog_log(LogType::Force, "UWP audio: selected endpoint is unavailable; using the system default");
+			device_description = devices.front();
+		}
+#endif
 	}
 	if (!device_description)
 		throw std::runtime_error("failed to find selected device while trying to create audio device");
@@ -140,17 +179,21 @@ AudioAPIPtr IAudioAPI::CreateDevice(AudioAPI api, const DeviceDescriptionPtr& de
 
 	switch (api)
 	{
-#if BOOST_OS_WINDOWS
+#if BOOST_OS_WINDOWS && defined(HAS_DIRECTAUDIO)
 	case DirectSound:
 	{
 		const auto tmp = std::dynamic_pointer_cast<DirectSoundAPI::DirectSoundDeviceDescription>(device);
 		return std::make_unique<DirectSoundAPI>(tmp->GetGUID(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
+#endif
+#if BOOST_OS_WINDOWS && defined(HAS_XAUDIO)
+	#if defined(HAS_XAUDIO27)
 	case XAudio27:
 	{
 		const auto tmp = std::dynamic_pointer_cast<XAudio27API::XAudio27DeviceDescription>(device);
 		return std::make_unique<XAudio27API>(tmp->GetDeviceId(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
+	#endif
 	case XAudio2:
 	{
 		const auto tmp = std::dynamic_pointer_cast<XAudio2API::XAudio2DeviceDescription>(device);
@@ -176,15 +219,19 @@ std::vector<IAudioAPI::DeviceDescriptionPtr> IAudioAPI::GetDevices(AudioAPI api)
 
 	switch (api)
 	{
-#if BOOST_OS_WINDOWS
+#if BOOST_OS_WINDOWS && defined(HAS_DIRECTAUDIO)
 	case DirectSound:
 	{
 		return DirectSoundAPI::GetDevices();
 	}
+#endif
+#if BOOST_OS_WINDOWS && defined(HAS_XAUDIO)
+	#if defined(HAS_XAUDIO27)
 	case XAudio27:
 	{
 		return XAudio27API::GetDevices();
 	}
+	#endif
 	case XAudio2:
 	{
 		return XAudio2API::GetDevices();

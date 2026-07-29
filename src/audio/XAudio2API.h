@@ -1,9 +1,6 @@
 #pragma once
 
-#define DIRECTSOUND_VERSION 0x0800
-#include <mmsystem.h>
 #include <mmreg.h>
-#include <dsound.h>
 #include <wrl/client.h>
 
 #include "IAudioAPI.h"
@@ -31,7 +28,7 @@ public:
 
 	using XAudio2DeviceDescriptionPtr = std::shared_ptr<XAudio2DeviceDescription>;
 
-	AudioAPI GetType() const override { return XAudio27; }
+	AudioAPI GetType() const override { return XAudio2; }
 
 	XAudio2API(std::wstring device_id, uint32 samplerate, uint32 channels, uint32 samples_per_block, uint32 bits_per_sample);
 	~XAudio2API();

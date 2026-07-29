@@ -1,4 +1,6 @@
 add_library(CemuCommon 
+	CemuRuntime.cpp
+	CemuRuntime.h
   betype.h
   cpu_features.cpp
   cpu_features.h
@@ -24,9 +26,16 @@ add_library(CemuCommon
   version.h
 )
 
-set_property(TARGET CemuCommon PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_property(TARGET CemuCommon PROPERTY MSVC_RUNTIME_LIBRARY "${CEMU_MSVC_RUNTIME_LIBRARY}")
 
-if(WIN32)
+if(WIN32 AND CEMU_UWP)
+	target_sources(CemuCommon PRIVATE
+		windows/platform.cpp
+		windows/platform.h
+		windows/FileStream_win32.cpp
+		ExceptionHandler/ExceptionHandler_uwp.cpp
+	)
+elseif(WIN32)
 	target_sources(CemuCommon PRIVATE
 		windows/platform.cpp
 		windows/platform.h

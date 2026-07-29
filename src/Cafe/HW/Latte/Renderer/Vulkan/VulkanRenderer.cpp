@@ -100,11 +100,13 @@ std::vector<VulkanRenderer::DeviceInfo> VulkanRenderer::GetDevices()
         return {};
     }
 	uint32 apiVersion = VK_API_VERSION_1_1;
+#if !defined(CEMU_UWP)
 	if (vkEnumerateInstanceVersion(&apiVersion) != VK_SUCCESS)
 	{
 		if (VK_API_VERSION_MAJOR(apiVersion) < 1 || VK_API_VERSION_MINOR(apiVersion) < 2)
 			apiVersion = VK_API_VERSION_1_1;
 	}
+#endif
 
 	std::vector<DeviceInfo> result;
 
@@ -513,11 +515,13 @@ VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
 	std::vector<const char*> enabledInstanceExtensions = CheckInstanceExtensionSupport(m_featureControl);
 
 	uint32 apiVersion = VK_API_VERSION_1_1;
+#if !defined(CEMU_UWP)
 	if (vkEnumerateInstanceVersion(&apiVersion) != VK_SUCCESS)
 	{
 		if (VK_API_VERSION_MAJOR(apiVersion) < 1 || VK_API_VERSION_MINOR(apiVersion) < 2)
 			apiVersion = VK_API_VERSION_1_1;
 	}
+#endif
 
 	cemuLog_log(LogType::Force, fmt::format("Vulkan instance version: {}.{}", VK_API_VERSION_MAJOR(apiVersion), VK_API_VERSION_MINOR(apiVersion)));
 

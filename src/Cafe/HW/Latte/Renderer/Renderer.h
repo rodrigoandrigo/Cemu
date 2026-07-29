@@ -34,6 +34,7 @@ enum class RendererAPI
 	OpenGL,
 	Vulkan,
 	Metal,
+	D3D11,
 
 	MAX
 };

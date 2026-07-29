@@ -38,6 +38,10 @@
       "name": "glslang",
       "default-features": false
     },
+    {
+      "name": "spirv-cross",
+      "default-features": false
+    },
     "zstd",
     {
       "name": "wxwidgets",

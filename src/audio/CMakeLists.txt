@@ -5,19 +5,31 @@ add_library(CemuAudio
 	IAudioInputAPI.h
 )
 
-set_property(TARGET CemuAudio PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_property(TARGET CemuAudio PROPERTY MSVC_RUNTIME_LIBRARY "${CEMU_MSVC_RUNTIME_LIBRARY}")
 
 cemu_use_precompiled_header(CemuAudio)
 
-if(WIN32)
+if(WIN32 AND ENABLE_DIRECTAUDIO)
 	target_sources(CemuAudio PRIVATE
 		DirectSoundAPI.cpp
 		DirectSoundAPI.h
+	)
+	target_compile_definitions(CemuAudio PRIVATE HAS_DIRECTAUDIO)
+endif()
+
+if(WIN32 AND ENABLE_XAUDIO)
+	target_sources(CemuAudio PRIVATE
 		XAudio2API.cpp
 		XAudio2API.h
-		XAudio27API.cpp
-		XAudio27API.h
 	)
+	if(NOT CEMU_UWP)
+		target_sources(CemuAudio PRIVATE
+			XAudio27API.cpp
+			XAudio27API.h
+		)
+		target_compile_definitions(CemuAudio PRIVATE HAS_XAUDIO27)
+	endif()
+	target_compile_definitions(CemuAudio PRIVATE HAS_XAUDIO)
 endif()
 
 if(ENABLE_CUBEB)

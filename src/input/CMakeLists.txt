@@ -33,7 +33,7 @@ add_library(CemuInput
 	emulated/ClassicController.h
 )
 
-set_property(TARGET CemuInput PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_property(TARGET CemuInput PROPERTY MSVC_RUNTIME_LIBRARY "${CEMU_MSVC_RUNTIME_LIBRARY}")
 
 cemu_use_precompiled_header(CemuInput)
 
@@ -48,20 +48,24 @@ endif()
 
 if(WIN32)
 	# XInput
-	target_sources(CemuInput PRIVATE
-		api/XInput/XInputControllerProvider.cpp
-		api/XInput/XInputControllerProvider.h
-		api/XInput/XInputController.cpp
-		api/XInput/XInputController.h
-	)
+	if(ENABLE_XINPUT)
+		target_sources(CemuInput PRIVATE
+			api/XInput/XInputControllerProvider.cpp
+			api/XInput/XInputControllerProvider.h
+			api/XInput/XInputController.cpp
+			api/XInput/XInputController.h
+		)
+	endif()
 
 	# DirectInput
-	target_sources(CemuInput PRIVATE
-		api/DirectInput/DirectInputControllerProvider.cpp
-		api/DirectInput/DirectInputController.h
-		api/DirectInput/DirectInputControllerProvider.h
-		api/DirectInput/DirectInputController.cpp
-	)
+	if(ENABLE_DIRECTINPUT)
+		target_sources(CemuInput PRIVATE
+			api/DirectInput/DirectInputControllerProvider.cpp
+			api/DirectInput/DirectInputController.h
+			api/DirectInput/DirectInputControllerProvider.h
+			api/DirectInput/DirectInputController.cpp
+		)
+	endif()
 endif()
 
 if (SUPPORTS_WIIMOTE)
@@ -95,7 +99,9 @@ if(ENABLE_SDL)
 		api/SDL/SDLController.h
 		api/SDL/SDLControllerProvider.h
 	)
-	target_link_libraries(CemuInput PRIVATE	SDL3::SDL3)
+	# SDL declarations are exposed through the input-provider headers and are
+	# also reached via InputManager from imgui.
+	target_link_libraries(CemuInput PUBLIC SDL3::SDL3)
 endif()
 
 target_include_directories(CemuInput PUBLIC "../")

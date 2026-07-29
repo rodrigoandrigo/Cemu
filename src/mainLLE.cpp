@@ -2,7 +2,7 @@
 #include "WindowSystem.h"
 #include "Common/FileStream.h"
 
-void CemuCommonInit();
+void CemuCommonInit(bool embedded);
 
 typedef struct  
 {
@@ -31,7 +31,7 @@ void loadPPCBootrom()
 
 void mainEmulatorLLE()
 {
-	CemuCommonInit();
+	CemuCommonInit(false);
 	// memory init
 	memory_initPhysicalLayout();
 	

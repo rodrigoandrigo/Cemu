@@ -70,15 +70,20 @@ enum GraphicAPI
 	kOpenGL = 0,
 	kVulkan,
 	kMetal,
+	kD3D11,
 	COUNT
 };
 
-#if defined(ENABLE_VULKAN)
+#if defined(ENABLE_D3D11)
+constexpr GraphicAPI kDefaultGraphicsAPI = kD3D11;
+#elif defined(ENABLE_VULKAN)
 constexpr GraphicAPI kDefaultGraphicsAPI = kVulkan;
 #elif defined(ENABLE_METAL)
 constexpr GraphicAPI kDefaultGraphicsAPI = kMetal;
 #elif defined(ENABLE_OPENGL)
 constexpr GraphicAPI kDefaultGraphicsAPI = kOpenGL;
+#else
+#error "No graphics API is enabled"
 #endif
 
 enum AudioChannels

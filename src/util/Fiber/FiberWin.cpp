@@ -5,13 +5,21 @@ thread_local Fiber* sCurrentFiber{};
 
 Fiber::Fiber(void(*FiberEntryPoint)(void* userParam), void* userParam, void* privateData) : m_privateData(privateData)
 {
+	#ifdef CEMU_UWP
+	HANDLE fiberHandle = CreateFiberEx(0, 2 * 1024 * 1024, 0, (LPFIBER_START_ROUTINE)FiberEntryPoint, userParam);
+	#else
 	HANDLE fiberHandle = CreateFiber(2 * 1024 * 1024, (LPFIBER_START_ROUTINE)FiberEntryPoint, userParam);
+	#endif
 	this->m_implData = (void*)fiberHandle;
 }
 
 Fiber::Fiber(void* privateData) : m_privateData(privateData)
 {
+	#ifdef CEMU_UWP
+	this->m_implData = (void*)ConvertThreadToFiberEx(nullptr, 0);
+	#else
 	this->m_implData = (void*)ConvertThreadToFiber(nullptr);
+	#endif
 	this->m_stackPtr = nullptr;
 }
 

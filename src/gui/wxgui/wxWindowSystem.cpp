@@ -56,6 +56,39 @@ void WindowSystem::Create()
 #endif
 }
 
+void WindowSystem::SetEmbeddedSurface(void* window, void* canvas, int width, int height, double dpiScale)
+{
+	g_window_info.window_main.backend = WindowHandleInfo::Backend::Windows;
+	g_window_info.window_main.surface = window;
+	g_window_info.canvas_main.backend = WindowHandleInfo::Backend::Windows;
+	g_window_info.canvas_main.surface = canvas ? canvas : window;
+	ResizeEmbeddedSurface(width, height, dpiScale);
+	g_window_info.app_active = true;
+}
+
+void WindowSystem::ResizeEmbeddedSurface(int width, int height, double dpiScale)
+{
+	g_window_info.width = width;
+	g_window_info.height = height;
+	g_window_info.phys_width = width;
+	g_window_info.phys_height = height;
+	g_window_info.dpi_scale = dpiScale > 0.0 ? dpiScale : 1.0;
+}
+
+void WindowSystem::SetEmbeddedPadSurface(void* window, void* canvas, int width, int height, double dpiScale)
+{
+	g_window_info.window_pad.backend = WindowHandleInfo::Backend::Windows;
+	g_window_info.window_pad.surface = window;
+	g_window_info.canvas_pad.backend = WindowHandleInfo::Backend::Windows;
+	g_window_info.canvas_pad.surface = canvas ? canvas : window;
+	g_window_info.pad_width = width;
+	g_window_info.pad_height = height;
+	g_window_info.phys_pad_width = width;
+	g_window_info.phys_pad_height = height;
+	g_window_info.pad_dpi_scale = dpiScale > 0.0 ? dpiScale : 1.0;
+	g_window_info.pad_open = window != nullptr;
+}
+
 void WindowSystem::ShowErrorDialog(std::string_view message, std::string_view title, std::optional<WindowSystem::ErrorCategory> /*errorId*/)
 {
 	wxString caption;

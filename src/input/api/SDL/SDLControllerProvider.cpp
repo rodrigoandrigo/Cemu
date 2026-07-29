@@ -127,7 +127,11 @@ void SDLControllerProvider::InitSDL()
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAM, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_LUNA, "1");
 
-	if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC))
+	Uint32 subsystemFlags = SDL_INIT_GAMEPAD;
+#if !defined(CEMU_UWP)
+	subsystemFlags |= SDL_INIT_HAPTIC;
+#endif
+	if (!SDL_InitSubSystem(subsystemFlags))
 	{
 		throw std::runtime_error(fmt::format("couldn't initialize SDL: {}", SDL_GetError()));
 	}
@@ -141,7 +145,11 @@ void SDLControllerProvider::InitSDL()
 
 void SDLControllerProvider::ShutdownSDL()
 {
-	SDL_QuitSubSystem(SDL_INIT_GAMEPAD | SDL_INIT_HAPTIC);
+	Uint32 subsystemFlags = SDL_INIT_GAMEPAD;
+#if !defined(CEMU_UWP)
+	subsystemFlags |= SDL_INIT_HAPTIC;
+#endif
+	SDL_QuitSubSystem(subsystemFlags);
 }
 
 #if BOOST_OS_MACOS
@@ -289,12 +297,25 @@ void SDLControllerProvider::event_thread()
 	cemu_assert(false);
 #endif
 	SetThreadName("SDL_events");
-	InitSDL();
-	while (s_running.load(std::memory_order_relaxed))
+	try
 	{
-		SDL_Event event{};
-		SDL_WaitEvent(&event);
-		HandleSDLEvent(event);
+		InitSDL();
+		while (s_running.load(std::memory_order_relaxed))
+		{
+			SDL_Event event{};
+			SDL_WaitEvent(&event);
+			HandleSDLEvent(event);
+		}
+		ShutdownSDL();
 	}
-	ShutdownSDL();
+	catch (const std::exception& error)
+	{
+		s_running.store(false, std::memory_order_relaxed);
+		cemuLog_log(LogType::Force, "SDL gamepad initialization failed: {}", error.what());
+	}
+	catch (...)
+	{
+		s_running.store(false, std::memory_order_relaxed);
+		cemuLog_log(LogType::Force, "SDL gamepad initialization failed with an unknown error");
+	}
 }

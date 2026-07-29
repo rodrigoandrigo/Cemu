@@ -99,6 +99,12 @@ namespace WindowSystem
 
 	void Create();
 
+	// Used by embedding hosts. On Windows/UWP these are HWND values supplied by
+	// the host, e.g. acquired from CoreWindow through ICoreWindowInterop.
+	void SetEmbeddedSurface(void* window, void* canvas, int width, int height, double dpiScale);
+	void ResizeEmbeddedSurface(int width, int height, double dpiScale);
+	void SetEmbeddedPadSurface(void* window, void* canvas, int width, int height, double dpiScale);
+
 	WindowInfo& GetWindowInfo();
 
 	void UpdateWindowTitles(bool isIdle, bool isLoading, double fps);

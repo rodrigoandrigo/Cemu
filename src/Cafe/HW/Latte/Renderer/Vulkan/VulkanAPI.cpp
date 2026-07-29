@@ -88,10 +88,17 @@ void VulkanBenchmarkPrintResults()
 
 bool InitializeGlobalVulkan()
 {
-	const auto hmodule = LoadLibraryA("vulkan-1.dll");
-
 	if(g_vulkan_available)
 		return true;
+
+	// vk-sample-uwp-main packages the loader and DZN ICD with the app.  A UWP
+	// process must resolve that loader from its package rather than through the
+	// desktop DLL search path.
+#if defined(CEMU_UWP)
+	const auto hmodule = LoadPackagedLibrary(L"vulkan-1.dll", 0);
+#else
+	const auto hmodule = LoadLibraryA("vulkan-1.dll");
+#endif
 
 	if (hmodule == nullptr)
 	{
@@ -115,6 +122,8 @@ bool InitializeGlobalVulkan()
 
 bool InitializeInstanceVulkan(VkInstance instance)
 {
+	// The loader was opened by InitializeGlobalVulkan. GetModuleHandle is
+	// sufficient here and avoids loading a second copy of the packaged DLL.
 	const auto hmodule = GetModuleHandleA("vulkan-1.dll");
 	if (hmodule == nullptr)
 		return false;

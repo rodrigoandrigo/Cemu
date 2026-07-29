@@ -18,6 +18,7 @@
 #include "config/ActiveSettings.h"
 
 #include "Cafe/CafeSystem.h"
+#include "Common/CemuRuntime.h"
 
 LatteGPUState_t LatteGPUState = {};
 
@@ -119,6 +120,14 @@ int Latte_ThreadEntry()
 	WindowSystem::GetWindowPhysSize(w,h);
 
 	// renderer
+	if (!g_renderer)
+	{
+		cemuLog_log(LogType::Force, "Latte initialization failed: no graphics renderer was created");
+		CemuRuntime::RecordFatalError("The embedded Cemu host did not create a graphics renderer.");
+		sLatteThreadRunning = false;
+		sLatteThreadFinishedInit = true;
+		return -1;
+	}
 	g_renderer->Initialize();
 	RendererOutputShader::InitializeStatic();
 

@@ -44,7 +44,7 @@ extern std::shared_mutex g_mutex;
 
 // forward declarations from main.cpp
 void UnitTests();
-void CemuCommonInit();
+void CemuCommonInit(bool embedded);
 
 void HandlePostUpdate();
 // Translation strings to extract for gettext:
@@ -341,7 +341,7 @@ bool CemuApp::OnInit()
 #if BOOST_OS_MACOS
 	SDLControllerProvider::InitSDL();
 #endif
-	CemuCommonInit();
+	CemuCommonInit(false);
 
 #if BOOST_OS_MACOS
 	m_sdlEventPumpTimer = new wxTimer(this);

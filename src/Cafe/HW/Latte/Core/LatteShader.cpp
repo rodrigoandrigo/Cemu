@@ -15,6 +15,7 @@
 #include "config/ActiveSettings.h"
 #include "Cafe/GameProfile/GameProfile.h"
 #include "util/containers/flat_hash_map.hpp"
+#include "util/containers/robin_hood.h"
 #include "util/helpers/StateHasher.h"
 #ifdef ENABLE_METAL
 #include "Cafe/HW/Latte/Renderer/Metal/LatteToMtl.h"
@@ -349,7 +350,10 @@ void LatteShader_CreateRendererShader(LatteDecompilerShader* shader, bool compil
 	// check if a custom shader is present
 	std::string shaderSrc;
 
-	const std::string* customShaderSrc = GraphicPack2::FindCustomShaderSource(shader->baseHash, shader->auxHash, gpShaderType, g_renderer->GetType() == RendererAPI::Vulkan, g_renderer->GetType() == RendererAPI::Metal);
+	const bool usesSpirvShaderSource = g_renderer->GetType() == RendererAPI::Vulkan ||
+		g_renderer->GetType() == RendererAPI::D3D11;
+	const std::string* customShaderSrc = GraphicPack2::FindCustomShaderSource(shader->baseHash,
+		shader->auxHash, gpShaderType, usesSpirvShaderSource, g_renderer->GetType() == RendererAPI::Metal);
 	if (customShaderSrc)
 	{
 		shaderSrc.assign(*customShaderSrc);
@@ -749,6 +753,7 @@ LatteDecompilerShader* LatteShader_CreateShaderFromDecompilerOutput(LatteDecompi
 		shader->resourceMapping = decompilerOutput.resourceMappingGL;
 		break;
 	case RendererAPI::Vulkan:
+	case RendererAPI::D3D11:
 		shader->resourceMapping = decompilerOutput.resourceMappingVK;
 		break;
 	case RendererAPI::Metal:

@@ -4,6 +4,7 @@
 #include "WindowSystem.h"
 #include "util/MemMapper/MemMapper.h"
 #include "config/ActiveSettings.h"
+#include "Common/CemuRuntime.h"
 
 uint8* memory_base = NULL; // base address of the reserved 4GB space
 uint8* memory_elfCodeArena = NULL;
@@ -93,11 +94,7 @@ void MMURange::mapMem()
 	{
 		std::string errorMsg = _tr("Unable to allocate {} memory", name);
 		WindowSystem::ShowErrorDialog(errorMsg, _tr("Error"));
-		#if BOOST_OS_WINDOWS
-		ExitProcess(-1);
-		#else
-		exit(-1);
-		#endif
+		CemuRuntime::RaiseFatalError(errorMsg);
 	}
 	m_isMapped = true;
 }
@@ -135,7 +132,7 @@ void memory_init()
 		debug_printf("memory_init(): Unable to reserve 4GB of memory\n");
 		debugBreakpoint();
 		WindowSystem::ShowErrorDialog(_tr("Unable to reserve 4GB of memory"), _tr("Error"));
-		exit(-1);
+		CemuRuntime::RaiseFatalError(_tr("Unable to reserve 4GB of memory"));
 	}
 	for (auto& itr : g_mmuRanges)
 	{

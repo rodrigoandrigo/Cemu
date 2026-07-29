@@ -141,7 +141,9 @@ vec3 CubicHermite (vec3 A, vec3 B, vec3 C, vec3 D, float t)
 vec3 BicubicHermiteTexture(vec2 uv, vec4 texelSize)
 {
 	vec2 pixel = uv*texelSize.zw + 0.5;
-	vec2 frac = fract(pixel);
+	// "frac" is an HLSL intrinsic. Avoid using it as a variable name because
+	// this GLSL is also translated to HLSL by the D3D11 backend.
+	vec2 pixelFraction = fract(pixel);
     pixel = floor(pixel) / texelSize.zw - vec2(texelSize.xy/2.0);
 
 	vec4 doubleSize = texelSize*2.0;
@@ -166,12 +168,12 @@ vec3 BicubicHermiteTexture(vec2 uv, vec4 texelSize)
     vec3 C23 = texture(textureSrc, pixel + vec2( texelSize.x , doubleSize.y)).rgb;
     vec3 C33 = texture(textureSrc, pixel + vec2( doubleSize.x, doubleSize.y)).rgb;
 
-    vec3 CP0X = CubicHermite(C00, C10, C20, C30, frac.x);
-    vec3 CP1X = CubicHermite(C01, C11, C21, C31, frac.x);
-    vec3 CP2X = CubicHermite(C02, C12, C22, C32, frac.x);
-    vec3 CP3X = CubicHermite(C03, C13, C23, C33, frac.x);
+    vec3 CP0X = CubicHermite(C00, C10, C20, C30, pixelFraction.x);
+    vec3 CP1X = CubicHermite(C01, C11, C21, C31, pixelFraction.x);
+    vec3 CP2X = CubicHermite(C02, C12, C22, C32, pixelFraction.x);
+    vec3 CP3X = CubicHermite(C03, C13, C23, C33, pixelFraction.x);
 
-    return CubicHermite(CP0X, CP1X, CP2X, CP3X, frac.y);
+    return CubicHermite(CP0X, CP1X, CP2X, CP3X, pixelFraction.y);
 }
 
 void outputShader(){
@@ -494,6 +496,26 @@ void RendererOutputShader::InitializeStatic()
 {
 	switch(g_renderer->GetType())
 	{
+#ifdef ENABLE_D3D11
+	case RendererAPI::D3D11:
+	{
+		// D3D11 translates the common GLSL sources through Vulkan-flavoured
+		// SPIR-V and SPIRV-Cross. Use the Vulkan built-ins (gl_VertexIndex)
+		// instead of the OpenGL-only gl_VertexID variant.
+		std::string vertex_source = GetVulkanVertexSource(false);
+		std::string vertex_source_ud = GetVulkanVertexSource(true);
+
+		s_copy_shader = new RendererOutputShader(vertex_source, s_copy_shader_source);
+		s_copy_shader_ud = new RendererOutputShader(vertex_source_ud, s_copy_shader_source);
+
+		s_bicubic_shader = new RendererOutputShader(vertex_source, s_bicubic_shader_source);
+		s_bicubic_shader_ud = new RendererOutputShader(vertex_source_ud, s_bicubic_shader_source);
+
+		s_hermit_shader = new RendererOutputShader(vertex_source, s_hermite_shader_source);
+		s_hermit_shader_ud = new RendererOutputShader(vertex_source_ud, s_hermite_shader_source);
+		break;
+	}
+#endif
 #ifdef ENABLE_METAL
     case RendererAPI::Metal:
     {

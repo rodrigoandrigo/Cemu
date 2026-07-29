@@ -12,9 +12,12 @@
 #include "XAudio2API.h"
 #include "util/helpers/helpers.h"
 
+#include <system_error>
+
+#ifndef CEMU_UWP
 #include <WbemCli.h>
 #include <OleAuto.h>
-#include <system_error>
+#endif
 
 // guid from mmdeviceapi.h
 static const GUID DEVINTERFACE_AUDIO_RENDER_GUID = { 0xe6327cad, 0xdcec, 0x4949, 0xae, 0x8a, 0x99, 0x1e, 0x97, 0x6a, 0x79, 0xd2 };
@@ -29,12 +32,15 @@ std::vector<XAudio2API::DeviceDescriptionPtr> XAudio2API::s_devices;
 XAudio2API::XAudio2API(std::wstring device_id, uint32 samplerate, uint32 channels, uint32 samples_per_block, uint32 bits_per_sample)
 	: IAudioAPI(samplerate, channels, samples_per_block, bits_per_sample), m_device_id(std::move(device_id))
 {
+	HRESULT hres;
+	#ifdef CEMU_UWP
+	if (FAILED((hres = XAudio2Create(&m_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR))))
+	#else
 	const auto _XAudio2Create = (decltype(&XAudio2Create))GetProcAddress(s_xaudio_dll, "XAudio2Create");
 	if (!_XAudio2Create)
 		throw std::runtime_error("can't find XAudio2Create import");
-
-	HRESULT hres;
 	if (FAILED((hres = _XAudio2Create(&m_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR))))
+	#endif
 		throw std::runtime_error(fmt::format("can't create xaudio device (hres: {:#x})", hres));
 
 
@@ -129,6 +135,10 @@ bool XAudio2API::Stop()
 
 bool XAudio2API::InitializeStatic()
 {
+	#ifdef CEMU_UWP
+	RefreshDevices();
+	return true;
+	#else
 	if (s_xaudio_dll)
 		return true;
 
@@ -154,17 +164,26 @@ bool XAudio2API::InitializeStatic()
 
 		return false;
 	}
+	#endif
 }
 
 void XAudio2API::Destroy()
 {
+	#ifndef CEMU_UWP
 	if (s_xaudio_dll)
 		FreeLibrary(s_xaudio_dll);
+	#endif
 }
 
 const std::vector<XAudio2API::DeviceDescriptionPtr>& XAudio2API::RefreshDevices()
 {
 	s_devices.clear();
+	#ifdef CEMU_UWP
+	// Endpoint selection through WMI is desktop-only. UWP XAudio2 renders to
+	// the default endpoint selected by the host application.
+	s_devices.emplace_back(std::make_shared<XAudio2DeviceDescription>(L"Default XAudio2 device", L""));
+	return s_devices;
+	#else
 
 	try
 	{
@@ -246,6 +265,7 @@ const std::vector<XAudio2API::DeviceDescriptionPtr>& XAudio2API::RefreshDevices(
 
 	CoUninitialize();
 	return s_devices;
+	#endif
 }
 
 bool XAudio2API::FeedBlock(sint16* data)

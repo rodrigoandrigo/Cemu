@@ -110,6 +110,11 @@ GraphicAPI ActiveSettings::GetGraphicsAPI()
 {
 	const GraphicAPI api = g_current_game_profile->GetGraphicsAPI().value_or(GetConfig().graphic_api);
 	std::optional<GraphicAPI> fallbackAPI;
+#ifdef ENABLE_D3D11
+	if (api == kD3D11)
+		return api;
+	fallbackAPI = kD3D11;
+#endif
 #ifdef ENABLE_VULKAN
 	if (g_vulkan_available)
 	{

@@ -64,10 +64,14 @@ add_subdirectory(util)
 add_subdirectory(imgui)
 add_subdirectory(resource)
 
-add_executable(CemuBin
+add_library(CemuBin SHARED
 	main.cpp
 	mainLLE.cpp
+	Cemu/CemuEmbed.cpp
+	Cemu/CemuEmbed.h
 )
+
+target_compile_definitions(CemuBin PRIVATE CEMU_EMBED_BUILD)
 
 cemu_use_precompiled_header(CemuBin)
 
@@ -92,11 +96,11 @@ endif()
 
 string(TIMESTAMP CURRENT_YEAR "%Y" UTC)
 
-set_property(TARGET CemuBin PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-set_property(TARGET CemuBin PROPERTY WIN32_EXECUTABLE $<NOT:$<CONFIG:Debug>>)
+set_property(TARGET CemuBin PROPERTY MSVC_RUNTIME_LIBRARY "${CEMU_MSVC_RUNTIME_LIBRARY}")
 set(OUTPUT_NAME "Cemu_$<LOWER_CASE:$<CONFIG>>")
 
-if (MACOS_BUNDLE)
+get_target_property(CEMU_TARGET_TYPE CemuBin TYPE)
+if (MACOS_BUNDLE AND CEMU_TARGET_TYPE STREQUAL "EXECUTABLE")
 	set_property(TARGET CemuBin PROPERTY MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/resource/MacOSXBundleInfo.plist.in")
 
 	set(RESOURCE_FILES "${CMAKE_SOURCE_DIR}/src/resource/cemu.icns")
@@ -209,6 +213,8 @@ set_target_properties(CemuBin PROPERTIES
 	# multi-configuration generators will add a config subdirectory to RUNTIME_OUTPUT_DIRECTORY if no generator expression is used
 	# to get the same behavior everywhere we append an empty generator expression
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../bin/$<1:>"
+	LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../bin/$<1:>"
+	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../bin/$<1:>"
 	OUTPUT_NAME "${OUTPUT_NAME}"
 )
 
@@ -224,8 +230,25 @@ target_link_libraries(CemuBin PRIVATE
 	CemuConfig
 	CemuGui
 	CemuInput
+	CemuResource
 	CemuUtil
 )
+
+if(MINGW AND NOT CEMU_UWP)
+	target_link_libraries(CemuBin PRIVATE
+		ws2_32
+		winmm
+		opengl32
+	dinput8
+	dxguid
+	ntdll
+	dbghelp
+	)
+endif()
+
+if(CEMU_UWP AND MSVC AND CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
+	target_link_libraries(CemuBin PRIVATE WindowsApp d3d11 dxgi)
+endif()
 
 if(UNIX AND NOT APPLE)
 	# due to nasm output some linkers will make stack executable

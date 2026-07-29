@@ -221,7 +221,7 @@ bool GameProfile::Load(uint64_t title_id)
 		else if (boost::iequals(iniParser.GetCurrentSectionName(), "Graphics"))
 		{
 			gameProfileIntegerOption_t graphicsApi;
-			gameProfile_loadIntegerOption(&iniParser, "graphics_api", &graphicsApi, -1, 0, 1);
+			gameProfile_loadIntegerOption(&iniParser, "graphics_api", &graphicsApi, -1, 0, static_cast<int>(GraphicAPI::COUNT) - 1);
 			if (graphicsApi.value != -1)
 				m_graphics_api = (GraphicAPI)graphicsApi.value;
 

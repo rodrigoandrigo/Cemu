@@ -14,6 +14,7 @@
 #include "Cafe/GraphicPack/GraphicPack2.h"
 #include "util/helpers/SystemException.h"
 #include "Common/cpu_features.h"
+#include "Common/CemuRuntime.h"
 #include "input/InputManager.h"
 #include "Cafe/CafeSystem.h"
 #include "Cafe/TitleList/TitleList.h"
@@ -141,7 +142,7 @@ void LoadMainExecutable()
 		{
 			cemuLog_log(LogType::Force, "Unable to find RPX executable");
 			cemuLog_waitForFlush();
-			cemu_assert(false);
+			CemuRuntime::RaiseFatalError("Unable to find RPX executable");
 		}
 	}
 	// extract and load RPX
@@ -149,9 +150,10 @@ void LoadMainExecutable()
 	uint8* rpxData = fsc_extractFile(_pathToExecutable.c_str(), &rpxSize);
 	if (rpxData == nullptr)
 	{
-		cemuLog_log(LogType::Force, "Failed to load \"{}\"", _pathToExecutable);
+		const auto message = fmt::format("Failed to load \"{}\"", _pathToExecutable);
+		cemuLog_log(LogType::Force, "{}", message);
 		cemuLog_waitForFlush();
-		cemu_assert(false);
+		CemuRuntime::RaiseFatalError(message);
 	}
 	currentUpdatedApplicationHash = generateHashFromRawRPXData(rpxData, rpxSize);
 	// determine if this file is an ELF
@@ -169,10 +171,12 @@ void LoadMainExecutable()
 		applicationRPX = RPLLoader_LoadFromMemory(rpxData, rpxSize, (char*)_pathToExecutable.c_str());
 		if (!applicationRPX)
 		{
-			WindowSystem::ShowErrorDialog(_tr("Failed to run this title because the executable is damaged"));
+			const auto message = _tr("Failed to run this title because the executable is damaged");
+			WindowSystem::ShowErrorDialog(message);
 			cemuLog_createLogFile(false);
 			cemuLog_waitForFlush();
-			exit(0);
+			free(rpxData);
+			CemuRuntime::RaiseFatalError(message, 0);
 		}
 		RPLLoader_SetMainModule(applicationRPX);
 		SetEntryPoint(RPLLoader_GetModuleEntrypoint(applicationRPX));
@@ -496,7 +500,7 @@ namespace CafeSystem
 		#endif
 	}
 
-	#if BOOST_OS_WINDOWS
+	#if BOOST_OS_WINDOWS && !defined(CEMU_UWP)
 	std::string GetWindowsNamedVersion(uint32& buildNumber)
 	{
 		char productName[256];
@@ -544,11 +548,13 @@ namespace CafeSystem
 	{
 		std::string buffer;
 		const char* platform = NULL;
-		#if BOOST_OS_WINDOWS
+		#if BOOST_OS_WINDOWS && !defined(CEMU_UWP)
 		uint32 buildNumber;
 		std::string windowsVersionName = GetWindowsNamedVersion(buildNumber);
 		buffer = fmt::format("{} (Build {})", windowsVersionName, buildNumber);
 		platform = buffer.c_str();
+		#elif BOOST_OS_WINDOWS
+		platform = "Windows UWP";
 		#elif BOOST_OS_LINUX
 		if (getenv ("APPIMAGE"))
 			platform = "Linux (AppImage)";
@@ -906,14 +912,22 @@ namespace CafeSystem
 
 	void _LaunchTitleThread()
 	{
-		for(auto& module : s_iosuModules)
-			module->TitleStart();
-		cemu_initForGame();
-		// enter scheduler
-		if ((ActiveSettings::GetCPUMode() == CPUMode::MulticoreRecompiler || LaunchSettings::ForceMultiCoreInterpreter()) && !LaunchSettings::ForceInterpreter())
-			coreinit::OSSchedulerBegin(3);
-		else
-			coreinit::OSSchedulerBegin(1);
+		try
+		{
+			for(auto& module : s_iosuModules)
+				module->TitleStart();
+			cemu_initForGame();
+			// enter scheduler
+			if ((ActiveSettings::GetCPUMode() == CPUMode::MulticoreRecompiler || LaunchSettings::ForceMultiCoreInterpreter()) && !LaunchSettings::ForceInterpreter())
+				coreinit::OSSchedulerBegin(3);
+			else
+				coreinit::OSSchedulerBegin(1);
+		}
+		catch (const CemuRuntime::FatalError& error)
+		{
+			cemuLog_log(LogType::Force, "Title launch aborted: {}", error.what());
+			ShutdownTitle();
+		}
 	}
 
 	void LaunchForegroundTitle()

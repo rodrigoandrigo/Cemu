@@ -1,6 +1,7 @@
 #include "Common/precompiled.h"
 #include "Cafe/CafeSystem.h"
 #include "ExceptionHandler.h"
+#include "Common/CemuRuntime.h"
 
 #include <Windows.h>
 #include <Dbghelp.h>
@@ -238,9 +239,7 @@ void createCrashlog(EXCEPTION_POINTERS* e, PCONTEXT context)
 		fs::copy_file(ActiveSettings::GetUserDataPath("log.txt"), p, ec);
 	}
 
-	exit(0);
-
-	return;
+	CemuRuntime::RecordFatalError("Cemu encountered an unrecoverable Windows exception. See crashdump/log.txt for details.");
 }
 
 bool logCrashlog;

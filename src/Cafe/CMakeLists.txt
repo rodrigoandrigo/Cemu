@@ -626,7 +626,7 @@ if(CEMU_ARCHITECTURE MATCHES "(aarch64)|(AARCH64)|(arm64)|(ARM64)")
   target_link_libraries(CemuCafe PRIVATE xbyak_aarch64)
 endif()
 
-set_property(TARGET CemuCafe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_property(TARGET CemuCafe PROPERTY MSVC_RUNTIME_LIBRARY "${CEMU_MSVC_RUNTIME_LIBRARY}")
 
 cemu_use_precompiled_header(CemuCafe)
 
@@ -659,6 +659,33 @@ target_link_libraries(CemuCafe PRIVATE
   PUBLIC
   OpenSSL::SSL
 )
+
+# Several Cafe subsystems include InputManager through their public headers.
+# Keep the SDL include usage requirements on the compiling target as well;
+# linking only CemuInput is not possible here because CemuInput itself depends
+# on Cafe-facing interfaces.
+if(ENABLE_SDL)
+  target_link_libraries(CemuCafe PRIVATE SDL3::SDL3)
+endif()
+
+if (ENABLE_D3D11)
+  find_package(spirv_cross_core CONFIG REQUIRED)
+  find_package(spirv_cross_glsl CONFIG REQUIRED)
+  find_package(spirv_cross_hlsl CONFIG REQUIRED)
+  target_sources(CemuCafe PRIVATE
+    HW/Latte/Renderer/D3D11/D3D11Renderer.cpp
+    HW/Latte/Renderer/D3D11/D3D11Renderer.h
+  )
+  target_link_libraries(CemuCafe PRIVATE
+    spirv-cross-core
+    spirv-cross-glsl
+    spirv-cross-hlsl
+    glslang::glslang-default-resource-limits
+    d3d11
+    dxgi
+    d3dcompiler
+  )
+endif()
 
 if (ENABLE_WAYLAND)
 	# PUBLIC because wayland-client.h is included in VulkanAPI.h

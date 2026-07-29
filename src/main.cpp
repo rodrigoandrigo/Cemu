@@ -16,6 +16,7 @@
 
 #include "Common/ExceptionHandler/ExceptionHandler.h"
 #include "Common/cpu_features.h"
+#include "Common/CemuRuntime.h"
 
 #include "util/helpers/helpers.h"
 #include "config/ActiveSettings.h"
@@ -112,8 +113,10 @@ void WindowsInitCwd()
 	#endif
 }
 
-void CemuCommonInit()
+void CemuCommonInit(bool embedded)
 {
+	CemuRuntime::SetEmbeddingMode(embedded);
+	CemuRuntime::ClearFatalError();
 	reconfigureGLDrivers();
 	reconfigureVkDrivers();
 	// crypto init
@@ -122,7 +125,8 @@ void CemuCommonInit()
 	// call this as early as possible because it measures frequency of RDTSC using an asynchronous thread over 3 seconds
 	PPCTimer_init();
 
-	WindowsInitCwd();
+	if (!embedded)
+		WindowsInitCwd();
     ExceptionHandler_Init();
 	// read config
 	GetConfigHandle().Load();
@@ -151,6 +155,10 @@ void CemuCommonInit()
 		CafeSaveList::SetMLCPath(mlcPath);
 		CafeSaveList::Refresh();
 	}
+	// Desktop frontends create their renderer when their wx canvas is created.
+	// The embedded frontend has no canvas, so initialize its native surface now.
+	if (embedded)
+		WindowSystem::Create();
 }
 
 void mainEmulatorLLE();
@@ -237,8 +245,10 @@ void ToolShaderCacheMerger();
 // entrypoint for release builds
 int wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nShowCmd)
 {
+#if !defined(CEMU_UWP)
 	if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE)))
 		cemuLog_log(LogType::Force, "CoInitializeEx() failed");
+#endif
 #ifdef HAS_SDL
 	SDL_SetMainReady();
 #endif
@@ -251,8 +261,10 @@ int wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int
 // entrypoint for debug builds with console
 int main(int argc, char* argv[])
 {
+#if !defined(CEMU_UWP)
 	if (FAILED(CoInitializeEx(nullptr, COINIT_MULTITHREADED | COINIT_DISABLE_OLE1DDE)))
 		cemuLog_log(LogType::Force, "CoInitializeEx() failed");
+#endif
 #ifdef HAS_SDL
 	SDL_SetMainReady();
 #endif

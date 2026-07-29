@@ -1,8 +1,12 @@
 #pragma once
 
 #if BOOST_OS_WINDOWS
+#if HAS_DIRECTINPUT
 #include "input/api/DirectInput/DirectInputControllerProvider.h"
+#endif
+#if HAS_XINPUT
 #include "input/api/XInput/XInputControllerProvider.h"
+#endif
 #endif
 
 #ifdef SUPPORTS_WIIMOTE
