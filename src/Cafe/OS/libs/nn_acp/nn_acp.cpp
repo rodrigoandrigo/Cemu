@@ -10,6 +10,7 @@
 #include <fstream>
 
 #include "config/ActiveSettings.h"
+#include "Cafe/Account/Account.h"
 #include "Cafe/IOSU/legacy/iosu_acp.h"
 #include "Cafe/IOSU/legacy/iosu_ioctl.h"
 
@@ -57,22 +58,39 @@ namespace acp
 
 	ACPStatus ACPMountSaveDir()
 	{
-        cemu_assert_debug(!sSaveDirMounted);
+		if (sSaveDirMounted)
+			return ACPStatus::SUCCESS;
 		uint64 titleId = CafeSystem::GetForegroundTitleId();
 		uint32 high = GetTitleIdHigh(titleId) & (~0xC);
 		uint32 low = GetTitleIdLow(titleId);
 
 		// mount save path
 		const auto mlc = ActiveSettings::GetMlcPath("usr/save/{:08x}/{:08x}/user/", high, low);
-		FSCDeviceHostFS_Mount("/vol/save/", _pathToUtf8(mlc), FSC_PRIORITY_BASE);
+		std::error_code error;
+		fs::create_directories(mlc / "common", error);
+		if (!error)
+			fs::create_directories(mlc / fmt::format("{:08x}", Account::GetCurrentAccount().GetPersistentId()), error);
+		if (error)
+		{
+			cemuLog_log(LogType::Force, "Unable to prepare save directory {}: {}", _pathToUtf8(mlc), error.message());
+			return static_cast<ACPStatus>(1);
+		}
+		if (!FSCDeviceHostFS_Mount("/vol/save/", _pathToUtf8(mlc), FSC_PRIORITY_BASE))
+		{
+			cemuLog_log(LogType::Force, "Unable to mount save directory {}", _pathToUtf8(mlc));
+			return static_cast<ACPStatus>(1);
+		}
+		sSaveDirMounted = true;
 		nnResult mountResult = BUILD_NN_RESULT(NN_RESULT_LEVEL_SUCCESS, NN_RESULT_MODULE_NN_ACP, 0);
 		return _ACPConvertResultToACPStatus(&mountResult);
 	}
 
     ACPStatus ACPUnmountSaveDir()
     {
-        cemu_assert_debug(!sSaveDirMounted);
+		if (!sSaveDirMounted)
+			return ACPStatus::SUCCESS;
         fsc_unmount("/vol/save/", FSC_PRIORITY_BASE);
+		sSaveDirMounted = false;
         return ACPStatus::SUCCESS;
     }
 

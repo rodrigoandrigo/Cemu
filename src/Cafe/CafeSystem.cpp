@@ -38,6 +38,7 @@
 #include "Cafe/IOSU/PDM/iosu_pdm.h"
 #include "Cafe/IOSU/ccr_nfc/iosu_ccr_nfc.h"
 #include "Cafe/IOSU/nn/boss/boss_service.h"
+#include "Cemu/ncrypto/ncrypto.h"
 
 // IOSU initializer functions
 #include "Cafe/IOSU/kernel/iosu_kernel.h"
@@ -610,6 +611,83 @@ namespace CafeSystem
 		iosu::boss::GetModule()
 	};
 
+	bool EnsureDefaultMLCFiles(const fs::path& mlc)
+	{
+		const fs::path directories[] = {
+			mlc,
+			mlc / "sys",
+			mlc / "usr",
+			mlc / "usr/title/00050000",
+			mlc / "usr/title/0005000c",
+			mlc / "usr/title/0005000e",
+			mlc / "usr/save/00050010/1004a000/user/common/db",
+			mlc / "usr/save/00050010/1004a100/user/common/db",
+			mlc / "usr/save/00050010/1004a200/user/common/db",
+			mlc / "sys/title/0005001b/1005c000/content"
+		};
+
+		std::error_code ec;
+		for (const auto& path : directories)
+		{
+			ec.clear();
+			fs::create_directories(path, ec);
+			if (ec)
+			{
+				cemuLog_log(LogType::Force, "Unable to create required MLC directory {}: {}",
+					_pathToUtf8(path), ec.message());
+				return false;
+			}
+		}
+
+		try
+		{
+			const auto langDir = mlc / "sys/title/0005001b/1005c000/content";
+			const auto langFile = langDir / "language.txt";
+			if (!fs::exists(langFile))
+			{
+				std::ofstream file(langFile);
+				if (!file.is_open())
+					return false;
+
+				const char* langStrings[] = { "ja", "en", "fr", "de", "it", "es", "zh", "ko", "nl", "pt", "ru", "zh" };
+				for (const char* lang : langStrings)
+					file << fmt::format(R"("{}",)", lang) << std::endl;
+			}
+
+			const auto countryFile = langDir / "country.txt";
+			if (!fs::exists(countryFile))
+			{
+				std::ofstream file(countryFile);
+				if (!file.is_open())
+					return false;
+
+				for (size_t i = 0; i < NCrypto::GetCountryCount(); i++)
+				{
+					const char* countryCode = NCrypto::GetCountryAsString(i);
+					if (std::string_view(countryCode) == "NN")
+						file << "NULL," << std::endl;
+					else
+						file << fmt::format(R"("{}",)", countryCode) << std::endl;
+				}
+			}
+
+			const auto dummyFile = mlc / "writetestdummy";
+			std::ofstream file(dummyFile);
+			if (!file.is_open())
+				return false;
+			file.close();
+			fs::remove(dummyFile, ec);
+		}
+		catch (const std::exception& ex)
+		{
+			cemuLog_log(LogType::Force, "Unable to prepare the MLC directory {}: {}",
+				_pathToUtf8(mlc), ex.what());
+			return false;
+		}
+
+		return true;
+	}
+
 	// initialize all subsystems which are persistent and don't depend on a game running
 	void Initialize()
 	{
@@ -624,6 +702,11 @@ namespace CafeSystem
 		PPCCore_init();
 		RPLLoader_InitState();
 		cemuLog_log(LogType::Force, "mlc01 path: {}", _pathToUtf8(ActiveSettings::GetMlcPath()));
+		if (!EnsureDefaultMLCFiles(ActiveSettings::GetMlcPath()))
+		{
+			s_initialized = false;
+			throw std::runtime_error("Cemu could not create the required MLC directory structure.");
+		}
 		_CheckForWine();
 		// CPU and RAM info
 		logCPUAndMemoryInfo();

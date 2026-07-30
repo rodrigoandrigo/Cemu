@@ -152,10 +152,15 @@ public:
 				const auto it = m_constants.find(std::string{ view });
 				if (it == m_constants.cend())
 				{
-					if (m_constant_callback == nullptr)
+					if (m_constant_callback != nullptr)
+						value = m_constant_callback(view);
+					else if (m_unknown_constant_flag != nullptr)
+					{
+						*m_unknown_constant_flag = true;
+						value = {};
+					}
+					else
 						throw std::runtime_error(fmt::format("unknown constant found \"{}\" in expression: {}", view, expression));
-
-					value = m_constant_callback(view);
 				}
 				else
 					value = it->second;
@@ -428,10 +433,13 @@ public:
 
 	[[nodiscard]] bool IsConstantExpression(std::string_view expression) const
 	{
+		bool hasUnknownConstant = false;
+		TExpressionParser<TType> parser = *this;
+		parser.m_unknown_constant_flag = &hasUnknownConstant;
 		try
 		{
-			static_cast<void>(this->Evaluate(expression));
-			return true;
+			static_cast<void>(parser.Evaluate(expression));
+			return !hasUnknownConstant;
 		}
 		catch (...)
 		{
@@ -468,6 +476,7 @@ private:
 	std::unordered_map<std::string, TType> m_constants;
 	ConstantCallback_t m_constant_callback = nullptr;
 	FunctionCallback_t m_function_callback = nullptr;
+	bool* m_unknown_constant_flag = nullptr;
 
 	static bool _isNumberWithDecimalPoint(std::string_view str)
 	{

@@ -73,16 +73,27 @@ bool GraphicPack2::LoadCemuPatches()
 	bool foundPatches = false;
 	fs::path path(m_rulesPath);
 	path.remove_filename();
-	for (auto& p : fs::directory_iterator(path))
+	std::error_code ec;
+	fs::directory_iterator it(path, ec);
+	const fs::directory_iterator end;
+	if (ec)
 	{
-		auto& path = p.path();
-		if (fs::is_regular_file(p.status()) && path.has_filename())
+		cemuLog_log(LogType::Force, "Unable to enumerate graphic pack patch directory \"{}\": {}", _pathToUtf8(path), ec.message());
+		return false;
+	}
+	for (; it != end; it.increment(ec))
+	{
+		if (ec)
+			break;
+		const fs::path patchPath = it->path();
+		std::error_code entryError;
+		if (it->is_regular_file(entryError) && !entryError && patchPath.has_filename())
 		{
 			// check if filename matches
-			std::string filename = _pathToUtf8(path.filename());
+			std::string filename = _pathToUtf8(patchPath.filename());
 			if (boost::istarts_with(filename, "patch_") && boost::iends_with(filename, ".asm"))
 			{
-				FileStream* patchFile = FileStream::openFile2(path);
+				FileStream* patchFile = FileStream::openFile2(patchPath);
 				if (patchFile)
 				{
 					// read file
@@ -93,19 +104,21 @@ bool GraphicPack2::LoadCemuPatches()
 					// load Cemu style patch file
 					if (!ParseCemuPatchesTxtInternal(patchesStream))
 					{
-						cemuLog_log(LogType::Force, "Error while processing \"{}\". No patches for this graphic pack will be applied.", _pathToUtf8(path));
+						cemuLog_log(LogType::Force, "Error while processing \"{}\". No patches for this graphic pack will be applied.", _pathToUtf8(patchPath));
 						cemu_assert_debug(list_patchGroups.empty());
 						return true; // return true since a .asm patch was found even if we could not parse it
 					}
 				}
 				else
 				{
-					cemuLog_log(LogType::Force, "Unable to load patch file \"{}\"", _pathToUtf8(path));
+					cemuLog_log(LogType::Force, "Unable to load patch file \"{}\"", _pathToUtf8(patchPath));
 				}
 				foundPatches = true;
 			}
 		}
 	}
+	if (ec)
+		cemuLog_log(LogType::Force, "Error while enumerating graphic pack patch directory \"{}\": {}", _pathToUtf8(path), ec.message());
 	return foundPatches;
 }
 

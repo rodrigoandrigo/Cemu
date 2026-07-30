@@ -90,8 +90,9 @@ namespace save
 
 	SAVEStatus ConvertACPToSaveStatus(acp::ACPStatus status)
 	{
-		cemu_assert_debug(status == 0); // todo
-		return 0;
+		return status == acp::ACPStatus::SUCCESS
+			? SAVE_STATUS_OK
+			: static_cast<SAVEStatus>(FS_RESULT::FATAL_ERROR);
 	}
 
 	bool GetAbsoluteFullPath(uint32 persistentId, const char* subDir, char* outPath)
@@ -245,7 +246,9 @@ namespace save
 				SetPersistentIdToLocalCache(accountId, persistentId);
 			}
 			
-			SAVEMountSaveDir();
+			const auto mountStatus = SAVEMountSaveDir();
+			if (mountStatus != SAVE_STATUS_OK)
+				return mountStatus;
 			g_nn_save->initialized = true;
 
 			uint32 high = GetTitleIdHigh(titleId) & (~0xC);

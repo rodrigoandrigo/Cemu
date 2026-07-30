@@ -23,6 +23,7 @@ namespace CafeSystem
 	};
 
 	void Initialize();
+	bool EnsureDefaultMLCFiles(const fs::path& mlc);
 	void SetImplementation(SystemImplementation* impl);
     void Shutdown();
 

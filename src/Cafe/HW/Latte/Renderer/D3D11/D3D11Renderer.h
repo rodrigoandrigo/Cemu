@@ -6,6 +6,7 @@
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <array>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -89,17 +90,23 @@ public:
 private:
 	void RefreshBackBuffer();
 	void InitializePresentationPipeline();
-	void BindActiveShaders();
+	bool BindActiveShaders();
+	RendererShader* GetRectEmulationShader(class LatteDecompilerShader* vertexShader);
 	bool HasRequiredShaders() const;
 	void UpdateInputLayout();
 	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance);
 	void ApplyPipelineState();
+	void HandleSpecialState5();
 	void CheckDebugMessages(const char* scope);
 	ID3D11SamplerState* GetSamplerState(class LatteDecompilerShader* shader, uint32 textureIndex,
 		class LatteTexture* texture);
 	void UnbindTextureHazards();
+	void ClearShaderResources();
+	void ResolveTextureFeedbackLoops(const std::array<ID3D11RenderTargetView*, 8>& targets,
+		ID3D11DepthStencilView* depth);
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
+	Microsoft::WRL::ComPtr<ID3D11Device1> m_device1;
 	Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
 	Microsoft::WRL::ComPtr<ID3D11DeviceContext1> m_context1;
 	Microsoft::WRL::ComPtr<ID3D11InfoQueue> m_infoQueue;
@@ -118,21 +125,29 @@ private:
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_uniformVarsBuffers{};
 	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutOffsets{};
 	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
+	std::array<bool, 8> m_boundColorBlendable{ true, true, true, true, true, true, true, true };
 	bool m_streamoutActive{};
 
 	Microsoft::WRL::ComPtr<ID3D11VertexShader> m_presentVS;
 	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_presentPS;
+	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_surfaceCopyColorPS;
+	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_surfaceCopyDepthPS;
 	Microsoft::WRL::ComPtr<ID3D11SamplerState> m_presentSampler;
 	Microsoft::WRL::ComPtr<ID3D11SamplerState> m_presentPointSampler;
 	Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_rasterizerState;
 	Microsoft::WRL::ComPtr<ID3D11BlendState> m_blendState;
 	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
+	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_surfaceCopyDepthState;
 	Microsoft::WRL::ComPtr<ID3D11InputLayout> m_inputLayout;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11SamplerState>> m_samplerCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11RasterizerState>> m_rasterizerCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11BlendState>> m_blendCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> m_depthStencilCache;
+	std::unordered_map<uint64, std::unique_ptr<RendererShader>> m_rectShaderCache;
 	std::unordered_set<uint32> m_reportedDebugWarnings;
+	std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> m_feedbackResources;
+	std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> m_feedbackViews;
 	uint64 m_inputLayoutKey{};
 	bool m_imguiInitialized{};
+	bool m_graphicsStateInvalid{};
 };

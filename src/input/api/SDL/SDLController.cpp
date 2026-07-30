@@ -88,7 +88,7 @@ bool SDLController::connect()
 void SDLController::start_rumble()
 {
 	std::scoped_lock lock(m_controller_mutex);
-	if (is_connected() && !m_has_rumble)
+	if (!is_connected() || !m_has_rumble)
 		return;
 	if (m_settings.rumble <= 0)
 		return;
@@ -98,7 +98,7 @@ void SDLController::start_rumble()
 void SDLController::stop_rumble()
 {
 	std::scoped_lock lock(m_controller_mutex);
-	if (is_connected() && !m_has_rumble)
+	if (!is_connected() || !m_has_rumble)
 		return;
 	SDL_RumbleGamepad(m_controller, 0, 0, 0);
 }
@@ -120,6 +120,13 @@ std::string SDLController::get_button_name(uint64 button) const
 ControllerState SDLController::raw_state()
 {
 	ControllerState result{};
+#if defined(CEMU_UWP)
+	// WGI controllers are polled through GetCurrentReading. SDL_WaitEvent()
+	// handles device arrival/removal, but it does not guarantee a fresh input
+	// sample while no window-system event is pending. Refresh the joystick
+	// snapshot at the point where Cemu performs VPADRead.
+	SDL_UpdateGamepads();
+#endif
 	std::scoped_lock lock(m_controller_mutex);
 	if (!is_connected())
 		return result;

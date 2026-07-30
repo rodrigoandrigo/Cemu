@@ -70,10 +70,19 @@ CPUMode ActiveSettings::GetCPUMode()
 
 	if (mode == CPUMode::Auto)
 	{
+#if defined(CEMU_UWP)
+		// The UWP embed currently shares its lifetime with the XAML host and
+		// SwapChainPanel.  Keep the default scheduler on one emulated core
+		// until the multi-core title scheduler can be stopped and joined as
+		// part of the embed lifecycle.  This avoids secondary OSSched workers
+		// continuing through partially initialized or torn-down guest state.
+		mode = CPUMode::SinglecoreRecompiler;
+#else
 		if (GetPhysicalCoreCount() >= 4)
 			mode = CPUMode::MulticoreRecompiler;
 		else
 			mode = CPUMode::SinglecoreRecompiler;
+#endif
 	}
 	else if (mode == CPUMode::DualcoreRecompiler) // dualcore is disabled now
 		mode = CPUMode::MulticoreRecompiler;
@@ -161,7 +170,17 @@ void ActiveSettings::EnableAudioOnlyAux(bool state)
 
 uint32 ActiveSettings::GetPersistentId()
 {
-	return LaunchSettings::GetPersistentId().value_or(GetConfig().account.m_persistent_id);
+	const uint32 configured =
+		LaunchSettings::GetPersistentId().value_or(GetConfig().account.m_persistent_id);
+	const auto& accounts = Account::GetAccounts();
+	const auto selected = std::find_if(accounts.begin(), accounts.end(),
+		[configured](const Account& account)
+		{
+			return account.GetPersistentId() == configured;
+		});
+	return selected != accounts.end()
+		? selected->GetPersistentId()
+		: accounts.front().GetPersistentId();
 }
 
 bool ActiveSettings::IsOnlineEnabled()

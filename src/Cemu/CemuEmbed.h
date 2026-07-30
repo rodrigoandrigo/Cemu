@@ -23,6 +23,8 @@ extern "C" {
 #define CEMU_EMBED_ABI_VERSION 1u
 #define CEMU_EMBED_BROKERED_STORAGE_VERSION 2u
 #define CEMU_EMBED_D3D11_SURFACE_VERSION 1u
+#define CEMU_EMBED_LIBRARY_VERSION 2u
+#define CEMU_EMBED_ACCOUNT_VERSION 1u
 typedef struct CemuEmbedInstance CemuEmbedInstance;
 
 typedef enum CemuEmbedResult { CEMU_EMBED_OK, CEMU_EMBED_INVALID_ARGUMENT, CEMU_EMBED_INVALID_STATE, CEMU_EMBED_BUSY, CEMU_EMBED_INITIALIZATION_FAILED, CEMU_EMBED_LAUNCH_FAILED, CEMU_EMBED_STORAGE_FAILED } CemuEmbedResult;
@@ -115,6 +117,43 @@ typedef struct CemuEmbedBrokeredStorage {
 	CemuEmbedBrokeredProgressCallback progress;
 } CemuEmbedBrokeredStorage;
 
+typedef enum CemuEmbedInstallType {
+	CEMU_EMBED_INSTALL_AUTO = 0,
+	CEMU_EMBED_INSTALL_BASE_GAME = 1,
+	CEMU_EMBED_INSTALL_UPDATE = 2,
+	CEMU_EMBED_INSTALL_DLC = 3
+} CemuEmbedInstallType;
+
+// Strings in this structure remain valid only for the duration of the
+// enumeration callback.
+typedef struct CemuEmbedInstalledTitle {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	uint64_t title_id;
+	uint16_t base_version;
+	uint16_t effective_version;
+	uint16_t update_version;
+	uint16_t dlc_version;
+	uint32_t dlc_count;
+	uint32_t region;
+	const char* name_utf8;
+	const char* region_utf8;
+	uint32_t compatible_graphic_pack_count;
+	uint32_t enabled_graphic_pack_count;
+} CemuEmbedInstalledTitle;
+
+typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedInstalledTitleCallback)(
+	void* user_data, const CemuEmbedInstalledTitle* title);
+
+typedef struct CemuEmbedActiveAccount {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	uint32_t persistent_id;
+	int32_t online_enabled;
+	char mii_name_utf8[64];
+	char account_id_utf8[64];
+} CemuEmbedActiveAccount;
+
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Create(const CemuEmbedConfig* config, const CemuEmbedCallbacks* callbacks, CemuEmbedInstance** instance);
 // Call on the host UI thread before InitializeAsync and whenever the host
 // surface size changes while the instance is initializing or ready.
@@ -128,10 +167,51 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGame(CemuEmbedIns
 // for the selected folder. The broker is called synchronously on this thread.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolder(
 	CemuEmbedInstance* instance, void* folder_handle, const CemuEmbedBrokeredStorage* storage);
+// Installs an extracted base game, update or DLC into Cemu's persistent MLC.
+// The selected folder must contain code, content and meta. expected_type may
+// be AUTO to accept the type declared by app.xml. The operation is synchronous
+// and should be invoked outside the host UI dispatcher.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallTitleFromBrokeredFolder(
+	CemuEmbedInstance* instance, void* folder_handle,
+	const CemuEmbedBrokeredStorage* storage, CemuEmbedInstallType expected_type,
+	uint64_t* installed_base_title_id);
+// Re-scans the configured MLC and enumerates installed, runnable base games.
+// Update and DLC information is folded into the matching base-game record.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateInstalledTitles(
+	CemuEmbedInstance* instance, CemuEmbedInstalledTitleCallback callback,
+	void* user_data);
+// Launches a base title from the persistent library. Cemu resolves and mounts
+// the highest installed update and matching DLC through CafeTitleList.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchInstalledTitle(
+	CemuEmbedInstance* instance, uint64_t base_title_id);
+// Imports Cemu-format graphic packs (rules.txt plus patches/shaders) from a
+// brokered graphicPacks folder into the persistent user-data directory.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrokeredFolder(
+	CemuEmbedInstance* instance, void* folder_handle,
+	const CemuEmbedBrokeredStorage* storage, uint32_t* imported_pack_count);
+// Enables or disables every loaded graphic pack compatible with a base title.
+// Preset defaults declared by each pack are preserved in settings.xml.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledForTitle(
+	CemuEmbedInstance* instance, uint64_t base_title_id, int32_t enabled,
+	uint32_t* affected_pack_count);
+// Applies the host-safe automatic policy for a title: compatibility
+// Workarounds are enabled, while executable Mods and Cheats are disabled.
+// Graphics packs and every other category retain the user's saved state.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ApplySafeGraphicPackPolicyForTitle(
+	CemuEmbedInstance* instance, uint64_t base_title_id,
+	uint32_t* affected_pack_count);
+// Creates player one's Wii U GamePad profile from the first SDL gamepad,
+// preferring an Xbox device. Existing configured profiles are never replaced.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile(
+	CemuEmbedInstance* instance, int32_t* profile_ready);
 // Non-blocking: call this from the host dispatcher. It never creates wxEntry.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance);
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RequestStop(CemuEmbedInstance* instance);
 CEMU_EMBED_API CemuEmbedState CEMU_EMBED_CALL CemuEmbed_GetState(const CemuEmbedInstance* instance);
+// Returns the account actually selected by Cemu. If settings reference a
+// missing account, this reports the valid fallback account used by IOSU/ACT.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetActiveAccount(
+	CemuEmbedInstance* instance, CemuEmbedActiveAccount* account);
 // The Cemu runtime currently has process-wide singletons, so only one instance
 // may be created during a process lifetime.
 CEMU_EMBED_API void CEMU_EMBED_CALL CemuEmbed_Destroy(CemuEmbedInstance* instance);

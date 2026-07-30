@@ -117,6 +117,14 @@ void SDLControllerProvider::InitSDL()
 {
 	SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_ENHANCED_REPORTS, "1");
+#if defined(CEMU_UWP)
+	// Windows.Gaming.Input is the controller transport available to a packaged
+	// UWP application. SDL deliberately leaves this backend disabled by
+	// default, so the XAML host could see an Xbox controller while
+	// SDL_GetGamepads() (and therefore Cemu) saw no devices at all.
+	// This hint must be set before SDL_INIT_GAMEPAD is initialized.
+	SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "1");
+#endif
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS4, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5, "1");
 	SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE, "1");
@@ -141,6 +149,15 @@ void SDLControllerProvider::InitSDL()
 	{
 		cemuLog_log(LogType::Force, "Couldn't enable SDL gamecontroller event polling: {}", SDL_GetError());
 	}
+
+#if defined(CEMU_UWP)
+	int gamepadCount = 0;
+	SDL_JoystickID* gamepads = SDL_GetGamepads(&gamepadCount);
+	SDL_free(gamepads);
+	cemuLog_log(LogType::Force,
+		"UWP controller backend initialized through Windows.Gaming.Input ({} gamepad{})",
+		gamepadCount, gamepadCount == 1 ? "" : "s");
+#endif
 }
 
 void SDLControllerProvider::ShutdownSDL()

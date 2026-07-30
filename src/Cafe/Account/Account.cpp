@@ -7,6 +7,7 @@
 #include "Common/FileStream.h"
 #include <boost/random/uniform_int.hpp>
 
+#include <charconv>
 #include <random>
 
 std::vector<Account> Account::s_account_list;
@@ -188,7 +189,7 @@ std::error_code Account::Save()
 	try
 	{
 		std::ofstream file;
-		file.exceptions(std::ios::badbit);
+		file.exceptions(std::ios::badbit | std::ios::failbit);
 		file.open(path);
 	
 		file << "AccountInstance_20120705" << std::endl;
@@ -302,19 +303,29 @@ const std::vector<Account>& Account::RefreshAccounts()
 {
 	std::vector<Account> result;
 	const fs::path path = ActiveSettings::GetMlcPath("usr/save/system/act");
-	if (fs::exists(path))
+	std::error_code ec;
+	fs::create_directories(path, ec);
+	if (ec)
+		cemuLog_log(LogType::Force, "Unable to create account directory {}: {}", _pathToUtf8(path), ec.message());
+	ec.clear();
+	if (fs::is_directory(path, ec) && !ec)
 	{
-		for (const auto& it : fs::directory_iterator(path))
+		for (fs::directory_iterator it(path, ec), end; !ec && it != end; it.increment(ec))
 		{
-			if (!fs::is_directory(it))
+			std::error_code entryError;
+			if (!it->is_directory(entryError) || entryError)
 				continue;
 
-			const auto file_name = it.path().filename().string();
+			const auto file_name = it->path().filename().string();
 			if (file_name.size() != 8)
 				continue;
 
-			const auto persistent_id = ConvertString<uint32>(file_name, 16);
-			if (persistent_id < kMinPersistendId)
+			uint32 persistent_id{};
+			const auto parseResult = std::from_chars(file_name.data(),
+				file_name.data() + file_name.size(), persistent_id, 16);
+			if (parseResult.ec != std::errc{} ||
+				parseResult.ptr != file_name.data() + file_name.size() ||
+				persistent_id < kMinPersistendId)
 				continue;
 
 			Account account(persistent_id);
@@ -322,13 +333,17 @@ const std::vector<Account>& Account::RefreshAccounts()
 			if (!error)
 				result.emplace_back(account);
 		}
+		if (ec)
+			cemuLog_log(LogType::Force, "Unable to enumerate accounts in {}: {}", _pathToUtf8(path), ec.message());
 	}
 	
 	// we always force at least one account
 	if (result.empty())
 	{
 		result.emplace_back(kMinPersistendId, L"default");
-		result.begin()->Save();
+		const auto saveError = result.begin()->Save();
+		if (saveError)
+			cemuLog_log(LogType::Force, "Unable to create the default account: {}", saveError.message());
 	}
 
 	s_account_list = result;
@@ -340,7 +355,9 @@ void Account::UpdatePersisidDat()
 {
 	const auto max_id = std::max(kMinPersistendId, GetNextPersistentId() - 1);
 	const auto file = ActiveSettings::GetMlcPath("usr/save/system/act/persisid.dat");
-	std::ofstream f(file);
+	std::error_code ec;
+	fs::create_directories(file.parent_path(), ec);
+	std::ofstream f(file, std::ios::out | std::ios::trunc);
 	if(f.is_open())
 	{
 		f << "PersistentIdManager_20120607" << std::endl << "PersistentIdHead=" << std::hex << max_id << std::endl << std::endl;
@@ -394,7 +411,15 @@ uint32 Account::GetNextPersistentId()
 			{
 				if(boost::starts_with(line, "PersistentIdHead="))
 				{
-					result = ConvertString<uint32>(line.data() + sizeof("PersistentIdHead=") - 1, 16);
+					const std::string_view value(line.data() + sizeof("PersistentIdHead=") - 1,
+						line.size() - (sizeof("PersistentIdHead=") - 1));
+					uint32 parsed{};
+					const auto parseResult = std::from_chars(value.data(),
+						value.data() + value.size(), parsed, 16);
+					if (parseResult.ec == std::errc{} &&
+						parseResult.ptr == value.data() + value.size() &&
+						parsed >= kMinPersistendId)
+						result = parsed;
 					break;
 				}
 			}

@@ -5,20 +5,30 @@
 #include "config/CemuConfig.h"
 #include "config/NetworkSettings.h"
 #include "Cafe/CafeSystem.h"
+#include "Cafe/Account/Account.h"
+#include "Cafe/GraphicPack/GraphicPack2.h"
 #include "Cafe/TitleList/TitleList.h"
 #include "Common/CemuRuntime.h"
+#include "input/InputManager.h"
+#include "input/api/Controller.h"
 #include "interface/WindowSystem.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <charconv>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
+#include <boost/nowide/convert.hpp>
 #include <fmt/format.h>
+#ifdef HAS_SDL
+#include <SDL3/SDL_error.h>
+#endif
 
 void CemuCommonInit(bool embedded);
 
@@ -85,6 +95,36 @@ bool HasRequiredBrokeredStorage(const CemuEmbedBrokeredStorage* storage) {
 	return storage && storage->struct_size >= sizeof(CemuEmbedBrokeredStorage) &&
 		storage->abi_version == CEMU_EMBED_BROKERED_STORAGE_VERSION &&
 		storage->enumerate_recursive && storage->open_read && storage->read && storage->close;
+}
+
+std::pair<uint32_t, uint32_t> CountGraphicPacksForTitle(uint64_t titleId) {
+	uint32_t compatible{};
+	uint32_t enabled{};
+	for (const auto& pack : GraphicPack2::GetGraphicPacks()) {
+		if (!pack->ContainsTitleId(titleId))
+			continue;
+		++compatible;
+		if (pack->IsEnabled())
+			++enabled;
+	}
+	return {compatible, enabled};
+}
+
+void SaveGraphicPackState(const GraphicPackPtr& pack) {
+	auto& entries = GetConfigHandle().data().graphic_pack_entries;
+	const auto path = _utf8ToPath(pack->GetNormalizedPathString());
+	if (pack->IsEnabled()) {
+		auto& entry = entries[path];
+		entry.clear();
+		for (const auto& preset : pack->GetActivePresets())
+			entry.try_emplace(preset->category, preset->name);
+	} else if (pack->IsDefaultEnabled()) {
+		auto& entry = entries[path];
+		entry.clear();
+		entry.try_emplace("_disabled", "true");
+	} else {
+		entries.erase(path);
+	}
 }
 
 struct BrokeredCopyContext {
@@ -302,8 +342,9 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 }
 
 CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHandle,
-	const CemuEmbedBrokeredStorage& storage, fs::path& stagedPath) {
-	stagedPath = _utf8ToPath(instance->cachePath) / "brokered-titles" / "current";
+	const CemuEmbedBrokeredStorage& storage, std::string_view stagingName,
+	bool normalizeMergedMetadata, fs::path& stagedPath) {
+	stagedPath = _utf8ToPath(instance->cachePath) / "brokered-titles" / stagingName;
 	std::error_code error;
 	fs::remove_all(stagedPath, error);
 	if (error) {
@@ -357,12 +398,149 @@ CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHan
 			"The selected title changed while it was being staged.");
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
-	std::string normalizationError;
-	const auto normalizationResult = NormalizeMergedTitleMetadata(stagedPath, normalizationError);
-	if (normalizationResult != CEMU_EMBED_OK) {
-		ReportError(instance, normalizationResult, normalizationError.c_str());
-		return normalizationResult;
+	if (normalizeMergedMetadata) {
+		std::string normalizationError;
+		const auto normalizationResult = NormalizeMergedTitleMetadata(stagedPath, normalizationError);
+		if (normalizationResult != CEMU_EMBED_OK) {
+			ReportError(instance, normalizationResult, normalizationError.c_str());
+			return normalizationResult;
+		}
 	}
+	return CEMU_EMBED_OK;
+}
+
+bool IsExpectedInstallType(TitleIdParser::TITLE_TYPE actual, CemuEmbedInstallType expected) {
+	switch (expected) {
+	case CEMU_EMBED_INSTALL_AUTO:
+		return true;
+	case CEMU_EMBED_INSTALL_BASE_GAME:
+		return actual == TitleIdParser::TITLE_TYPE::BASE_TITLE ||
+			actual == TitleIdParser::TITLE_TYPE::BASE_TITLE_DEMO;
+	case CEMU_EMBED_INSTALL_UPDATE:
+		return actual == TitleIdParser::TITLE_TYPE::BASE_TITLE_UPDATE;
+	case CEMU_EMBED_INSTALL_DLC:
+		return actual == TitleIdParser::TITLE_TYPE::AOC;
+	default:
+		return false;
+	}
+}
+
+const char* InstallTypeName(TitleIdParser::TITLE_TYPE type) {
+	switch (type) {
+	case TitleIdParser::TITLE_TYPE::BASE_TITLE:
+	case TitleIdParser::TITLE_TYPE::BASE_TITLE_DEMO:
+		return "base game";
+	case TitleIdParser::TITLE_TYPE::BASE_TITLE_UPDATE:
+		return "update";
+	case TitleIdParser::TITLE_TYPE::AOC:
+		return "DLC";
+	default:
+		return "unsupported title";
+	}
+}
+
+std::string RegionName(CafeConsoleRegion region) {
+	std::vector<std::string_view> names;
+	if (HAS_FLAG(region, CafeConsoleRegion::JPN)) names.emplace_back("Japan");
+	if (HAS_FLAG(region, CafeConsoleRegion::USA)) names.emplace_back("USA");
+	if (HAS_FLAG(region, CafeConsoleRegion::EUR)) names.emplace_back("Europe");
+	if (HAS_FLAG(region, CafeConsoleRegion::AUS_DEPR)) names.emplace_back("Australia");
+	if (HAS_FLAG(region, CafeConsoleRegion::CHN)) names.emplace_back("China");
+	if (HAS_FLAG(region, CafeConsoleRegion::KOR)) names.emplace_back("Korea");
+	if (HAS_FLAG(region, CafeConsoleRegion::TWN)) names.emplace_back("Taiwan");
+	if (names.empty())
+		return "Unknown";
+	std::string result;
+	for (const auto name : names) {
+		if (!result.empty()) result += ", ";
+		result += name;
+	}
+	return result;
+}
+
+void RefreshInstalledTitles() {
+	CafeTitleList::Refresh();
+	while (CafeTitleList::IsScanning())
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+}
+
+CemuEmbedResult InstallTitleFromStaging(CemuEmbedInstance* instance,
+	const fs::path& stagedPath, CemuEmbedInstallType expectedType,
+	uint64_t* installedBaseTitleId) {
+	TitleInfo title{stagedPath};
+	if (!title.IsValid() || !title.ParseXmlInfo() ||
+		title.GetFormat() != TitleInfo::TitleDataFormat::HOST_FS) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"The selected folder is not an installable extracted Wii U title.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	const auto titleType = title.GetTitleType();
+	if (titleType != TitleIdParser::TITLE_TYPE::BASE_TITLE &&
+		titleType != TitleIdParser::TITLE_TYPE::BASE_TITLE_DEMO &&
+		titleType != TitleIdParser::TITLE_TYPE::BASE_TITLE_UPDATE &&
+		titleType != TitleIdParser::TITLE_TYPE::AOC) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"The selected folder is not a base game, update or DLC.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	if (!IsExpectedInstallType(titleType, expectedType)) {
+		const auto message = fmt::format(
+			"The selected folder contains a {}, not the requested installation type.",
+			InstallTypeName(titleType));
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED, message.c_str());
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	const TitleId titleId = title.GetAppTitleId();
+	const TitleId baseTitleId = TitleIdParser::MakeBaseTitleId(
+		titleType == TitleIdParser::TITLE_TYPE::AOC
+			? (titleId & ~0xFF00000000ull)
+			: titleId);
+	const fs::path target = ActiveSettings::GetMlcPath(title.GetInstallPath());
+	fs::path backup = target;
+	backup += ".cemu-embed-backup";
+	std::error_code error;
+	fs::create_directories(target.parent_path(), error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not create the title installation directory.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	fs::remove_all(backup, error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not clear a previous installation backup.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	if (fs::exists(target, error)) {
+		fs::rename(target, backup, error);
+		if (error) {
+			ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+				"Cemu could not back up the currently installed title.");
+			return CEMU_EMBED_STORAGE_FAILED;
+		}
+	}
+
+	fs::rename(stagedPath, target, error);
+	if (error) {
+		std::error_code restoreError;
+		if (fs::exists(backup, restoreError))
+			fs::rename(backup, target, restoreError);
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not commit the staged title to the MLC.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	fs::remove_all(backup, error);
+	if (error)
+		cemuLog_log(LogType::Force, "Unable to remove installation backup {}", _pathToUtf8(backup));
+	cemuLog_log(LogType::Force, "Installed {} {:016x} v{} to {}",
+		InstallTypeName(titleType), titleId, title.GetAppTitleVersion(), _pathToUtf8(target));
+	RefreshInstalledTitles();
+	if (installedBaseTitleId)
+		*installedBaseTitleId = baseTitleId;
 	return CEMU_EMBED_OK;
 }
 
@@ -499,8 +677,321 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolde
 		return CEMU_EMBED_BUSY;
 	}
 	fs::path stagedPath;
-	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage, stagedPath);
+	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
+		"current", true, stagedPath);
 	return stageResult == CEMU_EMBED_OK ? LaunchGameFromPath(instance, stagedPath) : stageResult;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallTitleFromBrokeredFolder(
+	CemuEmbedInstance* instance, void* folderHandle,
+	const CemuEmbedBrokeredStorage* storage, CemuEmbedInstallType expectedType,
+	uint64_t* installedBaseTitleId) {
+	if (!instance || !folderHandle || !HasRequiredBrokeredStorage(storage))
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (expectedType < CEMU_EMBED_INSTALL_AUTO || expectedType > CEMU_EMBED_INSTALL_DLC)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY) {
+		ReportError(instance, CEMU_EMBED_INVALID_STATE,
+			"Cemu is not ready to install a title yet.");
+		return CEMU_EMBED_INVALID_STATE;
+	}
+	if (CafeSystem::IsTitleRunning()) {
+		ReportError(instance, CEMU_EMBED_BUSY,
+			"Stop the running title before installing library content.");
+		return CEMU_EMBED_BUSY;
+	}
+
+	fs::path stagedPath;
+	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
+		"installing", false, stagedPath);
+	if (stageResult != CEMU_EMBED_OK)
+		return stageResult;
+	const auto installResult = InstallTitleFromStaging(instance, stagedPath,
+		expectedType, installedBaseTitleId);
+	if (installResult != CEMU_EMBED_OK) {
+		std::error_code cleanupError;
+		fs::remove_all(stagedPath, cleanupError);
+	}
+	return installResult;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateInstalledTitles(
+	CemuEmbedInstance* instance, CemuEmbedInstalledTitleCallback callback,
+	void* userData) {
+	if (!instance || !callback)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+
+	RefreshInstalledTitles();
+	std::set<TitleId> baseTitleIds;
+	for (const auto titleId : CafeTitleList::GetAllTitleIds()) {
+		TitleId baseTitleId{};
+		if (CafeTitleList::FindBaseTitleId(titleId, baseTitleId))
+			baseTitleIds.emplace(baseTitleId);
+	}
+
+	for (const auto baseTitleId : baseTitleIds) {
+		auto gameInfo = CafeTitleList::GetGameInfo(baseTitleId);
+		if (!gameInfo.IsValid())
+			continue;
+		auto& base = gameInfo.GetBase();
+		const std::string name = gameInfo.GetTitleName();
+		const std::string region = RegionName(gameInfo.GetRegion());
+		const auto aoc = gameInfo.GetAOC();
+		const auto [compatibleGraphicPacks, enabledGraphicPacks] =
+			CountGraphicPacksForTitle(baseTitleId);
+		CemuEmbedInstalledTitle record{
+			sizeof(CemuEmbedInstalledTitle),
+			CEMU_EMBED_LIBRARY_VERSION,
+			baseTitleId,
+			base.GetAppTitleVersion(),
+			gameInfo.GetVersion(),
+			gameInfo.HasUpdate() ? gameInfo.GetUpdate().GetAppTitleVersion() : uint16_t{},
+			gameInfo.GetAOCVersion(),
+			static_cast<uint32_t>(aoc.size()),
+			static_cast<uint32_t>(gameInfo.GetRegion()),
+			name.c_str(),
+			region.c_str(),
+			compatibleGraphicPacks,
+			enabledGraphicPacks
+		};
+		const auto result = callback(userData, &record);
+		if (result != CEMU_EMBED_OK)
+			return result;
+	}
+	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchInstalledTitle(
+	CemuEmbedInstance* instance, uint64_t baseTitleId) {
+	if (!instance || !baseTitleId)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY) {
+		ReportError(instance, CEMU_EMBED_INVALID_STATE,
+			"Cemu is not ready to launch an installed title yet.");
+		return CEMU_EMBED_INVALID_STATE;
+	}
+	if (CafeSystem::IsTitleRunning()) {
+		ReportError(instance, CEMU_EMBED_BUSY, "A title is already running.");
+		return CEMU_EMBED_BUSY;
+	}
+
+	baseTitleId = TitleIdParser::MakeBaseTitleId(baseTitleId);
+	auto gameInfo = CafeTitleList::GetGameInfo(baseTitleId);
+	if (!gameInfo.IsValid()) {
+		RefreshInstalledTitles();
+		gameInfo = CafeTitleList::GetGameInfo(baseTitleId);
+	}
+	if (!gameInfo.IsValid()) {
+		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
+			"The selected installed base game was not found.");
+		return CEMU_EMBED_LAUNCH_FAILED;
+	}
+	if (CafeSystem::PrepareForegroundTitle(baseTitleId) !=
+		CafeSystem::PREPARE_STATUS_CODE::SUCCESS) {
+		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
+			"Cemu could not mount the installed base game, update and DLC.");
+		return CEMU_EMBED_LAUNCH_FAILED;
+	}
+	CafeSystem::LaunchForegroundTitle();
+	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrokeredFolder(
+	CemuEmbedInstance* instance, void* folderHandle,
+	const CemuEmbedBrokeredStorage* storage, uint32_t* importedPackCount) {
+	if (!instance || !folderHandle || !HasRequiredBrokeredStorage(storage))
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (importedPackCount)
+		*importedPackCount = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning()) {
+		ReportError(instance, CEMU_EMBED_BUSY,
+			"Stop the running title before importing graphic packs.");
+		return CEMU_EMBED_BUSY;
+	}
+
+	fs::path stagedPath;
+	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
+		"graphic-packs", false, stagedPath);
+	if (stageResult != CEMU_EMBED_OK)
+		return stageResult;
+
+	std::error_code error;
+	fs::path source = stagedPath;
+	if (fs::is_directory(stagedPath / "graphicPacks", error))
+		source /= "graphicPacks";
+	const fs::path destination = ActiveSettings::GetUserDataPath("graphicPacks");
+	fs::create_directories(destination, error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not create the persistent graphicPacks directory.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	uint32_t rulesCount{};
+	for (fs::recursive_directory_iterator it(source, fs::directory_options::skip_permission_denied, error);
+		!error && it != fs::recursive_directory_iterator(); it.increment(error)) {
+		const auto relative = fs::relative(it->path(), source, error);
+		if (error)
+			break;
+		const auto target = destination / relative;
+		if (it->is_directory(error)) {
+			fs::create_directories(target, error);
+		} else if (it->is_regular_file(error)) {
+			fs::create_directories(target.parent_path(), error);
+			if (!error)
+				fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, error);
+			if (!error && it->path().filename() == "rules.txt")
+				++rulesCount;
+		}
+	}
+	if (error || rulesCount == 0) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			error ? "Cemu could not copy the selected graphic packs."
+			      : "The selected folder does not contain any Cemu rules.txt graphic packs.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	GraphicPack2::ClearGraphicPacks();
+	GraphicPack2::LoadAll();
+	if (importedPackCount)
+		*importedPackCount = rulesCount;
+	cemuLog_log(LogType::Force, "Imported {} graphic pack(s) into {}",
+		rulesCount, _pathToUtf8(destination));
+	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledForTitle(
+	CemuEmbedInstance* instance, uint64_t baseTitleId, int32_t enabled,
+	uint32_t* affectedPackCount) {
+	if (!instance || !baseTitleId)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (affectedPackCount)
+		*affectedPackCount = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+
+	baseTitleId = TitleIdParser::MakeBaseTitleId(baseTitleId);
+	uint32_t affected{};
+	for (const auto& pack : GraphicPack2::GetGraphicPacks()) {
+		if (!pack->ContainsTitleId(baseTitleId))
+			continue;
+		pack->SetEnabled(enabled != 0);
+		SaveGraphicPackState(pack);
+		++affected;
+	}
+	GetConfigHandle().Save();
+	if (affectedPackCount)
+		*affectedPackCount = affected;
+	cemuLog_log(LogType::Force, "{} {} compatible graphic pack(s) for title {:016x}",
+		enabled ? "Enabled" : "Disabled", affected, baseTitleId);
+	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ApplySafeGraphicPackPolicyForTitle(
+	CemuEmbedInstance* instance, uint64_t baseTitleId,
+	uint32_t* affectedPackCount) {
+	if (!instance || !baseTitleId)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (affectedPackCount)
+		*affectedPackCount = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+
+	baseTitleId = TitleIdParser::MakeBaseTitleId(baseTitleId);
+	uint32_t affected{};
+	for (const auto& pack : GraphicPack2::GetGraphicPacks()) {
+		if (!pack->ContainsTitleId(baseTitleId))
+			continue;
+		const std::string& path = pack->GetVirtualPath();
+		const bool isWorkaround = path.find("/Workarounds/") != std::string::npos;
+		const bool isExecutableModification =
+			path.find("/Mods/") != std::string::npos ||
+			path.find("/Cheats/") != std::string::npos;
+		if (!isWorkaround && !isExecutableModification)
+			continue;
+
+		const bool shouldEnable = isWorkaround;
+		if (pack->IsEnabled() == shouldEnable)
+			continue;
+		pack->SetEnabled(shouldEnable);
+		SaveGraphicPackState(pack);
+		++affected;
+		cemuLog_log(LogType::Force, "{} graphic pack under safe host policy: {}",
+			shouldEnable ? "Enabled" : "Disabled", path);
+	}
+	GetConfigHandle().Save();
+	if (affectedPackCount)
+		*affectedPackCount = affected;
+	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile(
+	CemuEmbedInstance* instance, int32_t* profileReady) {
+	if (!instance || !profileReady)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	*profileReady = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+#ifdef HAS_SDL
+	auto& input = InputManager::instance();
+	auto emulated = input.get_controller(0);
+	if (emulated) {
+		for (const auto& configuredController : emulated->get_controllers()) {
+			if (configuredController && configuredController->connect()) {
+				*profileReady = 1;
+				return CEMU_EMBED_OK;
+			}
+		}
+	}
+	if (!input.is_api_available(InputAPI::SDLController))
+		return CEMU_EMBED_OK;
+	const auto provider = input.get_api_provider(InputAPI::SDLController);
+	auto controllers = provider ? provider->get_controllers() :
+		std::vector<std::shared_ptr<ControllerBase>>{};
+	if (controllers.empty())
+		return CEMU_EMBED_OK;
+
+	auto selected = controllers.front();
+	for (const auto& controller : controllers) {
+		std::string name = controller->display_name();
+		std::transform(name.begin(), name.end(), name.begin(),
+			[](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (name.find("xbox") != std::string::npos) {
+			selected = controller;
+			break;
+		}
+	}
+	if (!emulated)
+		emulated = input.set_controller(0, EmulatedController::Type::VPAD);
+	if (!emulated)
+		return CEMU_EMBED_INITIALIZATION_FAILED;
+	if (!selected->connect()) {
+		cemuLog_log(LogType::Force,
+			"Windows.Gaming.Input exposed {}, but SDL could not open it: {}",
+			selected->display_name(), SDL_GetError());
+		return CEMU_EMBED_OK;
+	}
+	if (!emulated->get_controllers().empty())
+		emulated->clear_controllers();
+	emulated->add_controller(selected);
+	if (!emulated->set_default_mapping(selected)) {
+		emulated->clear_controllers();
+		cemuLog_log(LogType::Force,
+			"Could not create the default Wii U GamePad mapping for {}",
+			selected->display_name());
+		return CEMU_EMBED_OK;
+	}
+	if (!input.save(0)) {
+		cemuLog_log(LogType::Force,
+			"The Xbox controller is active, but its Wii U GamePad profile could not be saved");
+	}
+	input.on_device_changed();
+	*profileReady = 1;
+	cemuLog_log(LogType::Force,
+		"Created the default Wii U GamePad profile for {}", selected->display_name());
+#endif
+	return CEMU_EMBED_OK;
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance) {
 	if (!instance) return CEMU_EMBED_INVALID_ARGUMENT;
@@ -523,6 +1014,28 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RequestStop(CemuEmbedInstan
 }
 extern "C" CemuEmbedState CEMU_EMBED_CALL CemuEmbed_GetState(const CemuEmbedInstance* instance) {
 	return instance ? instance->state.load(std::memory_order_acquire) : CEMU_EMBED_STATE_FAILED;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetActiveAccount(
+	CemuEmbedInstance* instance, CemuEmbedActiveAccount* account) {
+	if (!instance || !account || account->struct_size < sizeof(CemuEmbedActiveAccount) ||
+		account->abi_version != CEMU_EMBED_ACCOUNT_VERSION)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	const auto state = instance->state.load(std::memory_order_acquire);
+	if (state != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+
+	const auto& activeAccount = Account::GetCurrentAccount();
+	const auto miiName = boost::nowide::narrow(std::wstring(activeAccount.GetMiiName()));
+	const auto accountId = activeAccount.GetAccountId();
+	account->persistent_id = activeAccount.GetPersistentId();
+	account->online_enabled = ActiveSettings::IsOnlineEnabled() ? 1 : 0;
+	memset(account->mii_name_utf8, 0, sizeof(account->mii_name_utf8));
+	memset(account->account_id_utf8, 0, sizeof(account->account_id_utf8));
+	memcpy(account->mii_name_utf8, miiName.data(),
+		std::min(miiName.size(), sizeof(account->mii_name_utf8) - 1));
+	memcpy(account->account_id_utf8, accountId.data(),
+		std::min(accountId.size(), sizeof(account->account_id_utf8) - 1));
+	return CEMU_EMBED_OK;
 }
 extern "C" void CEMU_EMBED_CALL CemuEmbed_Destroy(CemuEmbedInstance* instance) {
 	if (!instance) return;

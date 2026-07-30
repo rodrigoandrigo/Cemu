@@ -70,6 +70,7 @@ void FillAccountData(const Account& account, const bool online_enabled, int inde
 {
 	cemu_assert_debug(index < IOSU_ACT_ACCOUNT_MAX_COUNT);
 	auto& data = _actAccountData[index];
+	data = {};
 	data.isValid = true;
 	// options
 	data.isNetworkAccount = account.IsValidOnlineAccount();
@@ -81,16 +82,19 @@ void FillAccountData(const Account& account, const bool online_enabled, int inde
 	data.simpleAddressId = account.GetSimpleAddressId();
 	data.principalId = account.GetPrincipalId();
 	// NNID
-	std::copy(account.GetAccountId().begin(), account.GetAccountId().end(), data.accountId);
+	const auto accountId = account.GetAccountId();
+	std::copy_n(accountId.begin(), std::min(accountId.size(), sizeof(data.accountId) - 1), data.accountId);
 	std::copy(account.GetAccountPasswordCache().begin(), account.GetAccountPasswordCache().end(), data.accountPasswordCache);
 	// country & language
-	data.countryIndex = account.GetCountry();
+	data.countryIndex = account.GetCountry() < NCrypto::GetCountryCount() ? account.GetCountry() : 0;
 	strcpy(data.country, NCrypto::GetCountryAsString(data.countryIndex));
-	std::copy(account.GetTimeZoneId().cbegin(), account.GetTimeZoneId().cend(), data.timeZoneId);
+	const auto timeZoneId = account.GetTimeZoneId();
+	std::copy_n(timeZoneId.begin(), std::min(timeZoneId.size(), sizeof(data.timeZoneId) - 1), data.timeZoneId);
 	data.utcOffset = account.GetUtcOffset() / 1'000'000;
 	// Mii
 	std::copy(account.GetMiiData().begin(), account.GetMiiData().end(), (uint8*)&data.miiData);
-	std::copy(account.GetMiiName().begin(), account.GetMiiName().end(), data.miiNickname);
+	const auto miiName = account.GetMiiName();
+	std::copy_n(miiName.begin(), std::min(miiName.size(), std::size(data.miiNickname) - 1), data.miiNickname);
 		
 	// if online mode is disabled, make all accounts offline
 	if(!online_enabled)
@@ -113,6 +117,12 @@ void iosuAct_loadAccounts()
 	// first account is always our selected one
 	int counter = 0;
 	const auto& first_acc = Account::GetAccount(persistent_id);
+	if (first_acc.GetPersistentId() != persistent_id)
+	{
+		cemuLog_log(LogType::Force,
+			"IOSU_ACT: configured account {:08x} is unavailable; using {:08x} instead",
+			persistent_id, first_acc.GetPersistentId());
+	}
 	FillAccountData(first_acc, online_enabled, counter);
 	++counter;
 	// enable multiple accounts for cafe functions (badly tested)
@@ -125,7 +135,8 @@ void iosuAct_loadAccounts()
 	//	}
 	//}
 
-	cemuLog_log(LogType::Force, "IOSU_ACT: using account {} in first slot", boost::nowide::narrow(first_acc.GetMiiName()));
+	cemuLog_log(LogType::Force, "IOSU_ACT: using account {} ({:08x}) in first slot",
+		boost::nowide::narrow(first_acc.GetMiiName()), first_acc.GetPersistentId());
 	
 	_actAccountDataInitialized = true;
 }

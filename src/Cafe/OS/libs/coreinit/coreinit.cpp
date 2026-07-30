@@ -1,6 +1,8 @@
 #include "Cafe/OS/common/OSCommon.h"
+#include "Cafe/GraphicPack/GraphicPack2.h"
 #include "Common/SysAllocator.h"
 #include "Cafe/OS/RPL/rpl_symbol_storage.h"
+#include <cstring>
 
 #include "Cafe/OS/libs/coreinit/coreinit_Misc.h"
 
@@ -258,6 +260,36 @@ namespace coreinit
 
 	void OSPanic(const char* file, sint32 lineNumber, const char* msg)
 	{
+		// Minecraft v688's community crash fix deliberately skips unavailable
+		// FFL data. The game still asserts while creating placeholder Mii icons,
+		// but Cemu's OSPanic implementation returns and gameplay continues.
+		const bool isMinecraftMiiIconAssertion =
+			file != nullptr &&
+			std::strstr(file, "Minecraft") != nullptr &&
+			std::strstr(file, "MakeIcon.cpp") != nullptr;
+		if (isMinecraftMiiIconAssertion)
+		{
+			const auto& activePacks = GraphicPack2::GetActiveGraphicPacks();
+			const bool crashFixActive = std::any_of(
+				activePacks.begin(), activePacks.end(), [](const auto& pack)
+				{
+					return pack &&
+						pack->GetVirtualPath() ==
+						"Minecraft: Wii U Edition/Workarounds/Mii Crash Fix";
+				});
+			if (crashFixActive)
+			{
+				static std::once_flag warningOnce;
+				std::call_once(warningOnce, []
+					{
+						cemuLog_log(LogType::Force,
+							"Minecraft Mii icons are disabled because the Wii U FFL "
+							"resources are not installed; continuing with the active "
+							"Mii Crash Fix graphic pack.");
+					});
+				return;
+			}
+		}
 		cemuLog_log(LogType::Force, "OSPanic!");
 		cemuLog_log(LogType::Force, "File: {}:{}", file, lineNumber);
 		cemuLog_log(LogType::Force, "Msg: {}", msg);

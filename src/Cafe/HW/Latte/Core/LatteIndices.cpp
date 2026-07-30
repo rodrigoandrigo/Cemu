@@ -114,7 +114,9 @@ uint32 LatteIndices_calculateIndexOutputSize(LattePrimitiveMode primitiveMode, L
 		cemu_assert_suspicious();
 		return 0;
 	}
-	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN && g_renderer->GetType() == RendererAPI::Metal)
+	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN &&
+		(g_renderer->GetType() == RendererAPI::Metal ||
+			g_renderer->GetType() == RendererAPI::D3D11))
 	{
 		if (indexType == LatteIndexType::AUTO)
 		{
@@ -771,7 +773,9 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 			cemu_assert_debug(false);
 		outputCount = count + 1;
 	}
-	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN && g_renderer->GetType() == RendererAPI::Metal)
+	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN &&
+		(g_renderer->GetType() == RendererAPI::Metal ||
+			g_renderer->GetType() == RendererAPI::D3D11))
 	{
         if (indexType == LatteIndexType::AUTO)
     	{

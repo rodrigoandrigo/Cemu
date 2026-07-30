@@ -301,14 +301,9 @@ bool TestWriteAccess(const fs::path& p)
 // make path relative to Cemu directory
 fs::path MakeRelativePath(const fs::path& base, const fs::path& path)
 {
-	try
-	{
-		return fs::relative(path, base);
-	}
-	catch (const std::exception&)
-	{
-		return path;
-	}
+	std::error_code ec;
+	fs::path relativePath = fs::relative(path, base, ec);
+	return ec ? path : relativePath;
 }
 
 #ifdef HAS_DIRECTINPUT

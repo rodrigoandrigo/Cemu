@@ -740,14 +740,29 @@ bool GraphicPack2::SetActivePreset(std::string_view category, std::string_view n
 void GraphicPack2::LoadShaders()
 {
 	fs::path path = GetRulesPath();
-	for (auto& it : fs::directory_iterator(path.remove_filename()))
+	std::error_code ec;
+	fs::directory_iterator it(path.remove_filename(), ec);
+	const fs::directory_iterator end;
+	if (ec)
 	{
-		if (!is_regular_file(it))
+		cemuLog_log(LogType::Force, "graphicPack: unable to enumerate shader directory: {}", ec.message());
+		return;
+	}
+	for (; it != end; it.increment(ec))
+	{
+		if (ec)
+		{
+			cemuLog_log(LogType::Force, "graphicPack: error while enumerating shader directory: {}", ec.message());
+			break;
+		}
+
+		std::error_code entryError;
+		if (!it->is_regular_file(entryError) || entryError)
 			continue;
 
 		try
 		{
-			const auto& p = it.path();
+			const auto& p = it->path();
 			auto filename = p.filename().wstring();
 			uint64 shader_base_hash = 0;
 			uint64 shader_aux_hash = 0;
@@ -900,11 +915,17 @@ void GraphicPack2::_iterateReplacedFiles(const fs::path& currentPath, bool isAOC
 {
 	uint64 currentTitleId = CafeSystem::GetForegroundTitleId();
 	uint64 aocTitleId = (currentTitleId & 0xFFFFFFFFull) | 0x0005000c00000000ull;
-	for (auto& it : fs::recursive_directory_iterator(currentPath))
+	std::error_code ec;
+	fs::recursive_directory_iterator it(currentPath, fs::directory_options::skip_permission_denied, ec);
+	const fs::recursive_directory_iterator end;
+	for (; !ec && it != end; it.increment(ec))
 	{
-		if (fs::is_regular_file(it))
+		std::error_code entryError;
+		if (it->is_regular_file(entryError) && !entryError)
 		{
-			fs::path virtualMountPath = fs::relative(it.path(), currentPath);
+			fs::path virtualMountPath = fs::relative(it->path(), currentPath, entryError);
+			if (entryError)
+				continue;
 			if (isAOC)
 			{
 				virtualMountPath = fs::path(fmt::format("/vol/aoc{:016x}/", aocTitleId)) / virtualMountPath;
@@ -913,9 +934,13 @@ void GraphicPack2::_iterateReplacedFiles(const fs::path& currentPath, bool isAOC
 			{
 				virtualMountPath = fs::path(virtualMountBase) / virtualMountPath;
 			}
-			fscDeviceRedirect_add(virtualMountPath.generic_string(), it.file_size(), it.path().generic_string(), m_fs_priority);
+			const uintmax_t fileSize = it->file_size(entryError);
+			if (!entryError)
+				fscDeviceRedirect_add(virtualMountPath.generic_string(), fileSize, it->path().generic_string(), m_fs_priority);
 		}
 	}
+	if (ec)
+		cemuLog_log(LogType::Force, "graphicPack: error while enumerating replaced files in \"{}\": {}", _pathToUtf8(currentPath), ec.message());
 }
 
 void GraphicPack2::LoadReplacedFiles()
