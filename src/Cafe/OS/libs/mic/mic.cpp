@@ -83,6 +83,8 @@ bool mic_isConnected(uint32 drcIndex)
 
 sint32 mic_availableSamples(uint32 drcIndex)
 {
+	if (drcIndex >= std::size(MICStatus.drc) || MICStatus.drc[drcIndex].ringbufferSize == 0)
+		return 0;
 	return (MICStatus.drc[drcIndex].ringbufferSize+MICStatus.drc[drcIndex].writeIndex-MICStatus.drc[drcIndex].readIndex) % MICStatus.drc[drcIndex].ringbufferSize;
 }
 
@@ -93,18 +95,27 @@ bool mic_isActive(uint32 drcIndex)
 
 void mic_feedSamples(uint32 drcIndex, sint16* sampleData, sint32 numSamples)
 {
+	if (drcIndex >= std::size(MICStatus.drc) || !sampleData || numSamples <= 0)
+		return;
+	auto& status = MICStatus.drc[drcIndex];
+	if (!status.ringbufferSampleData || status.ringbufferSize < 2)
+		return;
+
 	uint16* sampleDataU16 = (uint16*)sampleData;
-	sint32 ringBufferSize = MICStatus.drc[0].ringbufferSize;
-	sint32 writeIndex = MICStatus.drc[0].writeIndex;
-	uint16* ringBufferBase = (uint16*)MICStatus.drc[0].ringbufferSampleData;
+	const uint32 ringBufferSize = status.ringbufferSize;
+	uint32 writeIndex = status.writeIndex;
+	uint16* ringBufferBase = (uint16*)status.ringbufferSampleData;
 	do
 	{
 		ringBufferBase[writeIndex] = _swapEndianU16(*sampleDataU16);
 		sampleDataU16++;
-		writeIndex++;
-		writeIndex %= ringBufferSize;
+		writeIndex = (writeIndex + 1) % ringBufferSize;
+		// Keep one slot empty so readIndex == writeIndex unambiguously means
+		// that no samples are available. Drop the oldest sample on overflow.
+		if (writeIndex == status.readIndex)
+			status.readIndex = (status.readIndex + 1) % ringBufferSize;
 	}while( (--numSamples) > 0 );
-	MICStatus.drc[0].writeIndex = writeIndex;
+	status.writeIndex = writeIndex;
 }
 
 void micExport_MICInit(PPCInterpreter_t* hCPU)
@@ -131,8 +142,22 @@ void micExport_MICInit(PPCInterpreter_t* hCPU)
 		return;
 	}
 	micRingbuffer_t* micRingbuffer = (micRingbuffer_t*)memory_getPointerFromVirtualOffset(hCPU->gpr[5]);
-	MICStatus.drc[drcIndex].ringbufferSampleData = memory_getPointerFromVirtualOffset(_swapEndianU32(micRingbuffer->samples));
-	MICStatus.drc[drcIndex].ringbufferSize = _swapEndianU32(micRingbuffer->size);
+	if (!micRingbuffer)
+	{
+		memory_writeU32(hCPU->gpr[6], (uint32)MIC_RESULT::BAD_PARAM);
+		osLib_returnFromFunction(hCPU, -1);
+		return;
+	}
+	const uint32 ringbufferSize = _swapEndianU32(micRingbuffer->size);
+	void* ringbufferSamples = memory_getPointerFromVirtualOffset(_swapEndianU32(micRingbuffer->samples));
+	if (!ringbufferSamples || ringbufferSize < 2)
+	{
+		memory_writeU32(hCPU->gpr[6], (uint32)MIC_RESULT::BAD_PARAM);
+		osLib_returnFromFunction(hCPU, -1);
+		return;
+	}
+	MICStatus.drc[drcIndex].ringbufferSampleData = ringbufferSamples;
+	MICStatus.drc[drcIndex].ringbufferSize = ringbufferSize;
 	MICStatus.drc[drcIndex].readIndex = 0;
 	MICStatus.drc[drcIndex].writeIndex = 0;
 	MICStatus.drc[drcIndex].isInited = true;
@@ -231,7 +256,7 @@ void micExport_MICClose(PPCInterpreter_t* hCPU)
 	// check if already closed
 	if( MICStatus.drc[drcIndex].isOpen == false )
 	{
-		osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::ALREADY_OPEN);
+		osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::NOT_OPEN);
 		return;
 	}
 	// success
@@ -387,9 +412,9 @@ void micExport_MICSetDataConsumed(PPCInterpreter_t* hCPU)
 		osLib_returnFromFunction(hCPU, (uint32)MIC_RESULT::NOT_OPEN);
 		return;
 	}
-	sint32 numConsumedSamples = (sint32)hCPU->gpr[4];
+	const uint32 numConsumedSamples = hCPU->gpr[4];
 	//debug_printf("MIC consume samples 0x%04x\n", numConsumedSamples);
-	if( mic_availableSamples(drcIndex) < numConsumedSamples )
+	if (numConsumedSamples > static_cast<uint32>(mic_availableSamples(drcIndex)))
 	{
 		MICStatus.drc[drcIndex].readIndex = MICStatus.drc[drcIndex].writeIndex;
 		osLib_returnFromFunction(hCPU, -81);
@@ -432,13 +457,13 @@ void mic_updateOnAXFrame()
 	mic_updateDevicePlayState(true);
 	if (g_inputAudio)
 	{
-		sint16 micSampleData[MIC_SAMPLES_PER_3MS_32KHZ];
+		sint16 micSampleData[MIC_SAMPLES_PER_3MS_32KHZ]{};
 		g_inputAudio->ConsumeBlock(micSampleData);
 		mic_feedSamples(0, micSampleData, MIC_SAMPLES_PER_3MS_32KHZ);
 	}
 	else
 	{
-		const sint32 micSampleCount = 32000 / 32;
+		const sint32 micSampleCount = MIC_SAMPLES_PER_3MS_32KHZ;
 		sint16 micSampleData[micSampleCount];
 
 		auto controller = InputManager::instance().get_vpad_controller(drcIndex);
@@ -459,6 +484,17 @@ void mic_updateOnAXFrame()
 
 namespace mic
 {
+	void Reset()
+	{
+		std::unique_lock lock(g_audioInputMutex);
+		if (g_inputAudio)
+		{
+			g_inputAudio->Stop();
+			g_inputAudio.reset();
+		}
+		MICStatus = {};
+	}
+
 	class : public COSModule
 	{
 		public:

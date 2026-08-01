@@ -834,10 +834,36 @@ glm::ivec2 InputManager::get_mouse_position(bool pad_window) const
 	}
 }
 
+void InputManager::set_virtual_mouse(bool enabled, glm::ivec2 position, bool left_down)
+{
+	std::unique_lock lock(m_virtual_mouse.m_mutex);
+	const bool was_down = m_virtual_mouse.left_down;
+	m_virtual_mouse.position = position;
+	m_virtual_mouse.left_down = enabled && left_down;
+	m_virtual_mouse.right_down = false;
+	m_virtual_mouse.right_down_toggle = false;
+	if (m_virtual_mouse.left_down && !was_down)
+		m_virtual_mouse.left_down_toggle = true;
+	if (!enabled)
+		m_virtual_mouse.left_down_toggle = false;
+	m_virtual_mouse_capture.store(enabled, std::memory_order_release);
+}
+
 std::optional<glm::ivec2> InputManager::get_left_down_mouse_info(bool* is_pad)
 {
 	if (is_pad)
 		*is_pad = false;
+
+	if (m_virtual_mouse_capture.load(std::memory_order_acquire))
+	{
+		std::unique_lock lock(m_virtual_mouse.m_mutex);
+		if (std::exchange(m_virtual_mouse.left_down_toggle, false) ||
+			m_virtual_mouse.left_down)
+			return m_virtual_mouse.position;
+		// Physical mouse/touch input is intentionally hidden while the GamePad
+		// virtual mouse owns the pointer.
+		return {};
+	}
 
 	{
 		std::shared_lock lock(m_main_mouse.m_mutex);
@@ -885,6 +911,8 @@ std::optional<glm::ivec2> InputManager::get_right_down_mouse_info(bool* is_pad)
 {
 	if (is_pad)
 		*is_pad = false;
+	if (m_virtual_mouse_capture.load(std::memory_order_acquire))
+		return {};
 
 	{
 		std::shared_lock lock(m_main_mouse.m_mutex);

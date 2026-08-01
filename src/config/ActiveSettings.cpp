@@ -70,19 +70,12 @@ CPUMode ActiveSettings::GetCPUMode()
 
 	if (mode == CPUMode::Auto)
 	{
-#if defined(CEMU_UWP)
-		// The UWP embed currently shares its lifetime with the XAML host and
-		// SwapChainPanel.  Keep the default scheduler on one emulated core
-		// until the multi-core title scheduler can be stopped and joined as
-		// part of the embed lifecycle.  This avoids secondary OSSched workers
-		// continuing through partially initialized or torn-down guest state.
-		mode = CPUMode::SinglecoreRecompiler;
-#else
+		// Auto follows the same hardware-based policy on desktop and in the UWP
+		// host instead of silently changing the user's selection to single-core.
 		if (GetPhysicalCoreCount() >= 4)
 			mode = CPUMode::MulticoreRecompiler;
 		else
 			mode = CPUMode::SinglecoreRecompiler;
-#endif
 	}
 	else if (mode == CPUMode::DualcoreRecompiler) // dualcore is disabled now
 		mode = CPUMode::MulticoreRecompiler;

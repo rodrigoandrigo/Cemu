@@ -48,6 +48,7 @@ public:
 
 private:
 	uint32 GetQueuedBuffers() const;
+	uint32 GetQueuedBuffersLocked() const;
 
 	struct XAudioDeleter
 	{
@@ -71,4 +72,5 @@ private:
 	DWORD m_sound_buffer_size = 0;
 	uint32_t m_offset = 0;
 	uint32_t m_blocks_queued = 0;
+	mutable std::mutex m_voice_mutex;
 };

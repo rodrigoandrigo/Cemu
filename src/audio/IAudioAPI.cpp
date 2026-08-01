@@ -2,7 +2,9 @@
 
 #if BOOST_OS_WINDOWS && defined(HAS_XAUDIO)
 #include "XAudio2API.h"
+#if defined(HAS_XAUDIO27)
 #include "XAudio27API.h"
+#endif
 #endif
 #if BOOST_OS_WINDOWS && defined(HAS_DIRECTAUDIO)
 #include "DirectSoundAPI.h"
@@ -24,7 +26,13 @@ std::array<bool, IAudioAPI::AudioAPIEnd> IAudioAPI::s_availableApis{};
 IAudioAPI::IAudioAPI(uint32 samplerate, uint32 channels, uint32 samples_per_block, uint32 bits_per_sample)
 	: m_samplerate(samplerate), m_channels(channels), m_samplesPerBlock(samples_per_block), m_bitsPerSample(bits_per_sample)
 {
-	m_bytesPerBlock = samples_per_block * channels * (bits_per_sample / 8);
+	if (samplerate == 0 || channels == 0 || samples_per_block == 0 || bits_per_sample == 0 || (bits_per_sample % 8) != 0)
+		throw std::invalid_argument("invalid audio stream format");
+
+	const uint64 bytesPerBlock = static_cast<uint64>(samples_per_block) * channels * (bits_per_sample / 8);
+	if (bytesPerBlock > std::numeric_limits<uint32>::max())
+		throw std::overflow_error("audio block size is too large");
+	m_bytesPerBlock = static_cast<uint32>(bytesPerBlock);
 	InitWFX(m_samplerate, m_channels, m_bitsPerSample);
 }
 
@@ -58,16 +66,19 @@ void IAudioAPI::InitWFX(sint32 samplerate, sint32 channels, sint32 bits_per_samp
 	switch (channels)
 	{
 	case 8:
-		m_wfx.dwChannelMask |= (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT | SPEAKER_FRONT_LEFT_OF_CENTER | SPEAKER_FRONT_RIGHT_OF_CENTER);
+		m_wfx.dwChannelMask = (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT | SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT);
 		break;
 	case 6:
-		m_wfx.dwChannelMask |= (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT);
+		m_wfx.dwChannelMask = (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT);
 		break;
 	case 4:
-		m_wfx.dwChannelMask |= (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT);
+		m_wfx.dwChannelMask = (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT);
 		break;
 	case 2:
-		m_wfx.dwChannelMask |= (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+		m_wfx.dwChannelMask = (SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT);
+		break;
+	case 1:
+		m_wfx.dwChannelMask = SPEAKER_FRONT_CENTER;
 		break;
 	default:
 		m_wfx.dwChannelMask = 0;
@@ -78,7 +89,8 @@ void IAudioAPI::InitWFX(sint32 samplerate, sint32 channels, sint32 bits_per_samp
 
 void IAudioAPI::InitializeStatic()
 {
-	s_audioDelay = GetConfig().audio_delay;
+	s_availableApis.fill(false);
+	s_audioDelay = std::clamp<sint32>(GetConfig().audio_delay, 1, static_cast<sint32>(kBlockCount - 1));
 
 #if BOOST_OS_WINDOWS && defined(HAS_DIRECTAUDIO)
 	s_availableApis[DirectSound] = true;
@@ -123,12 +135,9 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
 	{
 #ifdef CEMU_UWP
 		// The embedded UWP host has a single system-selected render endpoint.
-		// Keep optional outputs disabled, but make an unset TV device resolve
-		// to the XAudio2 default endpoint.
-		if (type == AudioType::TV)
-			selectedDevice = L"default";
-		else
-			return {};
+		// Route TV, GamePad and accessory audio to it so games that send sound
+		// exclusively to the Wii U GamePad do not become silent.
+		selectedDevice = L"default";
 #else
 		return {};
 #endif
@@ -167,6 +176,8 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
 		throw std::runtime_error("failed to find selected device while trying to create audio device");
 
 	audioAPIDev = CreateDevice(audio_api, device_description, rate, channels, samples_per_block, bits_per_sample);
+	if (!audioAPIDev)
+		throw std::runtime_error("selected audio backend could not create a device");
 	audioAPIDev->SetVolume(GetVolumeFromType(type));
 
 	return audioAPIDev;
@@ -174,7 +185,7 @@ AudioAPIPtr IAudioAPI::CreateDeviceFromConfig(AudioType type, sint32 rate, sint3
 
 AudioAPIPtr IAudioAPI::CreateDevice(AudioAPI api, const DeviceDescriptionPtr& device, sint32 samplerate, sint32 channels, sint32 samples_per_block, sint32 bits_per_sample)
 {
-	if (!IsAudioAPIAvailable(api))
+	if (!IsAudioAPIAvailable(api) || !device)
 		return {};
 
 	switch (api)
@@ -183,6 +194,8 @@ AudioAPIPtr IAudioAPI::CreateDevice(AudioAPI api, const DeviceDescriptionPtr& de
 	case DirectSound:
 	{
 		const auto tmp = std::dynamic_pointer_cast<DirectSoundAPI::DirectSoundDeviceDescription>(device);
+		if (!tmp)
+			throw std::invalid_argument("audio device does not belong to DirectSound");
 		return std::make_unique<DirectSoundAPI>(tmp->GetGUID(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
 #endif
@@ -191,12 +204,16 @@ AudioAPIPtr IAudioAPI::CreateDevice(AudioAPI api, const DeviceDescriptionPtr& de
 	case XAudio27:
 	{
 		const auto tmp = std::dynamic_pointer_cast<XAudio27API::XAudio27DeviceDescription>(device);
+		if (!tmp)
+			throw std::invalid_argument("audio device does not belong to XAudio 2.7");
 		return std::make_unique<XAudio27API>(tmp->GetDeviceId(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
 	#endif
 	case XAudio2:
 	{
 		const auto tmp = std::dynamic_pointer_cast<XAudio2API::XAudio2DeviceDescription>(device);
+		if (!tmp)
+			throw std::invalid_argument("audio device does not belong to XAudio 2.8");
 		return std::make_unique<XAudio2API>(tmp->GetDeviceId(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
 #endif
@@ -204,6 +221,8 @@ AudioAPIPtr IAudioAPI::CreateDevice(AudioAPI api, const DeviceDescriptionPtr& de
 	case Cubeb:
 	{
 		const auto tmp = std::dynamic_pointer_cast<CubebAPI::CubebDeviceDescription>(device);
+		if (!tmp)
+			throw std::invalid_argument("audio device does not belong to Cubeb");
 		return std::make_unique<CubebAPI>(tmp->GetDeviceId(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
 #endif

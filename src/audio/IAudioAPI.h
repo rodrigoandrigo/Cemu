@@ -85,7 +85,7 @@ protected:
 	uint32 m_bytesPerBlock;
 
 	sint32 m_volume = 0, m_inputVolume = 0;
-	bool m_playing = false;
+	std::atomic_bool m_playing{false};
 
 	static std::array<bool, AudioAPIEnd> s_availableApis;
 	uint32 m_audioDelayOverride = 0;

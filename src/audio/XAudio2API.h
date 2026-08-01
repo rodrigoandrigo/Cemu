@@ -45,6 +45,7 @@ public:
 
 private:
 	uint32 GetQueuedBuffers() const;
+	uint32 GetQueuedBuffersLocked() const;
 
 	static const std::vector<DeviceDescriptionPtr>& RefreshDevices();
 
@@ -62,7 +63,7 @@ private:
 	std::unique_ptr<IXAudio2SourceVoice, VoiceDeleter> m_source_voice;
 
 	std::unique_ptr<uint8[]> m_audio_buffer[kBlockCount];
-	DWORD m_sound_buffer_size = 0;
 	uint32_t m_offset = 0;
 	uint32_t m_blocks_queued = 0;
+	mutable std::mutex m_voice_mutex;
 };

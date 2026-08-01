@@ -150,7 +150,7 @@ namespace snd_core
 
 	#define AX_FRAMES_PER_GROUP		(4)
 
-	sint16 tempTVChannelData[AX_SAMPLES_MAX * AX_TV_CHANNEL_COUNT * AX_FRAMES_PER_GROUP] = {};
+	sint16 tempTVChannelData[AX_SAMPLES_MAX * 8 * AX_FRAMES_PER_GROUP] = {};
 	sint32 tempAudioBlockCounter = 0;
 
 
@@ -159,8 +159,46 @@ namespace snd_core
 	sint16 __buf_AXDRCDMABuffers_2[AX_SAMPLES_MAX * 6];
 	sint16* __AXDRCDMABuffers[3] = { __buf_AXDRCDMABuffers_0, __buf_AXDRCDMABuffers_1, __buf_AXDRCDMABuffers_2 };
 
-	sint16 tempDRCChannelData[AX_SAMPLES_MAX * 6 * AX_FRAMES_PER_GROUP] = {};
+	sint16 tempDRCChannelData[AX_SAMPLES_MAX * 8 * AX_FRAMES_PER_GROUP] = {};
 	sint32 tempDRCAudioBlockCounter = 0;
+
+	static void ConvertInterleavedAudioBlock(const sint16* input, sint32 inputSampleCount, sint16* output, uint32 outputChannels)
+	{
+		if (!input || !output || inputSampleCount <= 0 || outputChannels == 0)
+			return;
+
+		const uint32 frameCount = AX_SAMPLES_PER_3MS_48KHZ;
+		const uint32 inputChannels = static_cast<uint32>(inputSampleCount) / frameCount;
+		if (inputChannels == 0 || inputChannels > 6 || inputSampleCount != static_cast<sint32>(frameCount * inputChannels))
+		{
+			cemuLog_log(LogType::Force, "AX rejected malformed audio block: {} samples", inputSampleCount);
+			std::fill_n(output, frameCount * outputChannels, 0);
+			return;
+		}
+
+		for (uint32 frame = 0; frame < frameCount; ++frame)
+		{
+			const sint16* inputFrame = input + frame * inputChannels;
+			sint16* outputFrame = output + frame * outputChannels;
+			if (outputChannels == 1 && inputChannels > 1)
+			{
+				const sint32 left = _swapEndianS16(inputFrame[0]);
+				const sint32 right = _swapEndianS16(inputFrame[1]);
+				outputFrame[0] = static_cast<sint16>((left + right) / 2);
+				continue;
+			}
+
+			for (uint32 channel = 0; channel < outputChannels; ++channel)
+			{
+				if (inputChannels == 1)
+					outputFrame[channel] = _swapEndianS16(inputFrame[0]);
+				else if (channel < inputChannels)
+					outputFrame[channel] = _swapEndianS16(inputFrame[channel]);
+				else
+					outputFrame[channel] = 0;
+			}
+		}
+	}
 
 	void AIInitDMA(sint16* sampleData, sint32 size)
 	{
@@ -175,10 +213,7 @@ namespace snd_core
 
 		const uint32 channels = g_tvAudio ? g_tvAudio->GetChannels() : AX_TV_CHANNEL_COUNT;
 		sint16* outputChannel = tempTVChannelData + AX_SAMPLES_PER_3MS_48KHZ * tempAudioBlockCounter * channels;
-		for (sint32 i = 0; i < sampleCount; ++i)
-		{
-			outputChannel[i] = _swapEndianS16(sampleData[i]);
-		}
+		ConvertInterleavedAudioBlock(sampleData, sampleCount, outputChannel, channels);
 
 		tempAudioBlockCounter++;
 		if (tempAudioBlockCounter == AX_FRAMES_PER_GROUP)
@@ -311,10 +346,7 @@ namespace snd_core
 
 		const uint32 channels = g_padAudio ? g_padAudio->GetChannels() : AX_DRC_CHANNEL_COUNT;
 		sint16* outputChannel = tempDRCChannelData + AX_SAMPLES_PER_3MS_48KHZ * tempDRCAudioBlockCounter * channels;
-		for (sint32 i = 0; i < sampleCount; ++i)
-		{
-			outputChannel[i] = _swapEndianS16(sampleData[i]);
-		}
+		ConvertInterleavedAudioBlock(sampleData, sampleCount, outputChannel, channels);
 
 		tempDRCAudioBlockCounter++;
 		if (tempDRCAudioBlockCounter == AX_FRAMES_PER_GROUP)
@@ -398,6 +430,10 @@ namespace snd_core
 	{
 
 		numQueuedFramesSndGeneric = 0;
+		tempAudioBlockCounter = 0;
+		tempDRCAudioBlockCounter = 0;
+		std::fill(std::begin(tempTVChannelData), std::end(tempTVChannelData), 0);
+		std::fill(std::begin(tempDRCChannelData), std::end(tempDRCChannelData), 0);
 
 		std::unique_lock lock(g_audioMutex);
 		if (!g_tvAudio)
@@ -406,7 +442,7 @@ namespace snd_core
 			{
 				g_tvAudio = IAudioAPI::CreateDeviceFromConfig(IAudioAPI::AudioType::TV, 48000, snd_core::AX_SAMPLES_PER_3MS_48KHZ * AX_FRAMES_PER_GROUP, 16);
 			}
-			catch (std::runtime_error& ex)
+			catch (const std::exception& ex)
 			{
 				cemuLog_log(LogType::Force, "can't initialize tv audio: {}", ex.what());
 			}
@@ -419,7 +455,7 @@ namespace snd_core
 			{
 				g_padAudio = IAudioAPI::CreateDeviceFromConfig(IAudioAPI::AudioType::Gamepad, 48000, snd_core::AX_SAMPLES_PER_3MS_48KHZ * AX_FRAMES_PER_GROUP, 16);
 			}
-			catch (std::runtime_error& ex)
+			catch (const std::exception& ex)
 			{
 				cemuLog_log(LogType::Force, "can't initialize pad audio: {}", ex.what());
 			}
@@ -429,6 +465,8 @@ namespace snd_core
 	void AXOut_reset()
 	{
 		std::unique_lock lock(g_audioMutex);
+		tempAudioBlockCounter = 0;
+		tempDRCAudioBlockCounter = 0;
 		if (g_tvAudio)
 		{
 			g_tvAudio->Stop();

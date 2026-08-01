@@ -11,7 +11,12 @@ std::array<bool, IAudioInputAPI::AudioInputAPIEnd> IAudioInputAPI::s_availableAp
 IAudioInputAPI::IAudioInputAPI(uint32 samplerate, uint32 channels, uint32 samples_per_block, uint32 bits_per_sample)
 	: m_samplerate(samplerate), m_channels(channels), m_samplesPerBlock(samples_per_block), m_bitsPerSample(bits_per_sample) 
 {
-	m_bytesPerBlock = samples_per_block * channels * (bits_per_sample / 8);
+	if (samplerate == 0 || channels == 0 || samples_per_block == 0 || bits_per_sample == 0 || (bits_per_sample % 8) != 0)
+		throw std::invalid_argument("invalid audio input stream format");
+	const uint64 bytesPerBlock = static_cast<uint64>(samples_per_block) * channels * (bits_per_sample / 8);
+	if (bytesPerBlock > std::numeric_limits<uint32>::max())
+		throw std::overflow_error("audio input block size is too large");
+	m_bytesPerBlock = static_cast<uint32>(bytesPerBlock);
 }
 
 void IAudioInputAPI::PrintLogging()
@@ -22,6 +27,7 @@ void IAudioInputAPI::PrintLogging()
 
 void IAudioInputAPI::InitializeStatic()
 {
+	s_availableApis.fill(false);
 #if HAS_CUBEB
 	s_availableApis[Cubeb] = CubebInputAPI::InitializeStatic();
 #endif
@@ -38,7 +44,7 @@ bool IAudioInputAPI::IsAudioInputAPIAvailable(AudioInputAPI api)
 
 AudioInputAPIPtr IAudioInputAPI::CreateDevice(AudioInputAPI api, const DeviceDescriptionPtr& device, sint32 samplerate, sint32 channels, sint32 samples_per_block, sint32 bits_per_sample)
 {
-	if (!IsAudioInputAPIAvailable(api))
+	if (!IsAudioInputAPIAvailable(api) || !device)
 		return {};
 
 	switch(api)
@@ -47,6 +53,8 @@ AudioInputAPIPtr IAudioInputAPI::CreateDevice(AudioInputAPI api, const DeviceDes
 	case Cubeb:
 	{
 		const auto tmp = std::dynamic_pointer_cast<CubebInputAPI::CubebDeviceDescription>(device);
+		if (!tmp)
+			throw std::invalid_argument("audio input device does not belong to Cubeb");
 		return std::make_unique<CubebInputAPI>(tmp->GetDeviceId(), samplerate, channels, samples_per_block, bits_per_sample);
 	}
 #endif

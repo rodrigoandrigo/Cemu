@@ -1,5 +1,6 @@
 #include "input/api/SDL/SDLController.h"
 
+#include "input/InputManager.h"
 #include "input/api/SDL/SDLControllerProvider.h"
 
 SDLController::SDLController(const SDL_GUID& guid, size_t guid_index)
@@ -136,9 +137,39 @@ ControllerState SDLController::raw_state()
 			result.buttons.SetButtonState(i, true);
 	}
 
-	if (m_axis[SDL_GAMEPAD_AXIS_LEFTX])
+#if defined(CEMU_UWP)
+	const bool virtualMouseCapture = InputManager::instance().is_virtual_mouse_capture_enabled();
+	const bool virtualMouseChord =
+		SDL_GetGamepadButton(m_controller, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER) &&
+		SDL_GetGamepadButton(m_controller, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+	// L+R is reserved as the virtual-mouse toggle, including the frame that
+	// disables capture, so the chord never leaks through to the title.
+	if (virtualMouseChord)
+	{
+		result.buttons.SetButtonState(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, false);
+		result.buttons.SetButtonState(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, false);
+	}
+	if (virtualMouseCapture)
+	{
+		// The UWP host owns these controls while its GamePad virtual mouse is
+		// active. Avoid sending the same A/L/R actions to the emulated title.
+		result.buttons.SetButtonState(SDL_GAMEPAD_BUTTON_SOUTH, false);
+		result.buttons.SetButtonState(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, false);
+		result.buttons.SetButtonState(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, false);
+	}
+#endif
+
+	if (m_axis[SDL_GAMEPAD_AXIS_LEFTX]
+#if defined(CEMU_UWP)
+		&& !virtualMouseCapture
+#endif
+	)
 		result.axis.x = (float)SDL_GetGamepadAxis(m_controller, SDL_GAMEPAD_AXIS_LEFTX) / 32767.0f;
-	if (m_axis[SDL_GAMEPAD_AXIS_LEFTY])
+	if (m_axis[SDL_GAMEPAD_AXIS_LEFTY]
+#if defined(CEMU_UWP)
+		&& !virtualMouseCapture
+#endif
+	)
 		result.axis.y = (float)SDL_GetGamepadAxis(m_controller, SDL_GAMEPAD_AXIS_LEFTY) / 32767.0f;
 	if (m_axis[SDL_GAMEPAD_AXIS_RIGHTX])
 		result.rotation.x = (float)SDL_GetGamepadAxis(m_controller, SDL_GAMEPAD_AXIS_RIGHTX) / 32767.0f;

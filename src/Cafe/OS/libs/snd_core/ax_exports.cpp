@@ -4,6 +4,7 @@
 #include "Cafe/OS/common/OSCommon.h"
 #include "Cafe/OS/libs/coreinit/coreinit_MessageQueue.h"
 #include "OS/libs/coreinit/coreinit_DynLoad.h"
+#include "Cafe/OS/libs/mic/mic.h"
 
 namespace snd_core
 {
@@ -393,6 +394,7 @@ namespace snd_core
 	void reset()
 	{
         AXOut_reset();
+		mic::Reset();
         AXResetToDefaultState();
         sndGeneric.isInitialized = false;
 		sndGeneric.isSoundCore2 = false;

@@ -31,7 +31,7 @@ public:
 	bool ConsumeBlock(sint16* data) override;
 	bool Play() override;
 	bool Stop() override;
-	bool IsPlaying() const override { return m_is_playing;  };
+	bool IsPlaying() const override { return m_is_playing.load(std::memory_order_acquire); };
 	void SetVolume(sint32 volume) override;
 
 	static std::vector<DeviceDescriptionPtr> GetDevices();
@@ -43,7 +43,7 @@ private:
 	inline static cubeb* s_context = nullptr;
 
 	cubeb_stream* m_stream = nullptr;
-	bool m_is_playing = false;
+	std::atomic_bool m_is_playing{false};
 
 	mutable std::shared_mutex m_mutex;
 	std::vector<uint8> m_buffer;

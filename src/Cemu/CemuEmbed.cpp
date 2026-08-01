@@ -1150,6 +1150,19 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile
 #endif
 	return CEMU_EMBED_OK;
 }
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
+	CemuEmbedInstance* instance, int32_t x, int32_t y,
+	int32_t leftDown, int32_t enabled) {
+	if (!instance)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	InputManager::instance().set_virtual_mouse(
+		enabled != 0,
+		{ (std::max)(x, 0), (std::max)(y, 0) },
+		leftDown != 0);
+	return CEMU_EMBED_OK;
+}
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance) {
 	if (!instance) return CEMU_EMBED_INVALID_ARGUMENT;
 	if (CemuRuntime::HasFatalError()) {
@@ -1199,7 +1212,10 @@ extern "C" void CEMU_EMBED_CALL CemuEmbed_Destroy(CemuEmbedInstance* instance) {
 	CemuEmbed_RequestStop(instance);
 	if (instance->initializationThread.joinable()) instance->initializationThread.join();
 	if (instance->state.load(std::memory_order_acquire) == CEMU_EMBED_STATE_STOPPING) SetState(instance, CEMU_EMBED_STATE_STOPPED);
-	if (instance->initialized.load(std::memory_order_acquire)) CafeSystem::Shutdown();
+	if (instance->initialized.load(std::memory_order_acquire)) {
+		InputManager::instance().set_virtual_mouse(false, {}, false);
+		CafeSystem::Shutdown();
+	}
 	{ std::lock_guard lock(s_instanceMutex); if (s_instance == instance) s_instance = nullptr; }
 	if (instance->loggingCallbacksInstalled.load(std::memory_order_acquire)) cemuLog_clearCallbacks();
 	delete instance;

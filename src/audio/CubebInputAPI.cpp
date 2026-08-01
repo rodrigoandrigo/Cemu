@@ -31,12 +31,14 @@ static void state_cb(cubeb_stream* stream, void* user, cubeb_state state)
 
 long CubebInputAPI::data_cb(cubeb_stream* stream, void* user, const void* inputbuffer, void* outputbuffer, long nframes)
 {
+	if (!user || !inputbuffer || nframes <= 0)
+		return nframes > 0 ? nframes : 0;
 	auto* thisptr = (CubebInputAPI*)user;
 
 	const auto size = (size_t)nframes * thisptr->m_channels * (thisptr->m_bitsPerSample / 8);
 
 	std::unique_lock lock(thisptr->m_mutex);
-	if (thisptr->m_buffer.capacity() <= thisptr->m_buffer.size() + size)
+	if (thisptr->m_buffer.size() + size > thisptr->m_buffer.capacity())
 	{
 		cemuLog_logDebug(LogType::Force, "dropped input sound block since too many buffers are queued");
 		return nframes;
@@ -64,7 +66,7 @@ CubebInputAPI::CubebInputAPI(cubeb_devid devid, uint32 samplerate, uint32 channe
 		input_params.layout = CUBEB_LAYOUT_3F4_LFE;
 		break;
 	case 6:
-		input_params.layout = CUBEB_LAYOUT_QUAD_LFE | CHANNEL_FRONT_CENTER;
+		input_params.layout = CUBEB_LAYOUT_3F2_LFE_BACK;
 		break;
 	case 4:
 		input_params.layout = CUBEB_LAYOUT_QUAD;
@@ -102,6 +104,8 @@ CubebInputAPI::~CubebInputAPI()
 
 bool CubebInputAPI::ConsumeBlock(sint16* data)
 {
+	if (!data)
+		return false;
 	std::unique_lock lock(m_mutex);
 	if (m_buffer.empty())
 	{
@@ -124,12 +128,14 @@ bool CubebInputAPI::ConsumeBlock(sint16* data)
 
 bool CubebInputAPI::Play()
 {
-	if (m_is_playing)
+	if (!m_stream)
+		return false;
+	if (m_is_playing.load(std::memory_order_acquire))
 		return true;
 
 	if (cubeb_stream_start(m_stream) == CUBEB_OK)
 	{
-		m_is_playing = true;
+		m_is_playing.store(true, std::memory_order_release);
 		return true;
 	}
 
@@ -138,12 +144,16 @@ bool CubebInputAPI::Play()
 
 bool CubebInputAPI::Stop()
 {
-	if (!m_is_playing)
+	if (!m_stream)
+		return false;
+	if (!m_is_playing.load(std::memory_order_acquire))
 		return true;
 
 	if (cubeb_stream_stop(m_stream) == CUBEB_OK)
 	{
-		m_is_playing = false;
+		m_is_playing.store(false, std::memory_order_release);
+		std::unique_lock lock(m_mutex);
+		m_buffer.clear();
 		return true;
 	}
 
@@ -152,8 +162,10 @@ bool CubebInputAPI::Stop()
 
 void CubebInputAPI::SetVolume(sint32 volume)
 {
+	volume = std::clamp<sint32>(volume, 0, 100);
 	IAudioInputAPI::SetVolume(volume);
-	cubeb_stream_set_volume(m_stream, (float)volume / 100.0f);
+	if (m_stream)
+		cubeb_stream_set_volume(m_stream, static_cast<float>(volume) / 100.0f);
 }
 
 bool CubebInputAPI::InitializeStatic()
@@ -170,7 +182,10 @@ bool CubebInputAPI::InitializeStatic()
 void CubebInputAPI::Destroy()
 {
 	if (s_context)
+	{
 		cubeb_destroy(s_context);
+		s_context = nullptr;
+	}
 }
 
 std::vector<IAudioInputAPI::DeviceDescriptionPtr> CubebInputAPI::GetDevices()

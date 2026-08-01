@@ -97,6 +97,8 @@ private:
 	void UpdateInputLayout();
 	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance);
 	void UpdateSamplerSwizzleBuffer(class LatteDecompilerShader* shader);
+	bool UpdateDynamicConstantBuffer(Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
+		UINT& capacity, const void* data, UINT size);
 	void ApplyPipelineState();
 	void HandleSpecialState5();
 	void CheckDebugMessages(const char* scope);
@@ -126,8 +128,15 @@ private:
 	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBuffers{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_uniformVarsBuffers{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_samplerSwizzleBuffers{};
+	std::array<UINT, 3> m_uniformVarsBufferCapacity{};
+	std::array<UINT, 3> m_samplerSwizzleBufferCapacity{};
+	std::array<std::vector<uint8>, 3> m_uniformScratch{};
+	std::array<std::vector<uint8>, 3> m_uploadedUniformScratch{};
+	std::array<bool, 3> m_uniformScratchUploaded{};
 	std::array<std::array<std::array<uint32, 4>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3>
 		m_samplerSwizzles{};
+	decltype(m_samplerSwizzles) m_uploadedSamplerSwizzles{};
+	std::array<bool, 3> m_samplerSwizzleUploaded{};
 	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutOffsets{};
 	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
 	std::array<bool, 8> m_boundColorBlendable{ true, true, true, true, true, true, true, true };
@@ -144,6 +153,7 @@ private:
 	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
 	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_surfaceCopyDepthState;
 	Microsoft::WRL::ComPtr<ID3D11InputLayout> m_inputLayout;
+	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11InputLayout>> m_inputLayoutCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11SamplerState>> m_samplerCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11RasterizerState>> m_rasterizerCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11BlendState>> m_blendCache;
@@ -153,6 +163,7 @@ private:
 	std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> m_feedbackResources;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> m_feedbackViews;
 	uint64 m_inputLayoutKey{};
+	bool m_inputLayoutKeyValid{};
 	bool m_imguiInitialized{};
 	bool m_graphicsStateInvalid{};
 };

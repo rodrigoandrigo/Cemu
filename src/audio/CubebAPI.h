@@ -44,7 +44,7 @@ private:
 	inline static cubeb* s_context = nullptr;
 
 	cubeb_stream* m_stream = nullptr;
-	bool m_is_playing = false;
+	std::atomic_bool m_is_playing{false};
 
 	mutable std::shared_mutex m_mutex;
 	std::vector<uint8> m_buffer;

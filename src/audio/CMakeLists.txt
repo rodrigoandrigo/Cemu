@@ -30,6 +30,11 @@ if(WIN32 AND ENABLE_XAUDIO)
 		target_compile_definitions(CemuAudio PRIVATE HAS_XAUDIO27)
 	endif()
 	target_compile_definitions(CemuAudio PRIVATE HAS_XAUDIO)
+	if(CEMU_UWP)
+		# XAudio2Create is a linked Windows SDK API in an AppContainer; unlike
+		# desktop Cemu it cannot be resolved with LoadLibrary/GetProcAddress.
+		target_link_libraries(CemuAudio PRIVATE xaudio2)
+	endif()
 endif()
 
 if(ENABLE_CUBEB)

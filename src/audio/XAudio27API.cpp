@@ -18,12 +18,12 @@ XAudio27API::XAudio27API(uint32 device_id, uint32 samplerate, uint32 channels, u
 		device_id = 0;
 
 	HRESULT hres;
-	IXAudio2* xaudio;
+	IXAudio2* xaudio = nullptr;
 	if (FAILED((hres = XAudio2Create(&xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR))))
 		throw std::runtime_error(fmt::format("can't create xaudio device (hres: {:#x})", hres));
 	m_xaudio = decltype(m_xaudio)(xaudio);
 
-	IXAudio2MasteringVoice* mastering_voice;
+	IXAudio2MasteringVoice* mastering_voice = nullptr;
 	if (FAILED((hres = m_xaudio->CreateMasteringVoice(&mastering_voice, channels, samplerate, 0, device_id))))
 		throw std::runtime_error(fmt::format("can't create xaudio mastering voice (hres: {:#x})", hres));
 
@@ -58,7 +58,7 @@ XAudio27API::XAudio27API(uint32 device_id, uint32 samplerate, uint32 channels, u
 		break;
 	}
 
-	IXAudio2SourceVoice* source_voice;
+	IXAudio2SourceVoice* source_voice = nullptr;
 	if (FAILED((hres = m_xaudio->CreateSourceVoice(&source_voice, &m_wfx.Format, 0, 1.0f))))
 		throw std::runtime_error(fmt::format("can't create xaudio source voice (hres: {:#x})", hres));
 	m_source_voice = decltype(m_source_voice)(source_voice);
@@ -68,15 +68,21 @@ XAudio27API::XAudio27API(uint32 device_id, uint32 samplerate, uint32 channels, u
 	for (uint32 i = 0; i < kBlockCount; ++i)
 		m_audio_buffer[i] = std::make_unique<uint8[]>(m_bytesPerBlock);
 
-	m_xaudio->StartEngine();
+	if (FAILED((hres = m_xaudio->StartEngine())))
+		throw std::runtime_error(fmt::format("can't start xaudio 2.7 engine (hres: {:#x})", hres));
 }
 
 XAudio27API::~XAudio27API()
 {
-	if(m_xaudio)
+	std::scoped_lock lock(m_voice_mutex);
+	if (m_source_voice)
+	{
+		m_source_voice->Stop(0);
+		m_source_voice->FlushSourceBuffers();
+	}
+	m_playing = false;
+	if (m_xaudio)
 		m_xaudio->StopEngine();
-
-	XAudio27API::Stop();
 
 	m_source_voice.reset();
 	m_mastering_voice.reset();
@@ -85,14 +91,20 @@ XAudio27API::~XAudio27API()
 
 void XAudio27API::SetVolume(sint32 volume)
 {
+	volume = std::clamp<sint32>(volume, 0, 100);
+	std::scoped_lock lock(m_voice_mutex);
 	IAudioAPI::SetVolume(volume);
-	m_mastering_voice->SetVolume((float)volume / 100.0f);
+	if (m_mastering_voice)
+		m_mastering_voice->SetVolume(static_cast<float>(volume) / 100.0f);
 }
 
 bool XAudio27API::Play()
 {
+	std::scoped_lock lock(m_voice_mutex);
 	if (m_playing)
 		return true;
+	if (!m_source_voice)
+		return false;
 
 	m_playing = SUCCEEDED(m_source_voice->Start());
 	return m_playing;
@@ -100,13 +112,18 @@ bool XAudio27API::Play()
 
 bool XAudio27API::Stop()
 {
-	if (!m_playing)
+	std::scoped_lock lock(m_voice_mutex);
+	if (!m_source_voice)
+		return false;
+	if (!m_playing && GetQueuedBuffersLocked() == 0)
 		return true;
 
-	m_playing = FAILED(m_source_voice->Stop());
-	m_source_voice->FlushSourceBuffers();
-
-	return m_playing;
+	const HRESULT stopResult = m_source_voice->Stop(0);
+	const HRESULT flushResult = m_source_voice->FlushSourceBuffers();
+	m_playing = false;
+	m_blocks_queued = 0;
+	m_offset = 0;
+	return SUCCEEDED(stopResult) && SUCCEEDED(flushResult);
 }
 
 bool XAudio27API::InitializeStatic()
@@ -137,7 +154,10 @@ bool XAudio27API::InitializeStatic()
 	catch (const std::exception&)
 	{
 		if (s_xaudio_dll)
+		{
 			FreeLibrary(s_xaudio_dll);
+			s_xaudio_dll = nullptr;
+		}
 
 		return false;
 	}
@@ -148,7 +168,10 @@ void XAudio27API::Destroy()
 	s_xaudio.reset();
 
 	if (s_xaudio_dll)
+	{
 		FreeLibrary(s_xaudio_dll);
+		s_xaudio_dll = nullptr;
+	}
 }
 
 std::vector<XAudio27API::DeviceDescriptionPtr> XAudio27API::GetDevices()
@@ -196,10 +219,15 @@ void XAudio27API::VoiceDeleter::operator()(IXAudio2Voice* ptr) const
 
 bool XAudio27API::FeedBlock(sint16* data)
 {
+	if (!data)
+		return false;
+	std::scoped_lock lock(m_voice_mutex);
+	if (!m_source_voice)
+		return false;
 	// check if we queued too many blocks
 	if(m_blocks_queued >= kBlockCount)
 	{
-		m_blocks_queued = GetQueuedBuffers();
+		m_blocks_queued = GetQueuedBuffersLocked();
 
 		if (m_blocks_queued >= kBlockCount)
 		{
@@ -213,7 +241,12 @@ bool XAudio27API::FeedBlock(sint16* data)
 	XAUDIO2_BUFFER buffer{};
 	buffer.AudioBytes = m_bytesPerBlock;
 	buffer.pAudioData = m_audio_buffer[m_offset].get();
-	m_source_voice->SubmitSourceBuffer(&buffer);
+	const HRESULT result = m_source_voice->SubmitSourceBuffer(&buffer);
+	if (FAILED(result))
+	{
+		m_blocks_queued = GetQueuedBuffersLocked();
+		return false;
+	}
 
 	m_offset = (m_offset + 1) % kBlockCount;
 	m_blocks_queued++;
@@ -222,6 +255,14 @@ bool XAudio27API::FeedBlock(sint16* data)
 
 uint32 XAudio27API::GetQueuedBuffers() const
 {
+	std::scoped_lock lock(m_voice_mutex);
+	return GetQueuedBuffersLocked();
+}
+
+uint32 XAudio27API::GetQueuedBuffersLocked() const
+{
+	if (!m_source_voice)
+		return 0;
 	XAUDIO2_VOICE_STATE state{};
 	m_source_voice->GetState(&state);
 	return state.BuffersQueued;
@@ -229,5 +270,5 @@ uint32 XAudio27API::GetQueuedBuffers() const
 
 bool XAudio27API::NeedAdditionalBlocks() const
 {
-	return GetQueuedBuffers() < GetAudioDelay();
+	return GetQueuedBuffers() < std::min<uint32>(GetAudioDelay(), kBlockCount - 1);
 }

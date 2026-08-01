@@ -91,10 +91,15 @@ public:
 
 		bool left_down_toggle = false;
 		bool right_down_toggle = false;
-	} m_main_mouse{}, m_pad_mouse{}, m_main_touch{}, m_pad_touch{};
+	} m_main_mouse{}, m_pad_mouse{}, m_main_touch{}, m_pad_touch{}, m_virtual_mouse{};
 	glm::ivec2 get_mouse_position(bool pad_window) const;
 	std::optional<glm::ivec2> get_left_down_mouse_info(bool* is_pad);
 	std::optional<glm::ivec2> get_right_down_mouse_info(bool* is_pad);
+	void set_virtual_mouse(bool enabled, glm::ivec2 position, bool left_down);
+	bool is_virtual_mouse_capture_enabled() const
+	{
+		return m_virtual_mouse_capture.load(std::memory_order_acquire);
+	}
 
 	std::atomic<float> m_mouse_wheel;
 
@@ -111,6 +116,7 @@ private:
 	std::array<EmulatedControllerPtr, kMaxWPADControllers> m_wpad;
 
 	std::array<bool, kMaxController> m_is_gameprofile_set{};
+	std::atomic_bool m_virtual_mouse_capture{false};
 
 	template<std::derived_from<ControllerProviderBase> TProvider>
 	void create_provider()

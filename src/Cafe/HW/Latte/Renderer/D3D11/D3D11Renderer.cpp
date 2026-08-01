@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <imgui.h>
 #include "imgui/imgui_extension.h"
 #include <limits>
@@ -35,6 +36,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
+#include <thread>
 
 using Microsoft::WRL::ComPtr;
 
@@ -44,6 +46,7 @@ void LatteDraw_handleSpecialState8_clearAsDepth();
 
 namespace
 {
+#if defined(CEMU_D3D11_DRIVER_TRACE)
 std::atomic_uint64_t s_driverCallSequence{};
 
 class DriverCallTrace
@@ -72,6 +75,19 @@ private:
 	std::string m_operation;
 	uint64 m_sequence{};
 };
+#define CEMU_D3D11_JOIN_IMPL(a, b) a##b
+#define CEMU_D3D11_JOIN(a, b) CEMU_D3D11_JOIN_IMPL(a, b)
+#define D3D11_DRIVER_TRACE(operation) \
+	DriverCallTrace CEMU_D3D11_JOIN(driverCallTrace, __LINE__)(operation)
+#else
+#define D3D11_DRIVER_TRACE(operation) do { } while (false)
+#endif
+
+#if defined(CEMU_D3D11_DEBUG_VALIDATION)
+#define D3D11_DEBUG_CHECK(scope) CheckDebugMessages(scope)
+#else
+#define D3D11_DEBUG_CHECK(scope) do { } while (false)
+#endif
 
 void ThrowIfFailed(HRESULT result, const char* operation)
 {
@@ -90,6 +106,75 @@ uint64 HashBytes(const void* data, size_t size, uint64 hash = 146959810393466560
 	for (size_t i = 0; i < size; ++i)
 		hash = (hash ^ bytes[i]) * 1099511628211ull;
 	return hash;
+}
+
+HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* profile,
+	UINT flags, ID3DBlob** bytecode, ID3DBlob** errors)
+{
+	if (!source || !sourceSize || !profile || !bytecode)
+		return E_INVALIDARG;
+	*bytecode = nullptr;
+	if (errors)
+		*errors = nullptr;
+
+	// The cache key includes the compiler profile, flags and an explicit format
+	// version so changes to the generated HLSL cannot reuse stale bytecode.
+	uint64 hash = HashBytes(source, sourceSize);
+	hash = HashBytes(profile, std::strlen(profile), hash);
+	hash = HashBytes(&flags, sizeof(flags), hash);
+	constexpr uint32 cacheVersion = 2;
+	hash = HashBytes(&cacheVersion, sizeof(cacheVersion), hash);
+	const fs::path directory = ActiveSettings::GetUserDataPath("shaderCache/driver/d3d11");
+	const fs::path path = directory / fmt::format("{:016x}.dxbc", hash);
+
+	static std::mutex cacheMutex;
+	{
+		std::lock_guard lock(cacheMutex);
+		std::ifstream input(path, std::ios::binary | std::ios::ate);
+		if (input)
+		{
+			const std::streamoff length = static_cast<std::streamoff>(input.tellg());
+			if (length >= 4 && length <= 64 * 1024 * 1024)
+			{
+				ComPtr<ID3DBlob> cached;
+				if (SUCCEEDED(D3DCreateBlob(static_cast<SIZE_T>(length), &cached)))
+				{
+					input.seekg(0);
+					input.read(static_cast<char*>(cached->GetBufferPointer()),
+						static_cast<std::streamsize>(length));
+					if (input && std::memcmp(cached->GetBufferPointer(), "DXBC", 4) == 0)
+					{
+						*bytecode = cached.Detach();
+						return S_OK;
+					}
+				}
+			}
+		}
+	}
+
+	ComPtr<ID3DBlob> compiled;
+	ComPtr<ID3DBlob> compileErrors;
+	const HRESULT result = D3DCompile(source, sourceSize, nullptr, nullptr, nullptr,
+		"main", profile, flags, 0, &compiled, &compileErrors);
+	if (errors && compileErrors)
+		*errors = compileErrors.Detach();
+	if (FAILED(result))
+		return result;
+
+	{
+		std::lock_guard lock(cacheMutex);
+		std::error_code error;
+		fs::create_directories(directory, error);
+		if (!error)
+		{
+			std::ofstream output(path, std::ios::binary | std::ios::trunc);
+			if (output)
+				output.write(static_cast<const char*>(compiled->GetBufferPointer()),
+					static_cast<std::streamsize>(compiled->GetBufferSize()));
+		}
+	}
+	*bytecode = compiled.Detach();
+	return S_OK;
 }
 
 D3D11_COMPARISON_FUNC CompareFunc(Latte::E_COMPAREFUNC value)
@@ -1303,17 +1388,16 @@ void main(point GeometryInput inputVertices[1],
 			if (GetType() != ShaderType::kGeometry)
 				throw std::runtime_error("direct HLSL compilation is only used for D3D11 geometry helpers");
 			ComPtr<ID3DBlob> errors;
-			const HRESULT compileResult = D3DCompile(source.data(), source.size(), nullptr,
-				nullptr, nullptr, "main", "gs_5_0",
+			const HRESULT compileResult = CompileHLSLCached(source.data(), source.size(), "gs_5_0",
 				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-				0, &m_bytecode, &errors);
+				&m_bytecode, &errors);
 			if (FAILED(compileResult))
 			{
 				const char* message = errors ?
 					static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
 				throw std::runtime_error(message);
 			}
-			DriverCallTrace trace(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
+			D3D11_DRIVER_TRACE(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
 				m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
 			ThrowIfFailed(device->CreateGeometryShader(m_bytecode->GetBufferPointer(),
 				m_bytecode->GetBufferSize(), nullptr, &m_gs), "CreateGeometryShader");
@@ -1445,8 +1529,9 @@ void main(point GeometryInput inputVertices[1],
 			const char* profile = GetType() == ShaderType::kVertex ? "vs_5_0" :
 				GetType() == ShaderType::kFragment ? "ps_5_0" : "gs_5_0";
 			ComPtr<ID3DBlob> errors;
-			HRESULT hr = D3DCompile(hlsl.data(), hlsl.size(), nullptr, nullptr, nullptr, "main", profile,
-				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &m_bytecode, &errors);
+			HRESULT hr = CompileHLSLCached(hlsl.data(), hlsl.size(), profile,
+				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+				&m_bytecode, &errors);
 			if (FAILED(hr))
 			{
 				const char* message = errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
@@ -1454,19 +1539,19 @@ void main(point GeometryInput inputVertices[1],
 			}
 			if (GetType() == ShaderType::kVertex)
 			{
-				DriverCallTrace trace(fmt::format("CreateVertexShader {:016x}_{:016x} bytecode={}",
+				D3D11_DRIVER_TRACE(fmt::format("CreateVertexShader {:016x}_{:016x} bytecode={}",
 					m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
 				ThrowIfFailed(device->CreateVertexShader(m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(), nullptr, &m_vs), "CreateVertexShader");
 			}
 			else if (GetType() == ShaderType::kFragment)
 			{
-				DriverCallTrace trace(fmt::format("CreatePixelShader {:016x}_{:016x} bytecode={}",
+				D3D11_DRIVER_TRACE(fmt::format("CreatePixelShader {:016x}_{:016x} bytecode={}",
 					m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
 				ThrowIfFailed(device->CreatePixelShader(m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(), nullptr, &m_ps), "CreatePixelShader");
 			}
 			else
 			{
-				DriverCallTrace trace(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
+				D3D11_DRIVER_TRACE(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
 					m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
 				ThrowIfFailed(device->CreateGeometryShader(m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(), nullptr, &m_gs), "CreateGeometryShader");
 			}
@@ -2284,8 +2369,8 @@ ComPtr<ID3DBlob> CompileInternalShader(const char* source, const char* profile)
 {
 	ComPtr<ID3DBlob> blob;
 	ComPtr<ID3DBlob> errors;
-	HRESULT hr = D3DCompile(source, std::strlen(source), nullptr, nullptr, nullptr, "main", profile,
-		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &blob, &errors);
+	HRESULT hr = CompileHLSLCached(source, std::strlen(source), profile,
+		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, &blob, &errors);
 	if (FAILED(hr))
 		throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer()) : "D3DCompile failed");
 	return blob;
@@ -2294,6 +2379,15 @@ ComPtr<ID3DBlob> CompileInternalShader(const char* source, const char* profile)
 
 D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 {
+	// Avoid rehashing the state caches during the first shader-heavy frames.
+	// These are conservative reservations only; entries are still created lazily.
+	m_inputLayoutCache.reserve(512);
+	m_samplerCache.reserve(256);
+	m_rasterizerCache.reserve(128);
+	m_blendCache.reserve(256);
+	m_depthStencilCache.reserve(128);
+	m_rectShaderCache.reserve(128);
+	m_reportedDebugWarnings.reserve(128);
 	for (auto& stage : m_samplerSwizzles)
 		for (auto& selectors : stage)
 			selectors = { 0, 1, 2, 3 };
@@ -2306,9 +2400,9 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 	m_device.As(&m_device1);
 	m_context = static_cast<ID3D11DeviceContext*>(surface->immediate_context);
 	m_context.As(&m_context1);
-	ComPtr<ID3D11Multithread> multithread;
-	if (SUCCEEDED(m_context.As(&multithread)))
-		multithread->SetMultithreadProtected(TRUE);
+	// The immediate context is exclusively owned by LatteThread after the host
+	// hands the surface to Cemu. Enabling ID3D11Multithread here adds a lock to
+	// every D3D call and is especially expensive for draw-heavy Wii U titles.
 	if (SUCCEEDED(m_device.As(&m_infoQueue)))
 	{
 		// The debug layer raises exception 0x87A when break-on-error is enabled.
@@ -2539,12 +2633,12 @@ void D3D11Renderer::SwapBuffers(bool swapTV, bool)
 {
 	if (!swapTV)
 		return;
-	CheckDebugMessages("before Present");
+	D3D11_DEBUG_CHECK("before Present");
 	{
-		DriverCallTrace trace("IDXGISwapChain::Present");
+		D3D11_DRIVER_TRACE("IDXGISwapChain::Present");
 		ThrowIfFailed(m_swapChain->Present(1, 0), "IDXGISwapChain::Present");
 	}
-	CheckDebugMessages("after Present");
+	D3D11_DEBUG_CHECK("after Present");
 	m_context->OMSetRenderTargets(0, nullptr, nullptr);
 	m_backBufferView.Reset();
 	m_backBuffer.Reset();
@@ -2651,11 +2745,23 @@ void D3D11Renderer::Flush(bool waitIdle)
 		if (SUCCEEDED(m_device->CreateQuery(&desc, &event)))
 		{
 			m_context->End(event.Get());
-			while (m_context->GetData(event.Get(), nullptr, 0, 0) == S_FALSE) {}
+			uint32 spinCount = 0;
+			while (m_context->GetData(event.Get(), nullptr, 0,
+				D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
+			{
+				_mm_pause();
+				if ((++spinCount & 0x3FF) == 0)
+					std::this_thread::yield();
+			}
 		}
 	}
 }
-void D3D11Renderer::NotifyLatteCommandProcessorIdle() { m_context->Flush(); }
+void D3D11Renderer::NotifyLatteCommandProcessorIdle()
+{
+	// D3D11 submits work automatically. Flushing every time the emulated GX2
+	// ring buffer is briefly empty destroys batching and creates CPU/GPU bubbles.
+	// Explicit synchronization paths still call Flush(true) when required.
+}
 
 void D3D11Renderer::CheckDebugMessages(const char* scope)
 {
@@ -2732,7 +2838,7 @@ void D3D11Renderer::ImguiEnd()
 	if (m_imguiInitialized)
 	{
 		ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-		CheckDebugMessages("ImGui render");
+		D3D11_DEBUG_CHECK("ImGui render");
 	}
 }
 
@@ -2777,7 +2883,7 @@ ImTextureID D3D11Renderer::GenerateTexture(const std::vector<uint8>& data, const
 	D3D11_SUBRESOURCE_DATA initial{ rgba.data(), static_cast<UINT>(width * 4), 0 };
 	ComPtr<ID3D11Texture2D> texture;
 	{
-		DriverCallTrace trace(fmt::format(
+		D3D11_DRIVER_TRACE(fmt::format(
 			"CreateTexture2D ImGui {}x{} RGB={} RGBA={}",
 			size.x, size.y, data.size(), rgba.size()));
 		if (FAILED(m_device->CreateTexture2D(&desc, &initial, &texture)))
@@ -2786,7 +2892,7 @@ ImTextureID D3D11Renderer::GenerateTexture(const std::vector<uint8>& data, const
 	ID3D11ShaderResourceView* view{};
 	if (FAILED(m_device->CreateShaderResourceView(texture.Get(), nullptr, &view)))
 		return nullptr;
-	CheckDebugMessages("ImGui texture creation");
+	D3D11_DEBUG_CHECK("ImGui texture creation");
 	return view;
 }
 
@@ -3198,7 +3304,7 @@ void D3D11Renderer::texture_loadSlice(LatteTexture* texture, sint32 width, sint3
 		destinationBoxPtr = nullptr;
 	}
 	{
-		DriverCallTrace trace(fmt::format(
+		D3D11_DRIVER_TRACE(fmt::format(
 			"UpdateSubresource texture={} sub={} mip={} slice={} box={}x{}{} rowPitch={} bytes={}",
 			static_cast<const void*>(d3d->Resource()), subresource, mipIndex, sliceIndex,
 			uploadWidth, uploadHeight,
@@ -3508,7 +3614,7 @@ void D3D11Renderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* so
 		static_cast<float>(effectiveHeight), 0, 1, false);
 	renderTarget_setScissor(0, 0, effectiveWidth, effectiveHeight);
 	m_context->Draw(3, 0);
-	CheckDebugMessages(destination->isDepth ?
+	D3D11_DEBUG_CHECK(destination->isDepth ?
 		"color-to-depth surface copy" : "depth-to-color surface copy");
 
 	ID3D11ShaderResourceView* nullResource = nullptr;
@@ -3541,7 +3647,7 @@ void D3D11Renderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 offset
 	std::memcpy(m_bufferCacheShadow.data() + offset, buffer, size);
 	D3D11_BOX box{ offset, 0, 0, offset + static_cast<UINT>(size), 1, 1 };
 	{
-		DriverCallTrace trace(fmt::format(
+		D3D11_DRIVER_TRACE(fmt::format(
 			"UpdateSubresource buffer-cache offset={} size={} source={}",
 			offset, size, static_cast<const void*>(buffer)));
 		m_context->UpdateSubresource(m_bufferCache.Get(), 0, &box, buffer, 0, 0);
@@ -3555,7 +3661,7 @@ void D3D11Renderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 
 	std::memmove(m_bufferCacheShadow.data() + dstOffset, m_bufferCacheShadow.data() + srcOffset, size);
 	D3D11_BOX box{ dstOffset, 0, 0, dstOffset + size, 1, 1 };
 	{
-		DriverCallTrace trace(fmt::format(
+		D3D11_DRIVER_TRACE(fmt::format(
 			"UpdateSubresource buffer-copy src={} dst={} size={}", srcOffset, dstOffset, size));
 		m_context->UpdateSubresource(m_bufferCache.Get(), 0, &box,
 			m_bufferCacheShadow.data() + dstOffset, 0, 0);
@@ -3852,12 +3958,55 @@ bool D3D11Renderer::HasRequiredShaders() const
 	return true;
 }
 
+bool D3D11Renderer::UpdateDynamicConstantBuffer(ComPtr<ID3D11Buffer>& buffer,
+	UINT& capacity, const void* data, UINT size)
+{
+	if (!data || !size)
+		return false;
+	const UINT required = Align16(size);
+	if (!buffer || capacity < required)
+	{
+		// Grow geometrically to avoid recreating a buffer when shaders alternate
+		// between nearby uniform block sizes. Map(DISCARD) lets the driver rename
+		// storage instead of waiting for an earlier draw to finish reading it.
+		UINT newCapacity = capacity ? capacity : 256;
+		while (newCapacity < required &&
+			newCapacity <= (std::numeric_limits<UINT>::max)() / 2)
+			newCapacity *= 2;
+		if (newCapacity < required)
+			newCapacity = required;
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = newCapacity;
+		desc.Usage = D3D11_USAGE_DYNAMIC;
+		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		ComPtr<ID3D11Buffer> replacement;
+		if (FAILED(m_device->CreateBuffer(&desc, nullptr, &replacement)))
+			return false;
+		buffer = std::move(replacement);
+		capacity = newCapacity;
+	}
+
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	if (FAILED(m_context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+		return false;
+	std::memcpy(mapped.pData, data, size);
+	if (required > size)
+		std::memset(static_cast<uint8*>(mapped.pData) + size, 0, required - size);
+	m_context->Unmap(buffer.Get(), 0);
+	return true;
+}
+
 void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 verticesPerInstance)
 {
 	if (!shader || shader->resourceMapping.uniformVarsBufferBindingPoint < 0 ||
 		shader->uniform.uniformRangeSize == 0)
 		return;
-	std::vector<uint8> bytes(Align16(shader->uniform.uniformRangeSize));
+	const uint32 stage = static_cast<uint32>(shader->shaderType);
+	if (stage >= m_uniformScratch.size())
+		return;
+	auto& bytes = m_uniformScratch[stage];
+	bytes.assign(Align16(shader->uniform.uniformRangeSize), 0);
 	auto dataAt = [&bytes](sint32 offset) { return bytes.data() + offset; };
 	for (auto& entry : shader->uniform.list_ufTexRescale)
 	{
@@ -3898,14 +4047,15 @@ void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 vert
 	if (shader->uniform.loc_verticesPerInstance >= 0)
 		*reinterpret_cast<uint32*>(dataAt(shader->uniform.loc_verticesPerInstance)) = verticesPerInstance;
 
-	D3D11_BUFFER_DESC desc{};
-	desc.ByteWidth = static_cast<UINT>(bytes.size());
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	D3D11_SUBRESOURCE_DATA initial{ bytes.data(), 0, 0 };
-	const uint32 stage = static_cast<uint32>(shader->shaderType);
-	if (FAILED(m_device->CreateBuffer(&desc, &initial, &m_uniformVarsBuffers[stage])))
-		return;
+	if (!m_uniformVarsBuffers[stage] || !m_uniformScratchUploaded[stage] ||
+		m_uploadedUniformScratch[stage] != bytes)
+	{
+		if (!UpdateDynamicConstantBuffer(m_uniformVarsBuffers[stage],
+			m_uniformVarsBufferCapacity[stage], bytes.data(), static_cast<UINT>(bytes.size())))
+			return;
+		m_uploadedUniformScratch[stage] = bytes;
+		m_uniformScratchUploaded[stage] = true;
+	}
 	ID3D11Buffer* buffer = m_uniformVarsBuffers[stage].Get();
 	auto* nativeShader = static_cast<D3D11Shader*>(shader->shader);
 	if (!nativeShader)
@@ -3931,13 +4081,16 @@ void D3D11Renderer::UpdateSamplerSwizzleBuffer(LatteDecompilerShader* shader)
 	const uint32 stage = static_cast<uint32>(shader->shaderType);
 	if (stage >= m_samplerSwizzles.size())
 		return;
-	D3D11_BUFFER_DESC desc{};
-	desc.ByteWidth = sizeof(m_samplerSwizzles[stage]);
-	desc.Usage = D3D11_USAGE_DEFAULT;
-	desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-	D3D11_SUBRESOURCE_DATA initial{ m_samplerSwizzles[stage].data(), 0, 0 };
-	if (FAILED(m_device->CreateBuffer(&desc, &initial, &m_samplerSwizzleBuffers[stage])))
-		return;
+	if (!m_samplerSwizzleBuffers[stage] || !m_samplerSwizzleUploaded[stage] ||
+		m_uploadedSamplerSwizzles[stage] != m_samplerSwizzles[stage])
+	{
+		if (!UpdateDynamicConstantBuffer(m_samplerSwizzleBuffers[stage],
+			m_samplerSwizzleBufferCapacity[stage], m_samplerSwizzles[stage].data(),
+			static_cast<UINT>(sizeof(m_samplerSwizzles[stage]))))
+			return;
+		m_uploadedSamplerSwizzles[stage] = m_samplerSwizzles[stage];
+		m_samplerSwizzleUploaded[stage] = true;
+	}
 	ID3D11Buffer* buffer = m_samplerSwizzleBuffers[stage].Get();
 	if (shader->shaderType == LatteConst::ShaderType::Vertex)
 		m_context->VSSetConstantBuffers(binding, 1, &buffer);
@@ -3955,11 +4108,19 @@ void D3D11Renderer::UpdateInputLayout()
 	if (!fetch || !shader || !shader->Bytecode())
 		return;
 	const uint64 key = fetch->key ^ shaderContext->baseHash ^ (shaderContext->auxHash << 1);
-	if (m_inputLayout && m_inputLayoutKey == key)
+	if (m_inputLayoutKeyValid && m_inputLayoutKey == key)
 	{
 		// Internal fullscreen copies temporarily bind a null input layout.  The
 		// cached COM object remains valid, so an early return must also restore it
 		// on the immediate context before the next indexed GX2 draw.
+		m_context->IASetInputLayout(m_inputLayout.Get());
+		return;
+	}
+	if (const auto cached = m_inputLayoutCache.find(key); cached != m_inputLayoutCache.end())
+	{
+		m_inputLayout = cached->second;
+		m_inputLayoutKey = key;
+		m_inputLayoutKeyValid = true;
 		m_context->IASetInputLayout(m_inputLayout.Get());
 		return;
 	}
@@ -3988,7 +4149,7 @@ void D3D11Renderer::UpdateInputLayout()
 	m_inputLayout.Reset();
 	if (!elements.empty())
 	{
-		DriverCallTrace trace(fmt::format("CreateInputLayout elements={} shader={:016x}_{:016x}",
+		D3D11_DRIVER_TRACE(fmt::format("CreateInputLayout elements={} shader={:016x}_{:016x}",
 			elements.size(), shaderContext->baseHash, shaderContext->auxHash));
 		const HRESULT hr = m_device->CreateInputLayout(elements.data(), static_cast<UINT>(elements.size()),
 			shader->Bytecode()->GetBufferPointer(), shader->Bytecode()->GetBufferSize(), &m_inputLayout);
@@ -3998,7 +4159,9 @@ void D3D11Renderer::UpdateInputLayout()
 			return;
 		}
 	}
+	m_inputLayoutCache.emplace(key, m_inputLayout);
 	m_inputLayoutKey = key;
+	m_inputLayoutKeyValid = true;
 	m_context->IASetInputLayout(m_inputLayout.Get());
 }
 
@@ -4308,13 +4471,13 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 			m_context->IASetIndexBuffer(buffer,
 				hostIndexType == INDEX_TYPE::U16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
 			{
-				DriverCallTrace trace(fmt::format(
+				D3D11_DRIVER_TRACE(fmt::format(
 					"DrawIndexedInstanced indices={} instances={} baseVertex={} baseInstance={} buffer={}",
 					hostIndexCount, instanceCount, baseVertex, baseInstance,
 					static_cast<const void*>(buffer)));
 				m_context->DrawIndexedInstanced(hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
 			}
-			CheckDebugMessages("indexed GX2 draw");
+			D3D11_DEBUG_CHECK("indexed GX2 draw");
 		}
 		// LatteIndices_decode stores this allocation in its LRU cache. The cache
 		// releases it when the entry is evicted; releasing it after every draw
@@ -4323,11 +4486,11 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	}
 	else
 	{
-		DriverCallTrace trace(fmt::format(
+		D3D11_DRIVER_TRACE(fmt::format(
 			"DrawInstanced vertices={} instances={} baseVertex={} baseInstance={}",
 			count, instanceCount, baseVertex, baseInstance));
 		m_context->DrawInstanced(count, instanceCount, baseVertex, baseInstance);
-		CheckDebugMessages("non-indexed GX2 draw");
+		D3D11_DEBUG_CHECK("non-indexed GX2 draw");
 	}
 
 	if (LatteSHRC_GetActivePixelShader())
@@ -4362,7 +4525,7 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 	desc.Usage = D3D11_USAGE_IMMUTABLE;
 	desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
 	D3D11_SUBRESOURCE_DATA initial{ data->data.data(), 0, 0 };
-	DriverCallTrace trace(fmt::format("CreateBuffer index bytes={} source={}",
+	D3D11_DRIVER_TRACE(fmt::format("CreateBuffer index bytes={} source={}",
 		data->data.size(), static_cast<const void*>(data->data.data())));
 	ThrowIfFailed(m_device->CreateBuffer(&desc, &initial, &data->buffer), "Create index buffer");
 }

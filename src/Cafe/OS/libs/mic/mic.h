@@ -6,4 +6,5 @@ void mic_updateOnAXFrame();
 namespace mic
 {
 	COSModule* GetModule();
+	void Reset();
 };

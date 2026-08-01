@@ -32,6 +32,8 @@ static void state_cb(cubeb_stream* stream, void* user, cubeb_state state)
 
 long CubebAPI::data_cb(cubeb_stream* stream, void* user, const void* inputbuffer, void* outputbuffer, long nframes)
 {
+	if (!user || !outputbuffer || nframes <= 0)
+		return 0;
 	auto* thisptr = (CubebAPI*)user;
 	//const auto size = (size_t)thisptr->m_bytesPerBlock; // (size_t)nframes* thisptr->m_channels;
 
@@ -119,8 +121,10 @@ bool CubebAPI::NeedAdditionalBlocks() const
 
 bool CubebAPI::FeedBlock(sint16* data)
 {
+	if (!data)
+		return false;
 	std::unique_lock lock(m_mutex);
-	if (m_buffer.capacity() <= m_buffer.size() + m_bytesPerBlock)
+	if (m_buffer.size() + m_bytesPerBlock > m_buffer.capacity())
 	{
 		cemuLog_logDebug(LogType::Force, "dropped direct sound block since too many buffers are queued");
 		return false;
@@ -132,12 +136,14 @@ bool CubebAPI::FeedBlock(sint16* data)
 
 bool CubebAPI::Play()
 {
-	if (m_is_playing)
+	if (!m_stream)
+		return false;
+	if (m_is_playing.load(std::memory_order_acquire))
 		return true;
 
 	if (cubeb_stream_start(m_stream) == CUBEB_OK)
 	{
-		m_is_playing = true;
+		m_is_playing.store(true, std::memory_order_release);
 		return true;
 	}
 
@@ -146,12 +152,16 @@ bool CubebAPI::Play()
 
 bool CubebAPI::Stop()
 {
-	if (!m_is_playing)
+	if (!m_stream)
+		return false;
+	if (!m_is_playing.load(std::memory_order_acquire))
 		return true;
 
 	if (cubeb_stream_stop(m_stream) == CUBEB_OK)
 	{
-		m_is_playing = false;
+		m_is_playing.store(false, std::memory_order_release);
+		std::unique_lock lock(m_mutex);
+		m_buffer.clear();
 		return true;
 	}
 
@@ -160,8 +170,10 @@ bool CubebAPI::Stop()
 
 void CubebAPI::SetVolume(sint32 volume)
 {
+	volume = std::clamp<sint32>(volume, 0, 100);
 	IAudioAPI::SetVolume(volume);
-	cubeb_stream_set_volume(m_stream, (float)volume / 100.0f);
+	if (m_stream)
+		cubeb_stream_set_volume(m_stream, static_cast<float>(volume) / 100.0f);
 }
 
 
@@ -178,7 +190,10 @@ bool CubebAPI::InitializeStatic()
 void CubebAPI::Destroy()
 {
 	if (s_context)
+	{
 		cubeb_destroy(s_context);
+		s_context = nullptr;
+	}
 }
 
 std::vector<IAudioAPI::DeviceDescriptionPtr> CubebAPI::GetDevices()

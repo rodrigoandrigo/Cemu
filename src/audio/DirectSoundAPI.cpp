@@ -50,9 +50,10 @@ DirectSoundAPI::DirectSoundAPI(GUID* guid, sint32 samplerate, sint32 channels, s
 	}
 
 	{ // initialize sound buffer
-		void *ptr1, *ptr2;
-		DWORD bytes1, bytes2;
-		m_sound_buffer->Lock(0, m_sound_buffer_size, &ptr1, &bytes1, &ptr2, &bytes2, 0);
+		void *ptr1 = nullptr, *ptr2 = nullptr;
+		DWORD bytes1 = 0, bytes2 = 0;
+		if (FAILED(m_sound_buffer->Lock(0, m_sound_buffer_size, &ptr1, &bytes1, &ptr2, &bytes2, 0)))
+			throw std::runtime_error("can't initialize directsound buffer");
 		memset(ptr1, 0x00, bytes1);
 		if (ptr2 && bytes2 > 0)
 			memset(ptr2, 0x00, bytes2);
@@ -65,6 +66,15 @@ DirectSoundAPI::DirectSoundAPI(GUID* guid, sint32 samplerate, sint32 channels, s
 	for (size_t i = 0; i < kBufferCount; ++i)
 	{
 		m_notify_event[i] = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+		if (!m_notify_event[i])
+		{
+			for (size_t created = 0; created < i; ++created)
+			{
+				CloseHandle(m_notify_event[created]);
+				m_notify_event[created] = nullptr;
+			}
+			throw std::runtime_error("can't create directsound notification event");
+		}
 
 		notify[i].hEventNotify = m_notify_event[i];
 		//notify[i].dwOffset = ((i*2) + 1) * (m_bytes_per_block / 2);
@@ -162,14 +172,20 @@ bool DirectSoundAPI::Stop()
 	if (!m_playing)
 		return true;
 
-	m_playing = FAILED(m_sound_buffer->Stop());
-	return m_playing;
+	const bool stopped = SUCCEEDED(m_sound_buffer->Stop());
+	m_playing = false;
+	std::unique_lock lock(m_mutex);
+	while (!m_buffer.empty())
+		m_buffer.pop();
+	return stopped;
 }
 
 bool DirectSoundAPI::FeedBlock(sint16* data)
 {
+	if (!data)
+		return false;
 	std::lock_guard lock(m_mutex);
-	if (m_buffer.size() > kBlockCount)
+	if (m_buffer.size() >= kBlockCount)
 	{
 		cemuLog_logDebug(LogType::Force, "dropped direct sound block since too many buffers are queued");
 		return false;
@@ -183,6 +199,7 @@ bool DirectSoundAPI::FeedBlock(sint16* data)
 
 void DirectSoundAPI::SetVolume(sint32 volume)
 {
+	volume = std::clamp<sint32>(volume, 0, 100);
 	IAudioAPI::SetVolume(volume);
 
 	const LONG value = pow((float)volume / 100.0f, 0.20f) * (DSBVOLUME_MAX - DSBVOLUME_MIN) + DSBVOLUME_MIN;

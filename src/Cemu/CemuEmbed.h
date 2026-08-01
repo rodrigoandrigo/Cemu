@@ -204,6 +204,11 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ApplySafeGraphicPackPol
 // preferring an Xbox device. Existing configured profiles are never replaced.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile(
 	CemuEmbedInstance* instance, int32_t* profile_ready);
+// Publishes a host-owned virtual mouse in physical surface pixels. While it is
+// enabled, the UWP SDL path reserves A, L/R and the left stick for the mouse.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
+	CemuEmbedInstance* instance, int32_t x, int32_t y,
+	int32_t left_down, int32_t enabled);
 // Non-blocking: call this from the host dispatcher. It never creates wxEntry.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance);
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RequestStop(CemuEmbedInstance* instance);
