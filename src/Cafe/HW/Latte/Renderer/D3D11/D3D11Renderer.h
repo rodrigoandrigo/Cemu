@@ -89,12 +89,14 @@ public:
 
 private:
 	void RefreshBackBuffer();
+	void EnsureBackBufferSize();
 	void InitializePresentationPipeline();
 	bool BindActiveShaders();
 	RendererShader* GetRectEmulationShader(class LatteDecompilerShader* vertexShader);
 	bool HasRequiredShaders() const;
 	void UpdateInputLayout();
 	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance);
+	void UpdateSamplerSwizzleBuffer(class LatteDecompilerShader* shader);
 	void ApplyPipelineState();
 	void HandleSpecialState5();
 	void CheckDebugMessages(const char* scope);
@@ -123,6 +125,9 @@ private:
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 16> m_vertexBuffers{};
 	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBuffers{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_uniformVarsBuffers{};
+	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_samplerSwizzleBuffers{};
+	std::array<std::array<std::array<uint32, 4>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3>
+		m_samplerSwizzles{};
 	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutOffsets{};
 	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
 	std::array<bool, 8> m_boundColorBlendable{ true, true, true, true, true, true, true, true };

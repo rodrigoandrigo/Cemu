@@ -168,6 +168,81 @@ bool ReadSmallTextFile(const fs::path& path, std::string& text) {
 	return input.good() || input.eof();
 }
 
+uint64_t StableGraphicPackId(const fs::path& rulesPath, std::string_view identity = {}) {
+	std::string rules;
+	if (!ReadSmallTextFile(rulesPath, rules))
+		rules = _pathToUtf8(rulesPath.filename());
+	uint64_t hash = 1469598103934665603ull;
+	for (const unsigned char value : rules) {
+		hash ^= value;
+		hash *= 1099511628211ull;
+	}
+	for (const unsigned char value : identity) {
+		hash ^= value;
+		hash *= 1099511628211ull;
+	}
+	return hash;
+}
+
+bool SamePath(const fs::path& left, const fs::path& right) {
+	std::error_code error;
+	const bool equivalent = fs::equivalent(left, right, error);
+	if (!error)
+		return equivalent;
+#ifdef _WIN32
+	auto leftText = _pathToUtf8(left.lexically_normal());
+	auto rightText = _pathToUtf8(right.lexically_normal());
+	std::transform(leftText.begin(), leftText.end(), leftText.begin(),
+		[](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+	std::transform(rightText.begin(), rightText.end(), rightText.begin(),
+		[](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+	return leftText == rightText;
+#else
+	return left.lexically_normal() == right.lexically_normal();
+#endif
+}
+
+bool CopyFileInChunks(const fs::path& source, const fs::path& destination,
+	std::error_code& error) {
+	error.clear();
+	std::ifstream input(source, std::ios::binary);
+	if (!input) {
+		error = std::make_error_code(std::errc::io_error);
+		return false;
+	}
+	std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+	if (!output) {
+		error = std::make_error_code(std::errc::io_error);
+		return false;
+	}
+
+	// Keep peak memory bounded and avoid the all-at-once copy path used by
+	// std::filesystem::copy_file. This is important for UWP when importing the
+	// full community graphic-pack repository.
+	std::vector<char> buffer(1024 * 1024);
+	while (input) {
+		input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+		const auto count = input.gcount();
+		if (count > 0) {
+			output.write(buffer.data(), count);
+			if (!output) {
+				error = std::make_error_code(std::errc::io_error);
+				return false;
+			}
+		}
+	}
+	if (!input.eof()) {
+		error = std::make_error_code(std::errc::io_error);
+		return false;
+	}
+	output.flush();
+	if (!output) {
+		error = std::make_error_code(std::errc::io_error);
+		return false;
+	}
+	return true;
+}
+
 bool FindXmlElementValue(const std::string& xml, std::string_view element,
 	size_t& valueBegin, size_t& valueEnd) {
 	const std::string opening = "<" + std::string(element);
@@ -305,9 +380,9 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 	// Broker callbacks commonly run on a thread-pool worker whose stack can be
 	// close to 1 MiB. Keep the transfer buffer on the heap so merely entering
 	// this callback cannot exhaust that stack (including directory entries).
-	// Four MiB keeps callback overhead low for multi-gigabyte titles while the
-	// heap allocation keeps thread-pool stack usage small.
-	std::vector<uint8_t> buffer(4 * 1024 * 1024);
+	// One MiB keeps callback overhead low for multi-gigabyte titles while also
+	// bounding the memory used by UWP DataReader and the destination stream.
+	std::vector<uint8_t> buffer(1024 * 1024);
 	uint64_t offset = 0;
 	while (offset < size) {
 		const uint32_t requested = static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), size - offset));
@@ -343,8 +418,11 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 
 CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHandle,
 	const CemuEmbedBrokeredStorage& storage, std::string_view stagingName,
-	bool normalizeMergedMetadata, fs::path& stagedPath) {
-	stagedPath = _utf8ToPath(instance->cachePath) / "brokered-titles" / stagingName;
+	bool normalizeMergedMetadata, fs::path& stagedPath, bool compactPath = false) {
+	const fs::path cachePath = _utf8ToPath(instance->cachePath);
+	stagedPath = compactPath
+		? cachePath / stagingName
+		: cachePath / "brokered-titles" / stagingName;
 	std::error_code error;
 	fs::remove_all(stagedPath, error);
 	if (error) {
@@ -811,7 +889,11 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrok
 
 	fs::path stagedPath;
 	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
-		"graphic-packs", false, stagedPath);
+		// Keep this component deliberately short. Community graphic-pack paths
+		// can already be deeply nested and the UWP package/cache prefix is long;
+		// using "graphic-packs" here pushed valid files to MAX_PATH before the
+		// std::filesystem scan could import them.
+		"gp", false, stagedPath, true);
 	if (stageResult != CEMU_EMBED_OK)
 		return stageResult;
 
@@ -819,6 +901,8 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrok
 	fs::path source = stagedPath;
 	if (fs::is_directory(stagedPath / "graphicPacks", error))
 		source /= "graphicPacks";
+	else if (fs::is_directory(stagedPath / "downloadedGraphicPacks", error))
+		source /= "downloadedGraphicPacks";
 	const fs::path destination = ActiveSettings::GetUserDataPath("graphicPacks");
 	fs::create_directories(destination, error);
 	if (error) {
@@ -827,36 +911,109 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrok
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
 
-	uint32_t rulesCount{};
-	for (fs::recursive_directory_iterator it(source, fs::directory_options::skip_permission_denied, error);
+	std::vector<fs::path> sourceRules;
+	for (fs::recursive_directory_iterator it(source,
+		fs::directory_options::skip_permission_denied, error);
 		!error && it != fs::recursive_directory_iterator(); it.increment(error)) {
-		const auto relative = fs::relative(it->path(), source, error);
+		if (!it->is_regular_file(error))
+			continue;
+		auto filename = _pathToUtf8(it->path().filename());
+		std::transform(filename.begin(), filename.end(), filename.begin(),
+			[](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+		if (filename == "rules.txt")
+			sourceRules.emplace_back(it->path());
+	}
+	if (error || sourceRules.empty()) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			error ? "Cemu could not scan the selected graphic packs."
+			      : "The selected folder does not contain any Cemu rules.txt graphic packs.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+
+	// Install each rules.txt directory below a short, stable private root.
+	// Besides making a directly selected pack visible to LoadAll(), this avoids
+	// reproducing the very deep community-repository hierarchy below the long
+	// UWP LocalState prefix.
+	const fs::path importedRoot = destination / "imported";
+	fs::create_directories(importedRoot, error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not create the imported graphic-pack directory.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	std::vector<fs::path> installedRules;
+	for (const auto& rulesPath : sourceRules) {
+		const auto relativeRules = rulesPath.lexically_relative(source);
+		if (relativeRules.empty()) {
+			error = std::make_error_code(std::errc::invalid_argument);
+			break;
+		}
+		const auto identity = _pathToUtf8(relativeRules);
+		const fs::path packSource = rulesPath.parent_path();
+		const fs::path packDestination = importedRoot /
+			fmt::format("{:016x}", StableGraphicPackId(rulesPath, identity));
+
+		fs::remove_all(packDestination, error);
 		if (error)
 			break;
-		const auto target = destination / relative;
-		if (it->is_directory(error)) {
-			fs::create_directories(target, error);
-		} else if (it->is_regular_file(error)) {
-			fs::create_directories(target.parent_path(), error);
-			if (!error)
-				fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing, error);
-			if (!error && it->path().filename() == "rules.txt")
-				++rulesCount;
+		fs::create_directories(packDestination, error);
+		if (error)
+			break;
+
+		for (fs::recursive_directory_iterator it(packSource,
+			fs::directory_options::skip_permission_denied, error);
+			!error && it != fs::recursive_directory_iterator(); it.increment(error)) {
+			const auto relative = it->path().lexically_relative(packSource);
+			if (relative.empty()) {
+				error = std::make_error_code(std::errc::invalid_argument);
+				break;
+			}
+			const auto target = packDestination / relative;
+			if (it->is_directory(error)) {
+				fs::create_directories(target, error);
+			} else if (it->is_regular_file(error)) {
+				fs::create_directories(target.parent_path(), error);
+				if (!error && !CopyFileInChunks(it->path(), target, error))
+					break;
+			}
 		}
+		if (error)
+			break;
+		installedRules.emplace_back(packDestination / rulesPath.filename());
 	}
-	if (error || rulesCount == 0) {
+	if (error) {
+		cemuLog_log(LogType::Force,
+			"Graphic-pack chunked copy failed: {}", error.message());
 		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
-			error ? "Cemu could not copy the selected graphic packs."
-			      : "The selected folder does not contain any Cemu rules.txt graphic packs.");
+			"Cemu could not copy the selected graphic packs in chunks.");
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
 
 	GraphicPack2::ClearGraphicPacks();
 	GraphicPack2::LoadAll();
+	uint32_t loadedCount{};
+	for (const auto& installedRulesPath : installedRules) {
+		for (const auto& pack : GraphicPack2::GetGraphicPacks()) {
+			if (SamePath(pack->GetRulesPath(), installedRulesPath)) {
+				++loadedCount;
+				break;
+			}
+		}
+	}
+	if (loadedCount == 0) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"The selected rules.txt files were copied, but Cemu rejected every graphic pack. Check the [Definition] section and pack version.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
 	if (importedPackCount)
-		*importedPackCount = rulesCount;
-	cemuLog_log(LogType::Force, "Imported {} graphic pack(s) into {}",
-		rulesCount, _pathToUtf8(destination));
+		*importedPackCount = loadedCount;
+	if (loadedCount != sourceRules.size())
+		cemuLog_log(LogType::Force,
+			"Imported {} of {} selected graphic pack(s); invalid rules were skipped",
+			loadedCount, sourceRules.size());
+	else
+		cemuLog_log(LogType::Force, "Imported {} graphic pack(s) into {}",
+			loadedCount, _pathToUtf8(destination));
 	return CEMU_EMBED_OK;
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledForTitle(

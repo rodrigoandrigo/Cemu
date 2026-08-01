@@ -97,6 +97,10 @@ void GraphicPack2::LoadAll()
 {
 	std::error_code ec;
 	fs::path basePath = ActiveSettings::GetUserDataPath("graphicPacks");
+	// Older embedded-host imports could place a directly selected pack at the
+	// graphicPacks root. Keep those installations discoverable as well.
+	if (fs::exists(basePath / "rules.txt", ec))
+		LoadGraphicPack(basePath);
 	for (fs::recursive_directory_iterator it(basePath, ec); it != end(it); ++it)
 	{
 		if (!it->is_directory(ec))
@@ -152,8 +156,10 @@ bool GraphicPack2::LoadGraphicPack(const fs::path& rulesPath, IniParser& rules)
 		s_graphic_packs.emplace_back(gp);
 		return true;
 	}
-	catch (const std::exception&)
+	catch (const std::exception& ex)
 	{
+		cemuLog_log(LogType::Force, "Graphic pack '{}' could not be loaded: {}",
+			_pathToUtf8(rulesPath), ex.what());
 		return false;
 	}
 }

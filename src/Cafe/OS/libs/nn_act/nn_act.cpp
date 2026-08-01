@@ -59,9 +59,6 @@ namespace act
 
 		uint32 GetMiiEx(void* miiData, uint8 slot)
 		{
-			if (!miiData)
-				return 0xC0712C80;
-
 			actPrepareRequest2();
 			actRequest->requestCode = IOSU_ARC_MIIDATA;
 			actRequest->accountSlot = slot;
@@ -416,26 +413,22 @@ void nnActExport_GetMiiName(PPCInterpreter_t* hCPU)
 {
 	cemuLog_logDebug(LogType::Force, "GetMiiName(0x{:08x})", hCPU->gpr[3]);
 	ppcDefineParamWStrBE(miiName, 0);
-	if (!miiName)
-	{
-		osLib_returnFromFunction(hCPU, 0xC0712C80);
-		return;
-	}
 
-	FFLData_t miiData{};
+	StackAllocator<FFLData_t> miiData;
+
 	uint32 r = nn::act::GetMiiEx(&miiData, iosu::act::ACT_SLOT_CURRENT);
 	// extract name
 	sint32 miiNameLength = 0;
 	for (sint32 i = 0; i < MII_FFL_NAME_LENGTH; i++)
 	{
-		miiName[i] = miiData.miiName[i];
-		if (miiData.miiName[i] == (const uint16be)'\0')
+		miiName[i] = miiData->miiName[i];
+		if (miiData->miiName[i] == (const uint16be)'\0')
 			break;
 		miiNameLength = i+1;
 	}
 	miiName[miiNameLength] = '\0';
 
-	osLib_returnFromFunction(hCPU, r);
+	osLib_returnFromFunction(hCPU, 0);
 }
 
 void nnActExport_GetMiiNameEx(PPCInterpreter_t* hCPU)
@@ -443,26 +436,22 @@ void nnActExport_GetMiiNameEx(PPCInterpreter_t* hCPU)
 	cemuLog_logDebug(LogType::Force, "GetMiiNameEx(0x{:08x}, {})", hCPU->gpr[3], hCPU->gpr[4] & 0xFF);
 	ppcDefineParamWStrBE(miiName, 0);
 	ppcDefineParamU8(slot, 1);
-	if (!miiName)
-	{
-		osLib_returnFromFunction(hCPU, 0xC0712C80);
-		return;
-	}
 
-	FFLData_t miiData{};
+	StackAllocator<FFLData_t> miiData;
+
 	uint32 r = nn::act::GetMiiEx(&miiData, slot);
 	// extract name
 	sint32 miiNameLength = 0;
 	for (sint32 i = 0; i < MII_FFL_NAME_LENGTH; i++)
 	{
-		miiName[i] = miiData.miiName[i];
-		if (miiData.miiName[i] == (const uint16be)'\0')
+		miiName[i] = miiData->miiName[i];
+		if (miiData->miiName[i] == (const uint16be)'\0')
 			break;
 		miiNameLength = i + 1;
 	}
 	miiName[miiNameLength] = '\0';
 
-	osLib_returnFromFunction(hCPU, r);
+	osLib_returnFromFunction(hCPU, 0);
 }
 
 typedef struct  

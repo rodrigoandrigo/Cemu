@@ -12,7 +12,10 @@ LatteTextureGL::LatteTextureGL(Latte::E_DIM dim, MPTR physAddress, MPTR physMipA
 	GenerateEmptyTextureFromGX2Dim(dim, this->glId_texture, this->glTexTarget, true);
 	// set format info
 	FormatInfoGL glFormatInfo;
-	GetOpenGLFormatInfo(isDepth, overwriteInfo.hasFormatOverwrite ? (Latte::E_GX2SURFFMT)overwriteInfo.format : format, dim, &glFormatInfo);
+	const auto effectiveFormat = overwriteInfo.hasFormatOverwrite ?
+		static_cast<Latte::E_GX2SURFFMT>(overwriteInfo.format) : format;
+	hasStencil = LatteTexture_GX2FormatHasStencil(isDepth, effectiveFormat);
+	GetOpenGLFormatInfo(isDepth, effectiveFormat, dim, &glFormatInfo);
 	this->glInternalFormat = glFormatInfo.glInternalFormat;
 	this->isAlternativeFormat = glFormatInfo.isUsingAlternativeFormat;
 	// set debug name

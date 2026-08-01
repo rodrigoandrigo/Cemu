@@ -22,10 +22,15 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
 		effectiveBaseDepth = overwriteInfo.depth;
 	}
 	effectiveBaseDepth = std::max(1, effectiveBaseDepth);
+	const auto effectiveFormat = overwriteInfo.hasFormatOverwrite ?
+		static_cast<Latte::E_GX2SURFFMT>(overwriteInfo.format) : format;
+	const uint32 effectiveMipLevels = std::max(1u,
+		std::min(mipLevels, static_cast<uint32>(maxPossibleMipLevels)));
+	hasStencil = LatteTexture_GX2FormatHasStencil(isDepth, effectiveFormat);
 
 	imageInfo.extent.width = effectiveBaseWidth;
 	imageInfo.extent.height = effectiveBaseHeight;
-	imageInfo.mipLevels = mipLevels;
+	imageInfo.mipLevels = effectiveMipLevels;
 	imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 	imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
@@ -45,7 +50,8 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
 	}
 	
 	VulkanRenderer::FormatInfoVK texFormatInfo;
-	vkRenderer->GetTextureFormatInfoVK(format, isDepth, dim, effectiveBaseWidth, effectiveBaseHeight, &texFormatInfo);
+	vkRenderer->GetTextureFormatInfoVK(effectiveFormat, isDepth, dim,
+		effectiveBaseWidth, effectiveBaseHeight, &texFormatInfo);
 	cemu_assert_debug(hasStencil == ((texFormatInfo.vkImageAspect & VK_IMAGE_ASPECT_STENCIL_BIT) != 0));
 	imageInfo.format = texFormatInfo.vkImageFormat;
 	vkObjTex->m_imageAspect = texFormatInfo.vkImageAspect;
@@ -63,7 +69,7 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
 	}
 	else
 	{
-		if(Latte::IsCompressedFormat(format) == false && texFormatInfo.vkImageFormat != VK_FORMAT_R4G4_UNORM_PACK8) // Vulkan's R4G4 cant be used as a color attachment
+		if(Latte::IsCompressedFormat(effectiveFormat) == false && texFormatInfo.vkImageFormat != VK_FORMAT_R4G4_UNORM_PACK8) // Vulkan's R4G4 cant be used as a color attachment
 			imageInfo.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
 	}
 
@@ -109,8 +115,8 @@ LatteTextureVk::LatteTextureVk(class VulkanRenderer* vkRenderer, Latte::E_DIM di
 	vkObjTex->m_format = imageInfo.format;
 
 	// init layout array
-	m_layoutsMips = std::max(mipLevels, 1u); // todo - use effective mip count
-	m_layoutsDepth = std::max(depth, 1u);
+	m_layoutsMips = effectiveMipLevels;
+	m_layoutsDepth = static_cast<uint32>(effectiveBaseDepth);
 	if (Is3DTexture())
 		m_layouts.resize(m_layoutsMips, VK_IMAGE_LAYOUT_UNDEFINED); // one per mip
 	else

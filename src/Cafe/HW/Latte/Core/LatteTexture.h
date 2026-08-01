@@ -21,6 +21,10 @@ struct LatteSamplerState
 
 #include "Cafe/HW/Latte/Core/LatteTextureView.h"
 
+// Shared by all renderer backends when texture rules replace the original
+// GX2 depth format after LatteTexture has been constructed.
+bool LatteTexture_GX2FormatHasStencil(bool isDepth, Latte::E_GX2SURFFMT format);
+
 class LatteTexture
 {
 public:

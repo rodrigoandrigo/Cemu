@@ -9,6 +9,8 @@
 #include "Cafe/HW/Latte/Renderer/RendererCore.h"
 #include "Cemu/CemuEmbed.h"
 #include "Cemu/Logging/CemuLogging.h"
+#include "Common/FileStream.h"
+#include "config/ActiveSettings.h"
 #include "interface/WindowSystem.h"
 
 #include <backends/imgui_impl_dx11.h>
@@ -22,12 +24,17 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cctype>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <imgui.h>
 #include "imgui/imgui_extension.h"
+#include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
+#include <system_error>
 
 using Microsoft::WRL::ComPtr;
 
@@ -136,6 +143,29 @@ D3D11_BLEND BlendFactor(Latte::LATTE_CB_BLENDN_CONTROL::E_BLENDFACTOR value)
 	}
 }
 
+// D3D11 does not allow the color variants of the blend factors in the
+// SrcBlendAlpha/DestBlendAlpha fields. GX2 (like OpenGL and Vulkan) uses one
+// blend-factor enum for both equations, so factors such as SRC_COLOR are
+// legal for the alpha equation and mean the alpha component of that source.
+// Translate those factors explicitly instead of copying the RGB D3D11 enum.
+D3D11_BLEND BlendFactorAlpha(Latte::LATTE_CB_BLENDN_CONTROL::E_BLENDFACTOR value)
+{
+	using F = Latte::LATTE_CB_BLENDN_CONTROL::E_BLENDFACTOR;
+	switch (value)
+	{
+	case F::BLEND_SRC_COLOR: return D3D11_BLEND_SRC_ALPHA;
+	case F::BLEND_ONE_MINUS_SRC_COLOR: return D3D11_BLEND_INV_SRC_ALPHA;
+	case F::BLEND_DST_COLOR: return D3D11_BLEND_DEST_ALPHA;
+	case F::BLEND_ONE_MINUS_DST_COLOR: return D3D11_BLEND_INV_DEST_ALPHA;
+	case F::BLEND_SRC_ALPHA_SATURATE:
+		// SRC_ALPHA_SATURATE is (f, f, f, 1); its alpha component is one.
+		return D3D11_BLEND_ONE;
+	case F::BLEND_SRC1_COLOR: return D3D11_BLEND_SRC1_ALPHA;
+	case F::BLEND_INV_SRC1_COLOR: return D3D11_BLEND_INV_SRC1_ALPHA;
+	default: return BlendFactor(value);
+	}
+}
+
 D3D11_BLEND_OP BlendOp(Latte::LATTE_CB_BLENDN_CONTROL::E_COMBINEFUNC value)
 {
 	using F = Latte::LATTE_CB_BLENDN_CONTROL::E_COMBINEFUNC;
@@ -192,8 +222,8 @@ D3D11_FILTER SamplerFilter(const _LatteRegisterSetSampler& sampler, bool compari
 	const auto mipFilter = sampler.WORD0.get_MIP_FILTER();
 	if (anisotropyEnabled)
 		return comparison ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
-	const bool minLinear = minFilter != XY::POINT;
-	const bool magLinear = magFilter != XY::POINT;
+	const bool minLinear = minFilter != XY::POINT && minFilter != XY::ANISO_POINT;
+	const bool magLinear = magFilter != XY::POINT && magFilter != XY::ANISO_POINT;
 	const bool mipLinear = mipFilter == Z::LINEAR;
 	const uint32 filter = (minLinear ? 0x10u : 0u) | (magLinear ? 0x4u : 0u) |
 		(mipLinear ? 0x1u : 0u) | (comparison ? 0x80u : 0u);
@@ -343,6 +373,44 @@ uint32 RowCount(const FormatInfo& info, uint32 height)
 	return (height + info.blockHeight - 1) / info.blockHeight;
 }
 
+uint32 AdjustTextureComponentSelector(Latte::E_GX2SURFFMT format, uint32 selector)
+{
+	using F = Latte::E_GX2SURFFMT;
+	switch (format)
+	{
+	case F::R8_UNORM:
+	case F::R8_SNORM:
+	case F::BC4_UNORM:
+	case F::BC4_SNORM:
+		if (selector >= 1 && selector <= 3)
+			selector = 0;
+		break;
+	case F::A1_B5_G5_R5_UNORM:
+	case F::A2_B10_G10_R10_UNORM:
+		if (selector <= 3)
+			selector = 3 - selector;
+		break;
+	case F::BC5_UNORM:
+	case F::BC5_SNORM:
+		if (selector == 3)
+			selector = 1;
+		break;
+	case F::X24_G8_UINT:
+		if (selector <= 3)
+			selector = 3;
+		break;
+	case F::R4_G4_UNORM:
+		if (selector == 0)
+			selector = 1;
+		else if (selector == 1)
+			selector = 0;
+		break;
+	default:
+		break;
+	}
+	return selector <= 5 ? selector : 4;
+}
+
 class D3D11Shader final : public RendererShader
 {
 public:
@@ -351,6 +419,15 @@ public:
 		: RendererShader(type, baseHash, auxHash, true, isGfxPack)
 	{
 		Compile(device, source);
+	}
+	D3D11Shader(ID3D11Device* device, ShaderType type, uint64 baseHash, uint64 auxHash,
+		bool isGfxPack, const std::string& source, bool sourceIsHlsl)
+		: RendererShader(type, baseHash, auxHash, true, isGfxPack)
+	{
+		if (sourceIsHlsl)
+			CompileHLSL(device, source);
+		else
+			Compile(device, source);
 	}
 
 	void PreponeCompilation(bool) override {}
@@ -369,9 +446,886 @@ public:
 	{
 		return originalBinding < m_uniformSlots.size() ? m_uniformSlots[originalBinding] : InvalidSlot;
 	}
+	UINT SamplerSwizzleSlot() const { return m_samplerSwizzleSlot; }
 	static constexpr UINT InvalidSlot = UINT_MAX;
 
 private:
+	struct HlslTextureResource
+	{
+		std::string name;
+		std::string valueType;
+		UINT slot{};
+	};
+
+	static bool IsHlslIdentifier(char value)
+	{
+		return std::isalnum(static_cast<unsigned char>(value)) || value == '_';
+	}
+
+	static size_t FindMatchingParenthesis(const std::string& source, size_t opening)
+	{
+		uint32 depth{};
+		for (size_t i = opening; i < source.size(); ++i)
+		{
+			if (source[i] == '(')
+				++depth;
+			else if (source[i] == ')' && --depth == 0)
+				return i;
+		}
+		return std::string::npos;
+	}
+
+	static std::string AddRuntimeSamplerSwizzles(std::string hlsl, UINT constantBufferSlot,
+		bool& patched)
+	{
+		if (constantBufferSlot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+			return hlsl;
+		std::vector<HlslTextureResource> textures;
+		size_t lineStart{};
+		while (lineStart < hlsl.size())
+		{
+			const size_t lineEnd = hlsl.find('\n', lineStart);
+			const size_t end = lineEnd == std::string::npos ? hlsl.size() : lineEnd;
+			const std::string_view line(hlsl.data() + lineStart, end - lineStart);
+			const size_t registerPos = line.find("register(t");
+			const size_t colonPos = line.find(':');
+			if (registerPos != std::string_view::npos && colonPos != std::string_view::npos)
+			{
+				const size_t slotBegin = registerPos + 10;
+				const size_t slotEnd = line.find(')', slotBegin);
+				size_t nameEnd = colonPos;
+				while (nameEnd > 0 && std::isspace(static_cast<unsigned char>(line[nameEnd - 1])))
+					--nameEnd;
+				size_t nameBegin = nameEnd;
+				while (nameBegin > 0 && IsHlslIdentifier(line[nameBegin - 1]))
+					--nameBegin;
+				if (slotEnd != std::string_view::npos && nameBegin != nameEnd)
+				{
+					const UINT slot = static_cast<UINT>(std::strtoul(
+						std::string(line.substr(slotBegin, slotEnd - slotBegin)).c_str(), nullptr, 10));
+					std::string valueType = "float4";
+					if (line.find("<uint4>") != std::string_view::npos)
+						valueType = "uint4";
+					else if (line.find("<int4>") != std::string_view::npos)
+						valueType = "int4";
+					textures.push_back({ std::string(line.substr(nameBegin, nameEnd - nameBegin)),
+						std::move(valueType), slot });
+				}
+			}
+			lineStart = lineEnd == std::string::npos ? hlsl.size() : lineEnd + 1;
+		}
+
+		struct Replacement
+		{
+			size_t begin{};
+			size_t end{};
+			UINT slot{};
+			char suffix{};
+		};
+		std::vector<Replacement> replacements;
+		static constexpr std::array<std::string_view, 10> methods = {
+			"Sample(", "SampleBias(", "SampleLevel(", "SampleGrad(", "Load(",
+			"Gather(", "GatherRed(", "GatherGreen(", "GatherBlue(", "GatherAlpha("
+		};
+		for (const auto& texture : textures)
+		{
+			if (texture.slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+				continue;
+			for (const auto method : methods)
+			{
+				const std::string needle = texture.name + "." + std::string(method);
+				size_t position{};
+				while ((position = hlsl.find(needle, position)) != std::string::npos)
+				{
+					const size_t opening = position + needle.size() - 1;
+					const size_t closing = FindMatchingParenthesis(hlsl, opening);
+					if (closing == std::string::npos)
+						break;
+					replacements.push_back({ position, closing + 1, texture.slot,
+						texture.valueType == "uint4" ? 'U' : texture.valueType == "int4" ? 'I' : 'F' });
+					position = closing + 1;
+				}
+			}
+		}
+		if (replacements.empty())
+			return hlsl;
+		std::sort(replacements.begin(), replacements.end(),
+			[](const Replacement& left, const Replacement& right) { return left.begin > right.begin; });
+		for (const auto& replacement : replacements)
+		{
+			hlsl.insert(replacement.end,
+				fmt::format(", cemuSamplerSwizzle[{}])", replacement.slot));
+			hlsl.insert(replacement.begin,
+				fmt::format("CemuApplySamplerSwizzle{}(", replacement.suffix));
+		}
+
+		hlsl.insert(0, fmt::format(R"HLSL(
+cbuffer CemuSamplerSwizzleBuffer : register(b{})
+{{
+    uint4 cemuSamplerSwizzle[16];
+}};
+float CemuSwizzleComponentF(float4 v, uint s) {{ return s < 4 ? v[s] : (s == 5 ? 1.0f : 0.0f); }}
+int CemuSwizzleComponentI(int4 v, uint s) {{ return s < 4 ? v[s] : (s == 5 ? 1 : 0); }}
+uint CemuSwizzleComponentU(uint4 v, uint s) {{ return s < 4 ? v[s] : (s == 5 ? 1u : 0u); }}
+float CemuApplySamplerSwizzleF(float v, uint4 s) {{ return CemuSwizzleComponentF(float4(v,0,0,1),s.x); }}
+float2 CemuApplySamplerSwizzleF(float2 v, uint4 s) {{ float4 q=float4(v,0,1); return float2(CemuSwizzleComponentF(q,s.x),CemuSwizzleComponentF(q,s.y)); }}
+float3 CemuApplySamplerSwizzleF(float3 v, uint4 s) {{ float4 q=float4(v,1); return float3(CemuSwizzleComponentF(q,s.x),CemuSwizzleComponentF(q,s.y),CemuSwizzleComponentF(q,s.z)); }}
+float4 CemuApplySamplerSwizzleF(float4 v, uint4 s) {{ return float4(CemuSwizzleComponentF(v,s.x),CemuSwizzleComponentF(v,s.y),CemuSwizzleComponentF(v,s.z),CemuSwizzleComponentF(v,s.w)); }}
+int CemuApplySamplerSwizzleI(int v, uint4 s) {{ return CemuSwizzleComponentI(int4(v,0,0,1),s.x); }}
+int2 CemuApplySamplerSwizzleI(int2 v, uint4 s) {{ int4 q=int4(v,0,1); return int2(CemuSwizzleComponentI(q,s.x),CemuSwizzleComponentI(q,s.y)); }}
+int3 CemuApplySamplerSwizzleI(int3 v, uint4 s) {{ int4 q=int4(v,1); return int3(CemuSwizzleComponentI(q,s.x),CemuSwizzleComponentI(q,s.y),CemuSwizzleComponentI(q,s.z)); }}
+int4 CemuApplySamplerSwizzleI(int4 v, uint4 s) {{ return int4(CemuSwizzleComponentI(v,s.x),CemuSwizzleComponentI(v,s.y),CemuSwizzleComponentI(v,s.z),CemuSwizzleComponentI(v,s.w)); }}
+uint CemuApplySamplerSwizzleU(uint v, uint4 s) {{ return CemuSwizzleComponentU(uint4(v,0,0,1),s.x); }}
+uint2 CemuApplySamplerSwizzleU(uint2 v, uint4 s) {{ uint4 q=uint4(v,0,1); return uint2(CemuSwizzleComponentU(q,s.x),CemuSwizzleComponentU(q,s.y)); }}
+uint3 CemuApplySamplerSwizzleU(uint3 v, uint4 s) {{ uint4 q=uint4(v,1); return uint3(CemuSwizzleComponentU(q,s.x),CemuSwizzleComponentU(q,s.y),CemuSwizzleComponentU(q,s.z)); }}
+uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComponentU(v,s.x),CemuSwizzleComponentU(v,s.y),CemuSwizzleComponentU(v,s.z),CemuSwizzleComponentU(v,s.w)); }}
+)HLSL", constantBufferSlot));
+		patched = true;
+		return hlsl;
+	}
+
+	static void ReplaceToken(std::string& text, std::string_view from, std::string_view to)
+	{
+		size_t position{};
+		while ((position = text.find(from, position)) != std::string::npos)
+		{
+			const bool leftBoundary = position == 0 || !IsHlslIdentifier(text[position - 1]);
+			const size_t right = position + from.size();
+			const bool rightBoundary = right == text.size() || !IsHlslIdentifier(text[right]);
+			if (leftBoundary && rightBoundary)
+			{
+				text.replace(position, from.size(), to);
+				position += to.size();
+			}
+			else
+				position = right;
+		}
+	}
+
+	static std::string GeometrySourceType(std::string type)
+	{
+		static constexpr std::array<std::pair<std::string_view, std::string_view>, 15> types = {{
+			{ "vec2", "float2" }, { "vec3", "float3" }, { "vec4", "float4" },
+			{ "ivec2", "int2" }, { "ivec3", "int3" }, { "ivec4", "int4" },
+			{ "uvec2", "uint2" }, { "uvec3", "uint3" }, { "uvec4", "uint4" },
+			{ "bvec2", "bool2" }, { "bvec3", "bool3" }, { "bvec4", "bool4" },
+			{ "mat2", "float2x2" }, { "mat3", "float3x3" }, { "mat4", "float4x4" }
+		}};
+		for (const auto& [glsl, hlsl] : types)
+			if (type == glsl)
+				return std::string(hlsl);
+		return type;
+	}
+
+	bool CompileGeneratedGeometryShader(ID3D11Device* device, const std::string& source)
+	{
+		const size_t inputMarker = source.find("V2G_LAYOUT in ");
+		const size_t inputOpen = inputMarker == std::string::npos ? std::string::npos :
+			source.find('{', inputMarker);
+		const size_t inputClose = inputOpen == std::string::npos ? std::string::npos :
+			source.find('}', inputOpen);
+		const size_t mainPosition = source.find("void main()", inputClose);
+		if (inputOpen == std::string::npos || inputClose == std::string::npos ||
+			mainPosition == std::string::npos)
+			return false;
+
+		struct SourceField { std::string type; std::string name; uint32 location{}; };
+		std::vector<SourceField> inputs;
+		std::vector<SourceField> outputs;
+		auto parseDeclarations = [](std::string_view block, std::vector<SourceField>& fields,
+			uint32 firstLocation)
+		{
+			size_t cursor{};
+			uint32 location = firstLocation;
+			while (cursor < block.size())
+			{
+				const size_t semicolon = block.find(';', cursor);
+				if (semicolon == std::string_view::npos)
+					break;
+				std::string line(block.substr(cursor, semicolon - cursor));
+				const size_t first = line.find_first_not_of(" \t\r\n");
+				const size_t last = line.find_last_not_of(" \t\r\n");
+				if (first != std::string::npos)
+				{
+					line = line.substr(first, last - first + 1);
+					const size_t space = line.find_last_of(" \t");
+					if (space != std::string::npos)
+					{
+						std::string type = line.substr(0, line.find_first_of(" \t"));
+						std::string name = line.substr(space + 1);
+						if (!type.empty() && !name.empty())
+							fields.push_back({ GeometrySourceType(std::move(type)), std::move(name), location++ });
+					}
+				}
+				cursor = semicolon + 1;
+			}
+		};
+		parseDeclarations(std::string_view(source).substr(inputOpen + 1,
+			inputClose - inputOpen - 1), inputs, 0);
+		if (inputs.empty())
+			return false;
+
+		size_t scan = inputClose;
+		const size_t inputSemicolon = source.find(';', inputClose);
+		size_t generatedBodyStart = inputSemicolon == std::string::npos ? inputClose + 1 : inputSemicolon + 1;
+		while ((scan = source.find("layout(location", scan)) != std::string::npos && scan < mainPosition)
+		{
+			const size_t equal = source.find('=', scan);
+			const size_t close = source.find(')', equal);
+			const size_t out = source.find("out ", close);
+			const size_t semicolon = source.find(';', out);
+			if (equal == std::string::npos || close == std::string::npos || out == std::string::npos ||
+				semicolon == std::string::npos || semicolon > mainPosition)
+				break;
+			const uint32 location = static_cast<uint32>(std::strtoul(
+				source.substr(equal + 1, close - equal - 1).c_str(), nullptr, 10));
+			const size_t typeBegin = out + 4;
+			const size_t typeEnd = source.find_first_of(" \t", typeBegin);
+			const size_t nameBegin = source.find_first_not_of(" \t", typeEnd);
+			outputs.push_back({ GeometrySourceType(source.substr(typeBegin, typeEnd - typeBegin)),
+				source.substr(nameBegin, semicolon - nameBegin), location });
+			generatedBodyStart = (std::max)(generatedBodyStart, semicolon + 1);
+			scan = semicolon + 1;
+		}
+
+		const char* inputPrimitive = source.find("layout(points) in") != std::string::npos ? "point" :
+			source.find("layout(lines) in") != std::string::npos ? "line" :
+			source.find("layout(lines_adjacency) in") != std::string::npos ? "lineadj" :
+			source.find("layout(triangles_adjacency) in") != std::string::npos ? "triangleadj" : "triangle";
+		const char* streamType = source.find("layout (line_strip") != std::string::npos ? "LineStream" :
+			source.find("layout (points") != std::string::npos ? "PointStream" : "TriangleStream";
+		uint32 maxVertices = 3;
+		const size_t maxMarker = source.find("max_vertices=");
+		if (maxMarker != std::string::npos)
+			maxVertices = static_cast<uint32>(std::strtoul(source.c_str() + maxMarker + 13, nullptr, 10));
+
+		std::string hlsl;
+		struct GeometryTexture { std::string name; std::string dimension; std::string valueType; UINT slot{}; };
+		std::vector<GeometryTexture> geometryTextures;
+		size_t textureCursor{};
+		while ((textureCursor = source.find("uniform ", textureCursor)) != std::string::npos &&
+			textureCursor < inputMarker)
+		{
+			const size_t typeBegin = textureCursor + 8;
+			const size_t typeEnd = source.find_first_of(" \t", typeBegin);
+			if (typeEnd == std::string::npos)
+				break;
+			const std::string samplerType = source.substr(typeBegin, typeEnd - typeBegin);
+			if (samplerType.find("sampler") == std::string::npos)
+			{
+				textureCursor = typeEnd;
+				continue;
+			}
+			const size_t nameBegin = source.find_first_not_of(" \t", typeEnd);
+			const size_t semicolon = source.find(';', nameBegin);
+			const size_t layoutBegin = source.rfind("TEXTURE_LAYOUT(", textureCursor);
+			const size_t layoutEnd = layoutBegin == std::string::npos ? std::string::npos :
+				source.find(')', layoutBegin);
+			if (nameBegin == std::string::npos || semicolon == std::string::npos ||
+				layoutBegin == std::string::npos || layoutEnd > textureCursor)
+			{
+				textureCursor = typeEnd;
+				continue;
+			}
+			const size_t lastComma = source.rfind(',', layoutEnd);
+			if (lastComma == std::string::npos || lastComma < layoutBegin)
+			{
+				textureCursor = semicolon + 1;
+				continue;
+			}
+			const UINT originalBinding = static_cast<UINT>(std::strtoul(
+				source.c_str() + lastComma + 1, nullptr, 10));
+			const UINT slot = TextureSlot(originalBinding);
+			if (slot == InvalidSlot)
+			{
+				textureCursor = semicolon + 1;
+				continue;
+			}
+			std::string dimension = samplerType.find("Cube") != std::string::npos ? "TextureCube" :
+				samplerType.find("3D") != std::string::npos ? "Texture3D" :
+				samplerType.find("1D") != std::string::npos ? "Texture1D" : "Texture2D";
+			std::string valueType = samplerType.starts_with('u') ? "uint4" :
+				samplerType.starts_with('i') ? "int4" : "float4";
+			geometryTextures.push_back({ source.substr(nameBegin, semicolon - nameBegin),
+				std::move(dimension), std::move(valueType), slot });
+			textureCursor = semicolon + 1;
+		}
+		for (const auto& texture : geometryTextures)
+			hlsl += fmt::format("{}<{}> {} : register(t{});\nSamplerState {}Sampler : register(s{});\n",
+				texture.dimension, texture.valueType, texture.name, texture.slot, texture.name, texture.slot);
+		std::string uniformHlsl;
+		std::unordered_set<std::string> uniformNames;
+		size_t uniformCursor{};
+		while ((uniformCursor = source.find("uniform ", uniformCursor)) != std::string::npos &&
+			uniformCursor < inputMarker)
+		{
+			const size_t semicolon = source.find(';', uniformCursor);
+			const size_t open = source.find('{', uniformCursor);
+			if (semicolon == std::string::npos || (open != std::string::npos && open < semicolon))
+			{
+				uniformCursor += 8;
+				continue;
+			}
+			std::string declaration = source.substr(uniformCursor + 8,
+				semicolon - uniformCursor - 8);
+			const size_t space = declaration.find_first_of(" \t");
+			if (space != std::string::npos && declaration.substr(0, space).find("sampler") == std::string::npos)
+			{
+				std::string type = GeometrySourceType(declaration.substr(0, space));
+				std::string name = declaration.substr(declaration.find_first_not_of(" \t", space));
+				const size_t array = name.find('[');
+				const std::string key = name.substr(0, array);
+				if (uniformNames.emplace(key).second)
+					uniformHlsl += fmt::format("    {} {};\n", type, name);
+			}
+			uniformCursor = semicolon + 1;
+		}
+		if (!uniformHlsl.empty())
+		{
+			UINT uniformSlot{};
+			const auto reflectedSlot = std::find_if(m_uniformSlots.begin(), m_uniformSlots.end(),
+				[](UINT slot) { return slot != InvalidSlot; });
+			if (reflectedSlot != m_uniformSlots.end())
+				uniformSlot = *reflectedSlot;
+			hlsl += fmt::format("cbuffer CemuGeometryUniforms : register(b{})\n{{\n", uniformSlot) +
+				uniformHlsl + "};\n";
+		}
+		hlsl += "struct GeometryInput\n{\n";
+		for (const auto& field : inputs)
+			hlsl += fmt::format("    {} {} : TEXCOORD{};\n", field.type, field.name, field.location);
+		hlsl += "};\nstruct GeometryOutput\n{\n    float4 position : SV_Position;\n";
+		for (const auto& field : outputs)
+			hlsl += fmt::format("    {} {} : TEXCOORD{};\n", field.type, field.name, field.location);
+		hlsl += "};\nvoid CemuSetPosition(inout float4 target, float4 value) { target=value; target.z=(target.z+target.w)*0.5f; }\n";
+
+		std::string body = source.substr(generatedBodyStart);
+		body.erase(0, body.find_first_not_of(" \t\r\n"));
+		static constexpr std::array<std::pair<std::string_view, std::string_view>, 23> replacements = {{
+			{ "floatBitsToInt", "asint" }, { "floatBitsToUint", "asuint" },
+			{ "intBitsToFloat", "asfloat" }, { "uintBitsToFloat", "asfloat" },
+			{ "fract", "frac" }, { "mix", "lerp" }, { "inversesqrt", "rsqrt" },
+			{ "dFdx", "ddx" }, { "dFdy", "ddy" }, { "mod", "fmod" },
+			{ "vec2", "float2" }, { "vec3", "float3" }, { "vec4", "float4" },
+			{ "ivec2", "int2" }, { "ivec3", "int3" }, { "ivec4", "int4" },
+			{ "uvec2", "uint2" }, { "uvec3", "uint3" }, { "uvec4", "uint4" },
+			{ "bvec2", "bool2" }, { "bvec3", "bool3" }, { "bvec4", "bool4" },
+			{ "roundEven", "round" }
+		}};
+		for (const auto& [glsl, hlslName] : replacements)
+			ReplaceToken(body, glsl, hlslName);
+		ReplaceToken(body, "v2g", "inputVertices");
+		for (const auto& output : outputs)
+			ReplaceToken(body, output.name, "cemuOutput." + output.name);
+		for (const auto& texture : geometryTextures)
+		{
+			const auto rewriteTextureCall = [&](std::string_view glslName, std::string_view hlslName)
+			{
+				const std::string needle = std::string(glslName) + "(" + texture.name + ",";
+				size_t position{};
+				while ((position = body.find(needle, position)) != std::string::npos)
+				{
+					body.replace(position, needle.size(),
+						texture.name + "." + std::string(hlslName) + "(" + texture.name + "Sampler,");
+					position += texture.name.size() + hlslName.size() + texture.name.size() + 11;
+				}
+			};
+			rewriteTextureCall("texture", "Sample");
+			rewriteTextureCall("textureLod", "SampleLevel");
+			rewriteTextureCall("textureGrad", "SampleGrad");
+			rewriteTextureCall("textureGather", "Gather");
+		}
+		ReplaceToken(body, "SET_POSITION", "CemuSetPosition");
+		size_t setPosition{};
+		while ((setPosition = body.find("CemuSetPosition(", setPosition)) != std::string::npos)
+		{
+			body.insert(setPosition + 16, "cemuOutput.position, ");
+			setPosition += 37;
+		}
+		while ((scan = body.find("EmitVertex();")) != std::string::npos)
+			body.replace(scan, 13, "outputStream.Append(cemuOutput);");
+		while ((scan = body.find("EndPrimitive();")) != std::string::npos)
+			body.replace(scan, 15, "outputStream.RestartStrip();");
+		const std::string signature = fmt::format(
+			"[maxvertexcount({})]\nvoid main({} GeometryInput inputVertices[{}], inout {}<GeometryOutput> outputStream)",
+			maxVertices, inputPrimitive,
+			std::string_view(inputPrimitive) == "point" ? 1 : std::string_view(inputPrimitive) == "line" ? 2 :
+			std::string_view(inputPrimitive) == "lineadj" ? 4 : std::string_view(inputPrimitive) == "triangleadj" ? 6 : 3,
+			streamType);
+		body.replace(body.find("void main()"), 11, signature);
+		const size_t mainBrace = body.find('{', body.find(signature));
+		body.insert(mainBrace + 1, "\nGeometryOutput cemuOutput = (GeometryOutput)0;");
+		hlsl += body;
+		UINT samplerSwizzleSlot{};
+		for (UINT slot : m_uniformSlots)
+			if (slot != InvalidSlot)
+				samplerSwizzleSlot = (std::max)(samplerSwizzleSlot, slot + 1);
+		hlsl = AddRuntimeSamplerSwizzles(std::move(hlsl), samplerSwizzleSlot,
+			m_usesRuntimeSwizzle);
+		if (m_usesRuntimeSwizzle)
+			m_samplerSwizzleSlot = samplerSwizzleSlot;
+
+		CompileHLSL(device, hlsl, true);
+		if (m_compiled)
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 native geometry shader {:016x}_{:016x}: translated automatically from Cemu GLSL",
+				m_baseHash, m_auxHash);
+		return m_compiled;
+	}
+
+	struct GeometryInterfaceField
+	{
+		std::string name;
+		std::string type;
+		std::string semantic;
+		std::string interpolation;
+	};
+
+	static std::string GeometryHlslType(const spirv_cross::SPIRType& spirType)
+	{
+		const char* baseType = "float";
+		switch (spirType.basetype)
+		{
+		case spirv_cross::SPIRType::Int: baseType = "int"; break;
+		case spirv_cross::SPIRType::UInt: baseType = "uint"; break;
+		// D3D signatures have no boolean component type. SPIR-V boolean
+		// interface values are represented as 32-bit integers at stage boundaries.
+		case spirv_cross::SPIRType::Boolean: baseType = "uint"; break;
+		default: break;
+		}
+		const uint32 componentCount = (std::max)(1u, spirType.vecsize);
+		return componentCount == 1 ? std::string(baseType) :
+			fmt::format("{}{}", baseType, componentCount);
+	}
+
+	static std::string GeometryInterpolation(bool flat, bool noPerspective,
+		bool centroid, bool sample, const spirv_cross::SPIRType& type)
+	{
+		// Integer varyings cannot be interpolated by D3D11. GLSL/SPIR-V normally
+		// decorate them Flat, but keep the generated HLSL legal even when an old
+		// shader-cache entry omitted that decoration.
+		if (flat || type.basetype == spirv_cross::SPIRType::Int ||
+			type.basetype == spirv_cross::SPIRType::UInt ||
+			type.basetype == spirv_cross::SPIRType::Boolean)
+			return "nointerpolation ";
+		if (noPerspective)
+			return "noperspective ";
+		if (sample)
+			return "sample ";
+		if (centroid)
+			return "centroid ";
+		return {};
+	}
+
+	static std::string GeometryAssignmentExpression(const GeometryInterfaceField& source,
+		const GeometryInterfaceField& destination, const std::string& expression)
+	{
+		if (source.type == destination.type)
+			return expression;
+		// Latte's ring interface commonly transports floating-point varyings in
+		// integer registers. SPIR-V retains those bit-pattern types at the native
+		// GS boundary, while HLSL requires the VS and GS signatures to agree. Keep
+		// the bits intact instead of applying a numeric conversion.
+		if (destination.type.starts_with("float") &&
+			(source.type.starts_with("int") || source.type.starts_with("uint")))
+			return fmt::format("asfloat({})", expression);
+		if (destination.type.starts_with("int") &&
+			(source.type.starts_with("float") || source.type.starts_with("uint")))
+			return fmt::format("asint({})", expression);
+		if (destination.type.starts_with("uint") &&
+			(source.type.starts_with("float") || source.type.starts_with("int")))
+			return fmt::format("asuint({})", expression);
+		return {};
+	}
+
+	static void AppendGeometryInterface(std::vector<GeometryInterfaceField>& fields,
+		spirv_cross::CompilerHLSL& compiler, const spirv_cross::Resource& resource,
+		bool output)
+	{
+		const auto& resourceType = compiler.get_type(resource.base_type_id);
+		if (resourceType.basetype == spirv_cross::SPIRType::Struct)
+		{
+			uint32 nextLocation = compiler.has_decoration(resource.id, spv::DecorationLocation) ?
+				compiler.get_decoration(resource.id, spv::DecorationLocation) : 0;
+			for (uint32 memberIndex = 0; memberIndex < resourceType.member_types.size(); ++memberIndex)
+			{
+				const auto& memberType = compiler.get_type(resourceType.member_types[memberIndex]);
+				if (compiler.has_member_decoration(resourceType.self, memberIndex, spv::DecorationBuiltIn))
+				{
+					const auto builtin = static_cast<spv::BuiltIn>(compiler.get_member_decoration(
+						resourceType.self, memberIndex, spv::DecorationBuiltIn));
+					if (builtin == spv::BuiltInPosition)
+						fields.push_back({ "position", "float4", "SV_Position", {} });
+					else if (output && builtin == spv::BuiltInLayer)
+						fields.push_back({ "layer", "uint", "SV_RenderTargetArrayIndex", "nointerpolation " });
+					else if (output && builtin == spv::BuiltInPrimitiveId)
+						fields.push_back({ "primitiveId", "uint", "SV_PrimitiveID", "nointerpolation " });
+					continue;
+				}
+
+				const uint32 location = compiler.has_member_decoration(
+					resourceType.self, memberIndex, spv::DecorationLocation) ?
+					compiler.get_member_decoration(resourceType.self, memberIndex, spv::DecorationLocation) :
+					nextLocation;
+				// Each matrix column occupies a separate interface location. Arrays of
+				// interface values do as well. Emit every occupied location rather than
+				// merely reserving it; otherwise the following stage sees an incomplete
+				// signature even though reflection itself succeeded.
+				uint32 occupiedLocations = (std::max)(1u, memberType.columns);
+				for (uint32 dimension : memberType.array)
+					occupiedLocations *= (std::max)(1u, dimension);
+				const std::string interpolation = GeometryInterpolation(
+					compiler.has_member_decoration(resourceType.self, memberIndex, spv::DecorationFlat),
+					compiler.has_member_decoration(resourceType.self, memberIndex, spv::DecorationNoPerspective),
+					compiler.has_member_decoration(resourceType.self, memberIndex, spv::DecorationCentroid),
+					compiler.has_member_decoration(resourceType.self, memberIndex, spv::DecorationSample),
+					memberType);
+				for (uint32 occupied = 0; occupied < occupiedLocations; ++occupied)
+				{
+					const uint32 fieldLocation = location + occupied;
+					fields.push_back({ fmt::format("attribute{}", fieldLocation),
+						GeometryHlslType(memberType), fmt::format("TEXCOORD{}", fieldLocation),
+						interpolation });
+				}
+				nextLocation = location + occupiedLocations;
+			}
+			return;
+		}
+
+		GeometryInterfaceField field{};
+		field.type = GeometryHlslType(resourceType);
+		if (compiler.has_decoration(resource.id, spv::DecorationBuiltIn))
+		{
+			const auto builtin = static_cast<spv::BuiltIn>(
+				compiler.get_decoration(resource.id, spv::DecorationBuiltIn));
+			switch (builtin)
+			{
+			case spv::BuiltInPosition:
+				field.name = "position";
+				field.type = "float4";
+				field.semantic = "SV_Position";
+				break;
+			case spv::BuiltInLayer:
+				if (!output)
+					return;
+				field.name = "layer";
+				field.type = "uint";
+				field.semantic = "SV_RenderTargetArrayIndex";
+				break;
+			case spv::BuiltInPrimitiveId:
+				if (!output)
+					return;
+				field.name = "primitiveId";
+				field.type = "uint";
+				field.semantic = "SV_PrimitiveID";
+				break;
+			case spv::BuiltInPointSize:
+				// D3D11 shader model 5 has no point-size output semantic.
+				return;
+			default:
+				return;
+			}
+		}
+		else
+		{
+			const uint32 location = compiler.get_decoration(resource.id, spv::DecorationLocation);
+			field.name = fmt::format("attribute{}", location);
+			field.semantic = fmt::format("TEXCOORD{}", location);
+			field.interpolation = GeometryInterpolation(
+				compiler.has_decoration(resource.id, spv::DecorationFlat),
+				compiler.has_decoration(resource.id, spv::DecorationNoPerspective),
+				compiler.has_decoration(resource.id, spv::DecorationCentroid),
+				compiler.has_decoration(resource.id, spv::DecorationSample), resourceType);
+		}
+		fields.emplace_back(std::move(field));
+	}
+
+	bool CompileGeometryCompatibilityShader(ID3D11Device* device,
+		spirv_cross::CompilerHLSL& compiler, const spirv_cross::ShaderResources& resources)
+	{
+		std::vector<GeometryInterfaceField> inputs;
+		std::vector<GeometryInterfaceField> outputs;
+		for (const auto& resource : resources.stage_inputs)
+			AppendGeometryInterface(inputs, compiler, resource, false);
+		for (const auto& resource : resources.stage_outputs)
+			AppendGeometryInterface(outputs, compiler, resource, true);
+		const auto hasPosition = [](const std::vector<GeometryInterfaceField>& fields) {
+			return std::any_of(fields.begin(), fields.end(), [](const GeometryInterfaceField& field) {
+				return field.semantic == "SV_Position";
+			});
+		};
+		if (!hasPosition(outputs))
+			outputs.push_back({ "position", "float4", "SV_Position", {} });
+
+		const auto& modes = compiler.get_execution_mode_bitset();
+		const char* inputPrimitive = "triangle";
+		uint32 inputVertices = 3;
+		if (modes.get(spv::ExecutionModeInputPoints))
+		{
+			inputPrimitive = "point";
+			inputVertices = 1;
+		}
+		else if (modes.get(spv::ExecutionModeInputLines))
+		{
+			inputPrimitive = "line";
+			inputVertices = 2;
+		}
+		else if (modes.get(spv::ExecutionModeInputLinesAdjacency))
+		{
+			inputPrimitive = "lineadj";
+			inputVertices = 4;
+		}
+		else if (modes.get(spv::ExecutionModeInputTrianglesAdjacency))
+		{
+			inputPrimitive = "triangleadj";
+			inputVertices = 6;
+		}
+
+		const char* streamType = "TriangleStream";
+		if (modes.get(spv::ExecutionModeOutputPoints))
+			streamType = "PointStream";
+		else if (modes.get(spv::ExecutionModeOutputLineStrip))
+			streamType = "LineStream";
+		uint32 outputVertices = compiler.get_execution_mode_argument(spv::ExecutionModeOutputVertices);
+		if (outputVertices == 0)
+			outputVertices = inputVertices;
+		const uint32 copiedVertices = (std::min)(inputVertices, outputVertices);
+
+		std::string hlsl = "struct GeometryInput\n{\n";
+		for (const auto& field : inputs)
+			hlsl += fmt::format("    {}{} {} : {};\n", field.interpolation,
+				field.type, field.name, field.semantic);
+		hlsl += "};\nstruct GeometryOutput\n{\n";
+		for (const auto& field : outputs)
+			hlsl += fmt::format("    {}{} {} : {};\n", field.interpolation,
+				field.type, field.name, field.semantic);
+		hlsl += fmt::format(
+			"}};\n[maxvertexcount({})]\nvoid main({} GeometryInput vertices[{}], "
+			"inout {}<GeometryOutput> outputStream)\n{{\n",
+			copiedVertices, inputPrimitive, inputVertices, streamType);
+		hlsl += fmt::format("    [unroll] for (uint vertexIndex = 0; vertexIndex < {}; ++vertexIndex)\n    {{\n", copiedVertices);
+		hlsl += "        GeometryOutput result = (GeometryOutput)0;\n";
+		for (const auto& output : outputs)
+		{
+			auto input = std::find_if(inputs.begin(), inputs.end(),
+				[&](const GeometryInterfaceField& candidate) {
+					return candidate.semantic == output.semantic && candidate.type == output.type;
+				});
+			// A Latte VS feeding a native GS exports ring parameters rather than
+			// SV_Position. Requiring SV_Position on the GS input makes D3D11 reject
+			// the VS-GS linkage. For the compatibility path, source the mandatory
+			// rasterizer position from the first reflected float4 ring parameter.
+			if (input == inputs.end() && output.semantic == "SV_Position")
+			{
+				input = std::find_if(inputs.begin(), inputs.end(),
+					[](const GeometryInterfaceField& candidate) {
+						return candidate.type == "float4" || candidate.type == "int4" ||
+							candidate.type == "uint4";
+					});
+			}
+			if (input != inputs.end())
+			{
+				const std::string expression = GeometryAssignmentExpression(*input, output,
+					fmt::format("vertices[vertexIndex].{}", input->name));
+				if (!expression.empty())
+					hlsl += fmt::format("        result.{} = {};\n", output.name, expression);
+			}
+		}
+		hlsl += "        outputStream.Append(result);\n    }\n    outputStream.RestartStrip();\n}\n";
+
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 native geometry shader {:016x}_{:016x}: SPIRV-Cross has no HLSL geometry-stage backend; using reflected topology-preserving compatibility shader",
+			m_baseHash, m_auxHash);
+		CompileHLSL(device, hlsl, true);
+		return m_compiled;
+	}
+
+	bool CompileKnownGeometryShader(ID3D11Device* device)
+	{
+		// Super Mario Maker's native geometry shader expands one Latte point
+		// into a rotated four-vertex sprite. A topology-only passthrough keeps
+		// D3D11 linkage valid, but destroys glyphs and UI rectangles because the
+		// original position and texture-coordinate calculations never run.
+		if (m_baseHash != 0xbcc4e8625638b961ull || m_auxHash != 0)
+			return false;
+
+		static constexpr const char* hlsl = R"HLSL(
+cbuffer UfBlock : register(b0)
+{
+    int4 uf_remappedGS[2];
+    int uf_verticesPerInstance;
+};
+
+struct GeometryInput
+{
+    int4 parameter0 : TEXCOORD0;
+    int4 parameter1 : TEXCOORD1;
+    int4 parameter2 : TEXCOORD2;
+    int4 parameter3 : TEXCOORD3;
+    int4 parameter4 : TEXCOORD4;
+    int4 parameter5 : TEXCOORD5;
+    int4 parameter6 : TEXCOORD6;
+};
+
+struct GeometryOutput
+{
+    float4 parameter0 : TEXCOORD0;
+    float4 position : SV_Position;
+};
+
+float2 TransformOffset(float2 offset)
+{
+    const float4 value = float4(offset, 0.0f, 1.0f);
+    return float2(dot(value, asfloat(uf_remappedGS[0])),
+                  dot(value, asfloat(uf_remappedGS[1])));
+}
+
+GeometryOutput MakeVertex(float4 center, float2 offset, float2 texCoord)
+{
+    GeometryOutput result = (GeometryOutput)0;
+    result.parameter0 = float4(texCoord, 0.0f, 0.0f);
+    result.position = center;
+    result.position.xy += TransformOffset(offset);
+    // The Latte GLSL SET_POSITION path targets Vulkan's 0..w depth range.
+    // D3D11 uses the same clip-depth convention.
+    result.position.z = (result.position.z + result.position.w) * 0.5f;
+    return result;
+}
+
+[maxvertexcount(4)]
+void main(point GeometryInput inputVertices[1],
+          inout TriangleStream<GeometryOutput> outputStream)
+{
+    const GeometryInput input = inputVertices[0];
+    const float4 center = asfloat(input.parameter0);
+    const float2 anchor = asfloat(input.parameter1.xy);
+    const float2 extent = asfloat(input.parameter2.xy);
+    const float angle = asfloat(input.parameter3.w);
+    const float2 scale = asfloat(input.parameter4.xy);
+    const float4 tex = asfloat(input.parameter5);
+    const float extra = (scale.x != 1.0f || scale.y != 1.0f) ?
+        asfloat(input.parameter6.x) : 0.0f;
+
+    // Preserve the Latte shader's periodic angle normalization while avoiding
+    // the integer bit-cast register machine used by the generated GLSL.
+    const float normalizedAngle = frac(angle * 0.1591549367f + 0.5f) *
+        6.2831854820f - 3.1415927410f;
+    const float cosine = cos(normalizedAngle);
+    const float sine = sin(normalizedAngle);
+    const float sx = scale.x * 8.0f;
+    const float sy = scale.y * 8.0f;
+
+    const float2 topLeftTex = float2(
+        -tex.z - extra - tex.x + anchor.x + extent.x,
+        -tex.w + extra + tex.y + anchor.y - extent.y);
+    const float2 topRightTex = float2(
+        -tex.z + extra + tex.x + anchor.x - extent.x,
+        topLeftTex.y);
+    const float2 bottomLeftTex = float2(
+        topLeftTex.x,
+        -tex.w - extra - tex.y + anchor.y + extent.y);
+    const float2 bottomRightTex = float2(topRightTex.x, bottomLeftTex.y);
+
+    outputStream.Append(MakeVertex(center,
+        float2(sx * cosine - sy * sine, sx * sine + sy * cosine),
+        topLeftTex));
+    outputStream.Append(MakeVertex(center,
+        float2(-sx * cosine - sy * sine, -sx * sine + sy * cosine),
+        topRightTex));
+    outputStream.Append(MakeVertex(center,
+        float2(sx * cosine + sy * sine, sx * sine - sy * cosine),
+        bottomLeftTex));
+    outputStream.Append(MakeVertex(center,
+        float2(-sx * cosine + sy * sine, -sx * sine - sy * cosine),
+        bottomRightTex));
+    outputStream.RestartStrip();
+}
+)HLSL";
+
+		CompileHLSL(device, hlsl, true);
+		if (m_compiled)
+		{
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 native geometry shader {:016x}_{:016x}: using exact point-sprite HLSL translation",
+				m_baseHash, m_auxHash);
+		}
+		return m_compiled;
+	}
+
+	void DumpUnsupportedGeometrySource(const std::string& source, const std::vector<uint32>& spirv) const
+	{
+		std::error_code error;
+		const fs::path directory = ActiveSettings::GetUserDataPath("dump/shaders");
+		fs::create_directories(directory, error);
+		if (error)
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 could not create geometry shader dump directory: {}", error.message());
+			return;
+		}
+		const std::string stem = fmt::format("{:016x}_{:016x}_gs", m_baseHash, m_auxHash);
+		const auto writeDump = [&](const fs::path& path, const void* data, size_t size)
+		{
+			error.clear();
+			if (fs::exists(path, error) && !error)
+				return true;
+			if (size > static_cast<size_t>(std::numeric_limits<sint32>::max()))
+				return false;
+			FileStream* file = FileStream::createFile2(path);
+			if (!file)
+				return false;
+			const bool written = file->writeData(data, static_cast<sint32>(size)) == static_cast<sint32>(size);
+			delete file;
+			return written;
+		};
+
+		const bool glslWritten = writeDump(directory / (stem + ".glsl"), source.data(), source.size());
+		const bool spirvWritten = writeDump(directory / (stem + ".spv"), spirv.data(), spirv.size() * sizeof(uint32));
+		if (glslWritten && spirvWritten)
+			cemuLog_log(LogType::Force,
+				"D3D11 dumped unsupported native geometry shader {:016x}_{:016x} as GLSL and SPIR-V to LocalState/dump/shaders",
+				m_baseHash, m_auxHash);
+		else
+			cemuLog_log(LogType::Force,
+				"D3D11 could not completely dump native geometry shader {:016x}_{:016x}",
+				m_baseHash, m_auxHash);
+	}
+
+	void CompileHLSL(ID3D11Device* device, const std::string& source,
+		bool preserveReflectedBindings = false)
+	{
+		try
+		{
+			if (!preserveReflectedBindings)
+			{
+				m_textureSlots.fill(InvalidSlot);
+				m_uniformSlots.fill(InvalidSlot);
+			}
+			if (GetType() != ShaderType::kGeometry)
+				throw std::runtime_error("direct HLSL compilation is only used for D3D11 geometry helpers");
+			ComPtr<ID3DBlob> errors;
+			const HRESULT compileResult = D3DCompile(source.data(), source.size(), nullptr,
+				nullptr, nullptr, "main", "gs_5_0",
+				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+				0, &m_bytecode, &errors);
+			if (FAILED(compileResult))
+			{
+				const char* message = errors ?
+					static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
+				throw std::runtime_error(message);
+			}
+			DriverCallTrace trace(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
+				m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
+			ThrowIfFailed(device->CreateGeometryShader(m_bytecode->GetBufferPointer(),
+				m_bytecode->GetBufferSize(), nullptr, &m_gs), "CreateGeometryShader");
+			m_compiled = true;
+		}
+		catch (const std::exception& ex)
+		{
+			cemuLog_log(LogType::Force, "D3D11 HLSL shader {:016x}_{:016x} failed: {}",
+				m_baseHash, m_auxHash, ex.what());
+		}
+	}
+
 	void Compile(ID3D11Device* device, const std::string& source)
 	{
 		try
@@ -404,12 +1358,25 @@ private:
 			spirv_cross::CompilerHLSL compiler(spirv);
 			const auto resources = compiler.get_shader_resources();
 			const auto executionModel = compiler.get_execution_model();
+			const auto descriptorCount = [&](const spirv_cross::Resource& resource)
+			{
+				const auto& type = compiler.get_type(resource.type_id);
+				UINT count = 1;
+				for (uint32 dimension : type.array)
+				{
+					if (dimension == 0 || count > UINT_MAX / dimension)
+						throw std::runtime_error("runtime-sized or oversized descriptor arrays are unsupported by D3D11");
+					count *= dimension;
+				}
+				return count;
+			};
 			UINT textureSlot{};
 			for (const auto& resource : resources.sampled_images)
 			{
 				const UINT originalBinding =
 					compiler.get_decoration(resource.id, spv::DecorationBinding);
-				if (textureSlot >= D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT)
+				const UINT count = descriptorCount(resource);
+				if (count > D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT - textureSlot)
 					throw std::runtime_error("shader requires more than 16 D3D11 samplers");
 				spirv_cross::HLSLResourceBinding binding{};
 				binding.stage = executionModel;
@@ -420,14 +1387,15 @@ private:
 				compiler.add_hlsl_resource_binding(binding);
 				if (originalBinding < m_textureSlots.size())
 					m_textureSlots[originalBinding] = textureSlot;
-				++textureSlot;
+				textureSlot += count;
 			}
 			UINT uniformSlot{};
 			for (const auto& resource : resources.uniform_buffers)
 			{
 				const UINT originalBinding =
 					compiler.get_decoration(resource.id, spv::DecorationBinding);
-				if (uniformSlot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+				const UINT count = descriptorCount(resource);
+				if (count > D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT - uniformSlot)
 					throw std::runtime_error("shader requires more than 14 D3D11 constant buffers");
 				spirv_cross::HLSLResourceBinding binding{};
 				binding.stage = executionModel;
@@ -437,14 +1405,42 @@ private:
 				compiler.add_hlsl_resource_binding(binding);
 				if (originalBinding < m_uniformSlots.size())
 					m_uniformSlots[originalBinding] = uniformSlot;
-				++uniformSlot;
+				uniformSlot += count;
+			}
+			// SPIRV-Cross' HLSL backend recognizes geometry-stage reflection but
+			// cannot emit its entry point or stream operations. Calling compile()
+			// therefore throws CompilerError("Unsupported shader stage"). Keep the
+			// D3D11 pipeline valid with a reflected topology/interface preserving
+			// shader instead of losing the stage (or stopping in the debugger).
+			if (executionModel == spv::ExecutionModelGeometry)
+			{
+				DumpUnsupportedGeometrySource(source, spirv);
+				if (CompileKnownGeometryShader(device))
+				{
+					CreateStreamoutShader(device, source);
+					return;
+				}
+				if (CompileGeneratedGeometryShader(device, source))
+				{
+					CreateStreamoutShader(device, source);
+					return;
+				}
+				CompileGeometryCompatibilityShader(device, compiler, resources);
+				if (m_compiled)
+					CreateStreamoutShader(device, source);
+				return;
 			}
 			auto options = compiler.get_hlsl_options();
 			options.shader_model = 50;
 			options.point_coord_compat = true;
 			options.point_size_compat = true;
+			// Preserve the SPIR-V name for stages supported by the HLSL backend.
+			options.use_entry_point_name = true;
 			compiler.set_hlsl_options(options);
-			const std::string hlsl = compiler.compile();
+			std::string hlsl = compiler.compile();
+			hlsl = AddRuntimeSamplerSwizzles(std::move(hlsl), uniformSlot, m_usesRuntimeSwizzle);
+			if (m_usesRuntimeSwizzle)
+				m_samplerSwizzleSlot = uniformSlot;
 
 			const char* profile = GetType() == ShaderType::kVertex ? "vs_5_0" :
 				GetType() == ShaderType::kFragment ? "ps_5_0" : "gs_5_0";
@@ -560,6 +1556,8 @@ private:
 	ComPtr<ID3D11GeometryShader> m_streamoutGs;
 	std::array<UINT, 256> m_textureSlots{};
 	std::array<UINT, 256> m_uniformSlots{};
+	UINT m_samplerSwizzleSlot{ InvalidSlot };
+	bool m_usesRuntimeSwizzle{};
 };
 
 class D3D11Query final : public LatteQueryObject
@@ -591,15 +1589,29 @@ class D3D11TextureView final : public LatteTextureView
 public:
 	D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim, Latte::E_GX2SURFFMT format,
 		sint32 firstMip, sint32 mipCount, sint32 firstSlice, sint32 sliceCount);
+	~D3D11TextureView() override;
 	ID3D11ShaderResourceView* SRV() const { return m_srv.Get(); }
 	ID3D11RenderTargetView* RTV() const { return m_rtv.Get(); }
 	ID3D11DepthStencilView* DSV() const { return m_dsv.Get(); }
 	DXGI_FORMAT RTVFormat() const { return m_rtvFormat; }
+	void PrepareForSampling();
+	void PrepareForRenderTarget();
+	void CopyAliasToBase();
+	bool IsIncompatibleAlias() const { return m_incompatibleAlias; }
 private:
+	bool CreateIncompatibleAlias(const FormatInfo& requested);
+	bool CopySubresourcesRaw(ID3D11Resource* source, DXGI_FORMAT sourceFormat,
+		UINT sourceFirstMip, UINT sourceFirstSlice, UINT sourceMipLevels,
+		ID3D11Resource* destination,
+		UINT destinationFirstMip, UINT destinationFirstSlice, UINT destinationMipLevels);
 	ComPtr<ID3D11ShaderResourceView> m_srv;
 	ComPtr<ID3D11RenderTargetView> m_rtv;
 	ComPtr<ID3D11DepthStencilView> m_dsv;
 	DXGI_FORMAT m_rtvFormat{ DXGI_FORMAT_UNKNOWN };
+	ComPtr<ID3D11Resource> m_aliasResource;
+	bool m_incompatibleAlias{};
+	UINT m_aliasSliceCount{ 1 };
+	uint64 m_syncedVersion{ (std::numeric_limits<uint64>::max)() };
 };
 
 class D3D11Texture final : public LatteTexture
@@ -609,14 +1621,27 @@ public:
 		Latte::E_GX2SURFFMT format, uint32 width, uint32 height, uint32 depth, uint32 pitch,
 		uint32 mipLevels, uint32 swizzle, Latte::E_HWTILEMODE tileMode, bool isDepth)
 		: LatteTexture(dim, physAddress, physMipAddress, format, width, height, depth, pitch,
-			mipLevels, swizzle, tileMode, isDepth), m_renderer(renderer), m_format(GetFormatInfo(format, isDepth)) {}
+			mipLevels, swizzle, tileMode, isDepth), m_renderer(renderer)
+	{
+		// Texture rules are evaluated by the LatteTexture constructor. OpenGL
+		// allocates the overridden format and Vulkan views assume that the image
+		// already has it; using the original GX2 format here made D3D11 graphic
+		// pack replacements either fail view creation or render with the wrong
+		// numeric interpretation.
+		const auto effectiveFormat = overwriteInfo.hasFormatOverwrite ?
+			static_cast<Latte::E_GX2SURFFMT>(overwriteInfo.format) : format;
+		hasStencil = LatteTexture_GX2FormatHasStencil(isDepth, effectiveFormat);
+		m_format = GetFormatInfo(effectiveFormat, isDepth);
+	}
 
 	void AllocateOnHost() override
 	{
 		if (m_resource)
 			return;
-		const uint32 logicalWidth = (std::max)(width, 1);
-		const uint32 logicalHeight = (std::max)(height, 1);
+		const uint32 logicalWidth = EffectiveWidth();
+		const uint32 logicalHeight = EffectiveHeight();
+		const uint32 logicalDepth = EffectiveDepth();
+		const UINT effectiveMipLevels = EffectiveMipLevels();
 		const uint32 nativeWidth = m_format.compressed ?
 			((logicalWidth + m_format.blockWidth - 1) / m_format.blockWidth) * m_format.blockWidth :
 			logicalWidth;
@@ -631,8 +1656,8 @@ public:
 		{
 			D3D11_TEXTURE1D_DESC desc{};
 			desc.Width = nativeWidth;
-			desc.MipLevels = (std::max)(mipLevels, 1);
-			desc.ArraySize = dim == Latte::E_DIM::DIM_1D_ARRAY ? (std::max)(depth, 1) : 1;
+			desc.MipLevels = effectiveMipLevels;
+			desc.ArraySize = dim == Latte::E_DIM::DIM_1D_ARRAY ? logicalDepth : 1;
 			desc.Format = m_format.resource;
 			desc.Usage = D3D11_USAGE_DEFAULT;
 			desc.BindFlags = bindFlags;
@@ -647,8 +1672,8 @@ public:
 			D3D11_TEXTURE3D_DESC desc{};
 			desc.Width = nativeWidth;
 			desc.Height = nativeHeight;
-			desc.Depth = (std::max)(depth, 1);
-			desc.MipLevels = (std::max)(mipLevels, 1);
+			desc.Depth = logicalDepth;
+			desc.MipLevels = effectiveMipLevels;
 			desc.Format = m_format.resource;
 			desc.Usage = D3D11_USAGE_DEFAULT;
 			// D3D11 cannot create a depth-stencil Texture3D. GX2 does not expose
@@ -669,14 +1694,21 @@ public:
 		// 130x130, while D3D11 rejects those dimensions for a BC resource.
 		desc.Width = nativeWidth;
 		desc.Height = nativeHeight;
-		desc.MipLevels = (std::max)(mipLevels, 1);
-		desc.ArraySize = dim == Latte::E_DIM::DIM_CUBEMAP ? (std::max)(depth, 6) :
-			(dim == Latte::E_DIM::DIM_2D_ARRAY || dim == Latte::E_DIM::DIM_2D_ARRAY_MSAA ? (std::max)(depth, 1) : 1);
+		desc.MipLevels = effectiveMipLevels;
+		// LatteTexture::depth is the layer count for every non-3D image, not only
+		// for resources whose original GX2 dimension explicitly says ARRAY. Vulkan
+		// allocates them this way as well, because later views may reinterpret a 2D
+		// allocation as an array or cubemap.
+		desc.ArraySize = dim == Latte::E_DIM::DIM_CUBEMAP ? (std::max)(logicalDepth, 6u) :
+			logicalDepth;
 		desc.Format = m_format.resource;
 		desc.SampleDesc.Count = 1;
 		desc.Usage = D3D11_USAGE_DEFAULT;
 		desc.BindFlags = bindFlags;
-		desc.MiscFlags = dim == Latte::E_DIM::DIM_CUBEMAP ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+		const bool cubeCompatible = dim != Latte::E_DIM::DIM_1D &&
+			dim != Latte::E_DIM::DIM_1D_ARRAY && desc.ArraySize >= 6 &&
+			(desc.ArraySize % 6) == 0 && nativeWidth == nativeHeight;
+		desc.MiscFlags = cubeCompatible ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
 		ThrowIfFailed(m_renderer->GetDevice()->CreateTexture2D(&desc, nullptr, &m_texture2D), "CreateTexture2D");
 		m_resource = m_texture2D;
 	}
@@ -687,6 +1719,51 @@ public:
 	ID3D11Texture3D* Texture3D() const { return m_texture3D.Get(); }
 	const FormatInfo& NativeFormat() const { return m_format; }
 	D3D11Renderer* Owner() const { return m_renderer; }
+	uint32 EffectiveWidth() const
+	{
+		const sint32 value = overwriteInfo.hasResolutionOverwrite ? overwriteInfo.width : width;
+		return static_cast<uint32>((std::max)(value, 1));
+	}
+	uint32 EffectiveHeight() const
+	{
+		const sint32 value = overwriteInfo.hasResolutionOverwrite ? overwriteInfo.height : height;
+		return static_cast<uint32>((std::max)(value, 1));
+	}
+	uint32 EffectiveDepth() const
+	{
+		const sint32 value = overwriteInfo.hasResolutionOverwrite ? overwriteInfo.depth : depth;
+		return static_cast<uint32>((std::max)(value, 1));
+	}
+	UINT EffectiveMipLevels() const
+	{
+		return static_cast<UINT>((std::max)((std::min)(mipLevels, maxPossibleMipLevels), 1));
+	}
+	void CommitAliasWriter()
+	{
+		if (!m_aliasWriter)
+			return;
+		auto* writer = m_aliasWriter;
+		m_aliasWriter = nullptr;
+		writer->CopyAliasToBase();
+		++m_contentVersion;
+	}
+	void BeginAliasWrite(D3D11TextureView* view)
+	{
+		if (m_aliasWriter != view)
+			CommitAliasWriter();
+		m_aliasWriter = view;
+	}
+	void BeginNativeWrite()
+	{
+		CommitAliasWriter();
+		++m_contentVersion;
+	}
+	void ReleaseAliasView(D3D11TextureView* view)
+	{
+		if (m_aliasWriter == view)
+			CommitAliasWriter();
+	}
+	uint64 ContentVersion() const { return m_contentVersion; }
 
 protected:
 	LatteTextureView* CreateView(Latte::E_DIM dim, Latte::E_GX2SURFFMT format,
@@ -701,6 +1778,8 @@ private:
 	ComPtr<ID3D11Texture1D> m_texture1D;
 	ComPtr<ID3D11Texture2D> m_texture2D;
 	ComPtr<ID3D11Texture3D> m_texture3D;
+	D3D11TextureView* m_aliasWriter{};
+	uint64 m_contentVersion{};
 };
 
 D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
@@ -709,12 +1788,13 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 {
 	texture->AllocateOnHost();
 	const auto& baseNative = texture->NativeFormat();
+	const bool formatOverwritten = texture->overwriteInfo.hasFormatOverwrite;
 	const auto viewNative = GetFormatInfo(format, texture->isDepth);
 	// GX2 aliases the same allocation through views with different numeric
 	// interpretations. Match Vulkan's mutable images by using the requested
 	// LatteTextureView format instead of silently inheriting the base format.
 	// D3D11 only accepts reinterpretation inside the same typeless family.
-	const auto& native = texture->isDepth ? baseNative : viewNative;
+	const auto& native = (texture->isDepth || formatOverwritten) ? baseNative : viewNative;
 	D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
 	srv.Format = native.srv;
 	if (dim == Latte::E_DIM::DIM_1D)
@@ -742,11 +1822,11 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 		// Vulkan always exposes GX2 cubemaps as cube arrays. A single cube is
 		// still legal through TEXTURECUBE, but titles can create views that
 		// start at a later cube or span more than six faces.
-		if (texture->depth > 6 || firstSlice >= 6 || sliceCount > 6)
+		if (texture->EffectiveDepth() > 6 || firstSlice >= 6 || sliceCount > 6)
 		{
 			const UINT firstFace = static_cast<UINT>((std::max)(firstSlice, 0));
 			const UINT availableFaces = static_cast<UINT>((std::max)(
-				static_cast<sint32>(texture->depth) - firstSlice, 0));
+				static_cast<sint32>(texture->EffectiveDepth()) - firstSlice, 0));
 			const UINT requestedFaces = static_cast<UINT>((std::max)(sliceCount, 0));
 			const UINT faceCount = (std::min)(availableFaces, requestedFaces);
 			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
@@ -762,7 +1842,7 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 			srv.TextureCube.MipLevels = mipCount;
 		}
 	}
-	else if (texture->depth > 1 || dim == Latte::E_DIM::DIM_2D_ARRAY)
+	else if (texture->EffectiveDepth() > 1 || dim == Latte::E_DIM::DIM_2D_ARRAY)
 	{
 		srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
 		srv.Texture2DArray.MostDetailedMip = firstMip;
@@ -780,12 +1860,17 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 		texture->Resource(), &srv, &m_srv);
 	if (FAILED(srvResult) && !texture->isDepth && native.srv != baseNative.srv)
 	{
-		// Block-compressed aliases and a few packed format pairs have no legal
-		// D3D11 view reinterpretation. Keep the resource usable and let Cemu's
-		// explicit surface-conversion path handle those pairs.
-		srv.Format = baseNative.srv;
-		srvResult = texture->Owner()->GetDevice()->CreateShaderResourceView(
-			texture->Resource(), &srv, &m_srv);
+		// A mutable GX2 allocation may cross DXGI typeless families. Such a view
+		// is illegal in D3D11, so back it with a synchronized shadow resource in
+		// the requested family instead of silently sampling the base format.
+		if (CreateIncompatibleAlias(viewNative))
+			srvResult = S_OK;
+		else
+		{
+			srv.Format = baseNative.srv;
+			srvResult = texture->Owner()->GetDevice()->CreateShaderResourceView(
+				texture->Resource(), &srv, &m_srv);
+		}
 	}
 	ThrowIfFailed(srvResult, "CreateShaderResourceView");
 
@@ -805,7 +1890,7 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 			dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE1D;
 			dsv.Texture1D.MipSlice = firstMip;
 		}
-		else if (texture->depth > 1)
+		else if (texture->EffectiveDepth() > 1)
 		{
 			dsv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DARRAY;
 			dsv.Texture2DArray.MipSlice = firstMip;
@@ -819,7 +1904,7 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 		}
 		ThrowIfFailed(texture->Owner()->GetDevice()->CreateDepthStencilView(texture->Resource(), &dsv, &m_dsv), "CreateDepthStencilView");
 	}
-	else if (native.rtv != DXGI_FORMAT_UNKNOWN)
+	else if (!m_incompatibleAlias && native.rtv != DXGI_FORMAT_UNKNOWN)
 	{
 		D3D11_RENDER_TARGET_VIEW_DESC rtv{};
 		rtv.Format = native.rtv;
@@ -828,7 +1913,13 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 			rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE1DARRAY;
 			rtv.Texture1DArray.MipSlice = firstMip;
 			rtv.Texture1DArray.FirstArraySlice = firstSlice;
-			rtv.Texture1DArray.ArraySize = sliceCount;
+			// CB_COLORn_VIEW selects one array slice for a color attachment.  The
+			// texture cache can nevertheless return its broader base view (most
+			// visibly for face zero of a cubemap).  Binding that broad RTV beside
+			// the five single-face RTVs makes the subresources overlap and D3D11
+			// rejects the complete MRT set.  Keep the SRV broad, but make the RTV
+			// describe only the render-target slice selected by GX2.
+			rtv.Texture1DArray.ArraySize = 1;
 		}
 		else if (dim == Latte::E_DIM::DIM_1D)
 		{
@@ -840,14 +1931,14 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 			rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE3D;
 			rtv.Texture3D.MipSlice = firstMip;
 			rtv.Texture3D.FirstWSlice = firstSlice;
-			rtv.Texture3D.WSize = sliceCount;
+			rtv.Texture3D.WSize = 1;
 		}
-		else if (texture->depth > 1)
+		else if (texture->EffectiveDepth() > 1)
 		{
 			rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
 			rtv.Texture2DArray.MipSlice = firstMip;
 			rtv.Texture2DArray.FirstArraySlice = firstSlice;
-			rtv.Texture2DArray.ArraySize = sliceCount;
+			rtv.Texture2DArray.ArraySize = 1;
 		}
 		else
 		{
@@ -867,6 +1958,211 @@ D3D11TextureView::D3D11TextureView(D3D11Texture* texture, Latte::E_DIM dim,
 	}
 }
 
+D3D11TextureView::~D3D11TextureView()
+{
+	static_cast<D3D11Texture*>(baseTexture)->ReleaseAliasView(this);
+}
+
+bool D3D11TextureView::CreateIncompatibleAlias(const FormatInfo& requested)
+{
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	const auto& base = texture->NativeFormat();
+	if (!texture->Texture2D() || texture->isDepth || requested.srv == DXGI_FORMAT_UNKNOWN ||
+		base.bytesPerBlock != requested.bytesPerBlock || base.blockWidth != requested.blockWidth ||
+		base.blockHeight != requested.blockHeight)
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 cannot create raw mutable alias from DXGI format {} to {} because the storage geometry differs",
+			static_cast<uint32>(base.resource), static_cast<uint32>(requested.resource));
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC desc{};
+	desc.Width = (std::max)(texture->EffectiveWidth() >> firstMip, 1u);
+	desc.Height = (std::max)(texture->EffectiveHeight() >> firstMip, 1u);
+	if (requested.compressed)
+	{
+		desc.Width = ((desc.Width + requested.blockWidth - 1) / requested.blockWidth) * requested.blockWidth;
+		desc.Height = ((desc.Height + requested.blockHeight - 1) / requested.blockHeight) * requested.blockHeight;
+	}
+	desc.MipLevels = static_cast<UINT>((std::max)(numMip, 1));
+	desc.ArraySize = dim == Latte::E_DIM::DIM_CUBEMAP ?
+		static_cast<UINT>((std::max)(numSlice, 6)) :
+		static_cast<UINT>((std::max)(numSlice, 1));
+	desc.Format = requested.resource;
+	desc.SampleDesc.Count = 1;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE |
+		(requested.rtv != DXGI_FORMAT_UNKNOWN ? D3D11_BIND_RENDER_TARGET : 0);
+	desc.MiscFlags = dim == Latte::E_DIM::DIM_CUBEMAP && desc.ArraySize >= 6 &&
+		(desc.ArraySize % 6) == 0 ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
+	ComPtr<ID3D11Texture2D> alias;
+	if (FAILED(texture->Owner()->GetDevice()->CreateTexture2D(&desc, nullptr, &alias)))
+		return false;
+	m_aliasResource = alias;
+
+	D3D11_SHADER_RESOURCE_VIEW_DESC srv{};
+	srv.Format = requested.srv;
+	if (desc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE)
+	{
+		if (desc.ArraySize > 6)
+		{
+			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBEARRAY;
+			srv.TextureCubeArray.MostDetailedMip = 0;
+			srv.TextureCubeArray.MipLevels = desc.MipLevels;
+			srv.TextureCubeArray.First2DArrayFace = 0;
+			srv.TextureCubeArray.NumCubes = desc.ArraySize / 6;
+		}
+		else
+		{
+			srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
+			srv.TextureCube.MostDetailedMip = 0;
+			srv.TextureCube.MipLevels = desc.MipLevels;
+		}
+	}
+	else if (desc.ArraySize > 1)
+	{
+		srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+		srv.Texture2DArray.MostDetailedMip = 0;
+		srv.Texture2DArray.MipLevels = desc.MipLevels;
+		srv.Texture2DArray.FirstArraySlice = 0;
+		srv.Texture2DArray.ArraySize = desc.ArraySize;
+	}
+	else
+	{
+		srv.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+		srv.Texture2D.MostDetailedMip = 0;
+		srv.Texture2D.MipLevels = desc.MipLevels;
+	}
+	if (FAILED(texture->Owner()->GetDevice()->CreateShaderResourceView(alias.Get(), &srv, &m_srv)))
+		return false;
+	if (requested.rtv != DXGI_FORMAT_UNKNOWN)
+	{
+		D3D11_RENDER_TARGET_VIEW_DESC rtv{};
+		rtv.Format = requested.rtv;
+		if (desc.ArraySize > 1)
+		{
+			rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+			rtv.Texture2DArray.MipSlice = 0;
+			rtv.Texture2DArray.FirstArraySlice = 0;
+			rtv.Texture2DArray.ArraySize = 1;
+		}
+		else
+		{
+			rtv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			rtv.Texture2D.MipSlice = 0;
+		}
+		if (FAILED(texture->Owner()->GetDevice()->CreateRenderTargetView(alias.Get(), &rtv, &m_rtv)))
+			return false;
+		m_rtvFormat = rtv.Format;
+	}
+	m_incompatibleAlias = true;
+	m_aliasSliceCount = desc.ArraySize;
+	cemuLog_logOnce(LogType::Force,
+		"D3D11 mutable GX2 alias uses synchronized shadow resource (DXGI {} -> {})",
+		static_cast<uint32>(base.resource), static_cast<uint32>(requested.resource));
+	return true;
+}
+
+bool D3D11TextureView::CopySubresourcesRaw(ID3D11Resource* source, DXGI_FORMAT sourceFormat,
+	UINT sourceFirstMip, UINT sourceFirstSlice, UINT sourceMipLevels,
+	ID3D11Resource* destination,
+	UINT destinationFirstMip, UINT destinationFirstSlice, UINT destinationMipLevels)
+{
+	ComPtr<ID3D11Texture2D> sourceTexture;
+	ComPtr<ID3D11Texture2D> destinationTexture;
+	if (FAILED(source->QueryInterface(IID_PPV_ARGS(&sourceTexture))) ||
+		FAILED(destination->QueryInterface(IID_PPV_ARGS(&destinationTexture))))
+		return false;
+	D3D11_TEXTURE2D_DESC sourceDesc{};
+	D3D11_TEXTURE2D_DESC destinationDesc{};
+	sourceTexture->GetDesc(&sourceDesc);
+	destinationTexture->GetDesc(&destinationDesc);
+	const UINT copyMipCount = (std::min)({ static_cast<UINT>((std::max)(numMip, 1)),
+		sourceMipLevels > sourceFirstMip ? sourceMipLevels - sourceFirstMip : 0,
+		destinationMipLevels > destinationFirstMip ? destinationMipLevels - destinationFirstMip : 0 });
+	const UINT copySliceCount = (std::min)({ m_aliasSliceCount,
+		sourceDesc.ArraySize > sourceFirstSlice ? sourceDesc.ArraySize - sourceFirstSlice : 0,
+		destinationDesc.ArraySize > destinationFirstSlice ? destinationDesc.ArraySize - destinationFirstSlice : 0 });
+	if (copyMipCount == 0 || copySliceCount == 0)
+		return false;
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	auto* context = texture->Owner()->GetContext();
+	for (UINT slice = 0; slice < copySliceCount; ++slice)
+	{
+		for (UINT mip = 0; mip < copyMipCount; ++mip)
+		{
+			D3D11_TEXTURE2D_DESC stagingDesc{};
+			stagingDesc.Width = (std::max)(sourceDesc.Width >> (sourceFirstMip + mip), 1u);
+			stagingDesc.Height = (std::max)(sourceDesc.Height >> (sourceFirstMip + mip), 1u);
+			stagingDesc.MipLevels = 1;
+			stagingDesc.ArraySize = 1;
+			stagingDesc.Format = sourceFormat;
+			stagingDesc.SampleDesc.Count = 1;
+			stagingDesc.Usage = D3D11_USAGE_STAGING;
+			stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			ComPtr<ID3D11Texture2D> staging;
+			if (FAILED(texture->Owner()->GetDevice()->CreateTexture2D(&stagingDesc, nullptr, &staging)))
+				return false;
+			context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, source,
+				D3D11CalcSubresource(sourceFirstMip + mip, sourceFirstSlice + slice,
+					sourceMipLevels), nullptr);
+			D3D11_MAPPED_SUBRESOURCE mapped{};
+			if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+				return false;
+			context->UpdateSubresource(destination,
+				D3D11CalcSubresource(destinationFirstMip + mip, destinationFirstSlice + slice,
+					destinationMipLevels), nullptr, mapped.pData, mapped.RowPitch, mapped.DepthPitch);
+			context->Unmap(staging.Get(), 0);
+		}
+	}
+	return true;
+}
+
+void D3D11TextureView::PrepareForSampling()
+{
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	texture->CommitAliasWriter();
+	if (!m_incompatibleAlias || m_syncedVersion == texture->ContentVersion())
+		return;
+	ComPtr<ID3D11Texture2D> aliasTexture;
+	if (FAILED(m_aliasResource.As(&aliasTexture)))
+		return;
+	D3D11_TEXTURE2D_DESC aliasDesc{};
+	aliasTexture->GetDesc(&aliasDesc);
+	if (CopySubresourcesRaw(texture->Resource(), texture->NativeFormat().resource,
+		firstMip, firstSlice, texture->EffectiveMipLevels(), m_aliasResource.Get(),
+		0, 0, aliasDesc.MipLevels))
+		m_syncedVersion = texture->ContentVersion();
+}
+
+void D3D11TextureView::PrepareForRenderTarget()
+{
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	if (!m_incompatibleAlias)
+	{
+		texture->BeginNativeWrite();
+		return;
+	}
+	PrepareForSampling();
+	texture->BeginAliasWrite(this);
+}
+
+void D3D11TextureView::CopyAliasToBase()
+{
+	if (!m_incompatibleAlias)
+		return;
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	ComPtr<ID3D11Texture2D> aliasTexture;
+	if (FAILED(m_aliasResource.As(&aliasTexture)))
+		return;
+	D3D11_TEXTURE2D_DESC aliasDesc{};
+	aliasTexture->GetDesc(&aliasDesc);
+	CopySubresourcesRaw(m_aliasResource.Get(), aliasDesc.Format, 0, 0, aliasDesc.MipLevels,
+		texture->Resource(), firstMip, firstSlice,
+		texture->EffectiveMipLevels());
+}
+
 class D3D11Readback final : public LatteTextureReadbackInfo
 {
 public:
@@ -875,6 +2171,7 @@ public:
 	void StartTransfer() override
 	{
 		auto* texture = static_cast<D3D11Texture*>(m_view->baseTexture);
+		m_view->PrepareForSampling();
 		texture->AllocateOnHost();
 		if (!texture->Texture2D())
 			throw std::runtime_error("D3D11 readback currently requires a 2D texture view");
@@ -997,6 +2294,9 @@ ComPtr<ID3DBlob> CompileInternalShader(const char* source, const char* profile)
 
 D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 {
+	for (auto& stage : m_samplerSwizzles)
+		for (auto& selectors : stage)
+			selectors = { 0, 1, 2, 3 };
 	const auto* surface = static_cast<const CemuEmbedD3D11Surface*>(WindowSystem::GetWindowInfo().canvas_main.surface);
 	if (!surface || surface->struct_size < sizeof(CemuEmbedD3D11Surface) ||
 		surface->abi_version != CEMU_EMBED_D3D11_SURFACE_VERSION ||
@@ -1017,6 +2317,13 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 		m_infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_CORRUPTION, FALSE);
 		m_infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_ERROR, FALSE);
 		m_infoQueue->SetBreakOnSeverity(D3D11_MESSAGE_SEVERITY_WARNING, FALSE);
+		// Keep messages in ID3D11InfoQueue so CheckDebugMessages() can classify
+		// and persist real renderer faults, but stop the debug layer from also
+		// writing every message directly to Visual Studio's Output window. GX2
+		// legitimately keeps a pixel shader active during depth-only passes, and
+		// D3D11 otherwise emits DEVICE_DRAW_RENDERTARGETVIEW_NOT_SET for every
+		// such draw before our compatibility filter gets a chance to process it.
+		m_infoQueue->SetMuteDebugOutput(TRUE);
 		m_infoQueue->ClearStoredMessages();
 	}
 	m_swapChain = static_cast<IDXGISwapChain*>(surface->swap_chain);
@@ -1100,6 +2407,48 @@ void D3D11Renderer::RefreshBackBuffer()
 	ThrowIfFailed(m_device->CreateRenderTargetView(m_backBuffer.Get(), nullptr, &m_backBufferView), "Create back-buffer RTV");
 }
 
+void D3D11Renderer::EnsureBackBufferSize()
+{
+	int requestedWidth = 1;
+	int requestedHeight = 1;
+	WindowSystem::GetWindowPhysSize(requestedWidth, requestedHeight);
+	requestedWidth = (std::max)(requestedWidth, 1);
+	requestedHeight = (std::max)(requestedHeight, 1);
+
+	DXGI_SWAP_CHAIN_DESC description{};
+	ThrowIfFailed(m_swapChain->GetDesc(&description), "IDXGISwapChain::GetDesc");
+	if (description.BufferDesc.Width == static_cast<UINT>(requestedWidth) &&
+		description.BufferDesc.Height == static_cast<UINT>(requestedHeight))
+		return;
+
+	m_context->OMSetRenderTargets(0, nullptr, nullptr);
+	m_backBufferView.Reset();
+	m_backBuffer.Reset();
+	m_context->Flush();
+
+	ThrowIfFailed(m_swapChain->ResizeBuffers(
+		2, static_cast<UINT>(requestedWidth), static_cast<UINT>(requestedHeight),
+		DXGI_FORMAT_B8G8R8A8_UNORM, 0), "IDXGISwapChain::ResizeBuffers");
+
+	// A composition swap chain uses physical-pixel buffers while XAML lays out
+	// the panel in DIPs. Keep the DXGI matrix synchronized with the scale used
+	// by the host when it published requestedWidth/requestedHeight.
+	ComPtr<IDXGISwapChain2> swapChain2;
+	if (SUCCEEDED(m_swapChain.As(&swapChain2)))
+	{
+		const float compositionScale = static_cast<float>((std::max)(
+			WindowSystem::GetWindowDPIScale(), 0.01));
+		DXGI_MATRIX_3X2_F inverseScale{};
+		inverseScale._11 = 1.0f / compositionScale;
+		inverseScale._22 = 1.0f / compositionScale;
+		ThrowIfFailed(swapChain2->SetMatrixTransform(&inverseScale),
+			"IDXGISwapChain2::SetMatrixTransform");
+	}
+
+	cemuLog_log(LogType::Force, "D3D11 presentation resized to {}x{}",
+		requestedWidth, requestedHeight);
+}
+
 void D3D11Renderer::Initialize()
 {
 	glslang::InitializeProcess();
@@ -1155,6 +2504,7 @@ bool D3D11Renderer::BeginFrame(bool mainWindow)
 {
 	if (!mainWindow)
 		return false;
+	EnsureBackBufferSize();
 	RefreshBackBuffer();
 	ID3D11RenderTargetView* view = m_backBufferView.Get();
 	m_context->OMSetRenderTargets(1, &view, nullptr);
@@ -1244,37 +2594,32 @@ void D3D11Renderer::HandleScreenshotRequest(LatteTextureView* textureView, bool 
 void D3D11Renderer::DrawBackbufferQuad(LatteTextureView* textureView, RendererOutputShader*, bool useLinear,
 	sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
 {
+	if (textureView)
+		static_cast<D3D11TextureView*>(textureView)->PrepareForSampling();
 	if (padView || !textureView || !BeginFrame(true))
 		return;
-	// Fill the complete SwapChainPanel while preserving the game's aspect ratio.
-	// The regular Cemu rectangle uses "contain" scaling and therefore produces
-	// black bars when the host window and the Wii U output have different aspect
-	// ratios. Embedded presentation uses "cover" scaling instead: the excess is
-	// centered and clipped by the full-back-buffer scissor rectangle.
+	// Preserve the complete Wii U image. Scale it as far as the current
+	// SwapChainPanel permits, then center the remaining letterbox/pillarbox
+	// space. Unlike "cover" scaling this never cuts HUD elements or menus.
 	D3D11_TEXTURE2D_DESC backBufferDesc{};
 	m_backBuffer->GetDesc(&backBufferDesc);
 	const sint32 backBufferWidth = static_cast<sint32>((std::max)(backBufferDesc.Width, 1u));
 	const sint32 backBufferHeight = static_cast<sint32>((std::max)(backBufferDesc.Height, 1u));
-	int surfaceWidth = 1;
-	int surfaceHeight = 1;
-	WindowSystem::GetWindowPhysSize(surfaceWidth, surfaceHeight);
-	const double coverScale = (std::max)(
-		static_cast<double>(surfaceWidth) / static_cast<double>((std::max)(imageWidth, 1)),
-		static_cast<double>(surfaceHeight) / static_cast<double>((std::max)(imageHeight, 1)));
-	const double coveredWidth = imageWidth * coverScale;
-	const double coveredHeight = imageHeight * coverScale;
-	const double coveredX = (surfaceWidth - coveredWidth) * 0.5;
-	const double coveredY = (surfaceHeight - coveredHeight) * 0.5;
-	const double compositionScaleX = static_cast<double>(backBufferWidth) /
-		static_cast<double>((std::max)(surfaceWidth, 1));
-	const double compositionScaleY = static_cast<double>(backBufferHeight) /
-		static_cast<double>((std::max)(surfaceHeight, 1));
-	imageX = static_cast<sint32>(std::lround(coveredX * compositionScaleX));
-	imageY = static_cast<sint32>(std::lround(coveredY * compositionScaleY));
-	imageWidth = static_cast<sint32>(std::lround(coveredWidth * compositionScaleX));
-	imageHeight = static_cast<sint32>(std::lround(coveredHeight * compositionScaleY));
-	if (clearBackground)
-		ClearColorbuffer(false);
+	const double containScale = (std::min)(
+		static_cast<double>(backBufferWidth) / static_cast<double>((std::max)(imageWidth, 1)),
+		static_cast<double>(backBufferHeight) / static_cast<double>((std::max)(imageHeight, 1)));
+	const sint32 containedWidth = (std::max)(
+		static_cast<sint32>(std::lround(imageWidth * containScale)), 1);
+	const sint32 containedHeight = (std::max)(
+		static_cast<sint32>(std::lround(imageHeight * containScale)), 1);
+	imageX = (backBufferWidth - containedWidth) / 2;
+	imageY = (backBufferHeight - containedHeight) / 2;
+	imageWidth = containedWidth;
+	imageHeight = containedHeight;
+	// Always clear the full buffer because the contained viewport can change
+	// after a resize. Otherwise pixels from the previous, larger viewport stay
+	// visible in the newly exposed bars.
+	ClearColorbuffer(false);
 	auto* view = static_cast<D3D11TextureView*>(textureView);
 	ID3D11ShaderResourceView* srv = view->SRV();
 	ID3D11SamplerState* sampler = useLinear ? m_presentSampler.Get() : m_presentPointSampler.Get();
@@ -1470,7 +2815,13 @@ void D3D11Renderer::renderTarget_setScissor(sint32 x, sint32 y, sint32 width, si
 }
 
 LatteCachedFBO* D3D11Renderer::rendertarget_createCachedFBO(uint64 key) { return new LatteCachedFBO(key); }
-void D3D11Renderer::rendertarget_deleteCachedFBO(LatteCachedFBO* fbo) { delete fbo; }
+void D3D11Renderer::rendertarget_deleteCachedFBO(LatteCachedFBO*)
+{
+	// LatteMRT::DeleteCachedFBO owns the common object and deletes it after this
+	// renderer hook returns. D3D11 has no separate framebuffer object to free;
+	// deleting here as well caused a double-free during the post-Present texture
+	// cleanup, commonly surfacing as a read from 0xFFFFFFFFFFFFFFFF.
+}
 
 void D3D11Renderer::UnbindTextureHazards()
 {
@@ -1630,6 +2981,7 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 		if (fbo->colorBuffer[i].texture)
 		{
 			auto* textureView = static_cast<D3D11TextureView*>(fbo->colorBuffer[i].texture);
+			textureView->PrepareForRenderTarget();
 			targets[i] = textureView->RTV();
 			if (targets[i])
 			{
@@ -1650,6 +3002,8 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 	}
 	ID3D11DepthStencilView* depth = fbo->depthBuffer.texture ?
 		static_cast<D3D11TextureView*>(fbo->depthBuffer.texture)->DSV() : nullptr;
+	if (fbo->depthBuffer.texture)
+		static_cast<D3D11TextureView*>(fbo->depthBuffer.texture)->PrepareForRenderTarget();
 	// Vulkan uses VK_EXT_attachment_feedback_loop_layout when a title samples
 	// an attachment that it is also updating. D3D11 forbids simultaneous SRV
 	// and RTV/DSV bindings, so snapshot only the conflicting inputs before the
@@ -1743,6 +3097,7 @@ void D3D11Renderer::texture_loadSlice(LatteTexture* texture, sint32 width, sint3
 		return;
 	auto* d3d = static_cast<D3D11Texture*>(texture);
 	d3d->AllocateOnHost();
+	d3d->BeginNativeWrite();
 	const auto& info = d3d->NativeFormat();
 	const UINT sourceWidth = static_cast<UINT>((std::max)(width, 1));
 	const UINT sourceHeight = static_cast<UINT>((std::max)(height, 1));
@@ -1858,6 +3213,7 @@ void D3D11Renderer::texture_clearColorSlice(LatteTexture* texture, sint32 slice,
 	float r, float g, float b, float a)
 {
 	auto* view = static_cast<D3D11TextureView*>(texture->GetOrCreateView(mip, 1, slice, 1));
+	view->PrepareForRenderTarget();
 	if (view->RTV())
 	{
 		const float color[4]{ r, g, b, a };
@@ -1869,6 +3225,7 @@ void D3D11Renderer::texture_clearDepthSlice(LatteTexture* texture, uint32 slice,
 	bool clearDepth, bool clearStencil, float depth, uint32 stencil)
 {
 	auto* view = static_cast<D3D11TextureView*>(texture->GetOrCreateView(mip, 1, slice, 1));
+	view->PrepareForRenderTarget();
 	UINT flags = (clearDepth ? D3D11_CLEAR_DEPTH : 0) | (clearStencil && texture->hasStencil ? D3D11_CLEAR_STENCIL : 0);
 	if (view->DSV() && flags)
 		m_context->ClearDepthStencilView(view->DSV(), flags, depth, static_cast<UINT8>(stencil));
@@ -1958,6 +3315,8 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 	if (unit >= m_boundTextures.size())
 		return;
 	auto* view = static_cast<D3D11TextureView*>(textureView);
+	if (view)
+		view->PrepareForSampling();
 	m_boundTextures[unit] = view ? view->SRV() : nullptr;
 	ID3D11ShaderResourceView* srv = view ? view->SRV() : nullptr;
 	auto bindTexture = [&](LatteDecompilerShader* shader, uint32 textureIndex,
@@ -1983,6 +3342,24 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 			nativeShader->TextureSlot(static_cast<UINT>(originalBinding)) : D3D11Shader::InvalidSlot;
 		if (binding == D3D11Shader::InvalidSlot)
 			return;
+		uint32 registerBase{};
+		if (shader->shaderType == LatteConst::ShaderType::Vertex)
+			registerBase = Latte::REGADDR::SQ_TEX_RESOURCE_WORD0_N_VS;
+		else if (shader->shaderType == LatteConst::ShaderType::Pixel)
+			registerBase = Latte::REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS;
+		else
+			registerBase = Latte::REGADDR::SQ_TEX_RESOURCE_WORD0_N_GS;
+		const uint32 word4 = LatteGPUState.contextRegister[registerBase + textureIndex * 7 + 4];
+		const auto swizzleFormat = textureView ? textureView->format :
+			Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
+		if (binding < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT)
+		{
+			auto& selectors = m_samplerSwizzles[static_cast<uint32>(shader->shaderType)][binding];
+			selectors[0] = AdjustTextureComponentSelector(swizzleFormat, (word4 >> 16) & 7);
+			selectors[1] = AdjustTextureComponentSelector(swizzleFormat, (word4 >> 19) & 7);
+			selectors[2] = AdjustTextureComponentSelector(swizzleFormat, (word4 >> 22) & 7);
+			selectors[3] = AdjustTextureComponentSelector(swizzleFormat, (word4 >> 25) & 7);
+		}
 		ID3D11SamplerState* sampler = textureView ?
 			GetSamplerState(shader, textureIndex, textureView->baseTexture) : nullptr;
 		setResources(binding, &srv);
@@ -2021,6 +3398,8 @@ void D3D11Renderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
 	auto* source = static_cast<D3D11Texture*>(src);
 	auto* destination = static_cast<D3D11Texture*>(dst);
 	source->AllocateOnHost(); destination->AllocateOnHost();
+	source->CommitAliasWriter();
+	destination->BeginNativeWrite();
 	if (width <= 0 || height <= 0 || depth <= 0)
 		return;
 	const bool source3D = src->Is3DTexture();
@@ -2082,6 +3461,10 @@ void D3D11Renderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* so
 		source->GetOrCreateView(srcMip, 1, srcSlice, 1));
 	auto* destinationView = static_cast<D3D11TextureView*>(
 		destination->GetOrCreateView(dstMip, 1, dstSlice, 1));
+	if (sourceView)
+		sourceView->PrepareForSampling();
+	if (destinationView)
+		destinationView->PrepareForRenderTarget();
 	if (!sourceView || !destinationView || !sourceView->SRV())
 		return;
 
@@ -2095,6 +3478,10 @@ void D3D11Renderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* so
 	// CopySubresourceRegion. Reproduce the other Cemu backends and convert the
 	// red/depth component with a fullscreen draw into the destination view.
 	UnbindTextureHazards();
+	// The destination can still be present in a shader stage from the preceding
+	// GX2 draw. D3D11 otherwise nulls that SRV implicitly when it becomes an RTV,
+	// leaving the renderer's binding cache out of sync with the real context.
+	ClearShaderResources();
 	ID3D11RenderTargetView* colorTarget = destination->isDepth ? nullptr : destinationView->RTV();
 	ID3D11DepthStencilView* depthTarget = destination->isDepth ? destinationView->DSV() : nullptr;
 	if ((!destination->isDepth && !colorTarget) || (destination->isDepth && !depthTarget))
@@ -2319,58 +3706,101 @@ RendererShader* D3D11Renderer::GetRectEmulationShader(LatteDecompilerShader* ver
 	if (const auto existing = m_rectShaderCache.find(key); existing != m_rectShaderCache.end())
 		return existing->second.get();
 
-	std::string source;
-	source.append("#version 450\r\n");
-	source.append("layout(triangles) in;\r\n");
-	source.append("layout(triangle_strip) out;\r\n");
-	source.append("layout(max_vertices = 4) out;\r\n");
-	const auto parameterMask = vertexShader->outputParameterMask;
-	for (sint32 direction = 0; direction < 2; ++direction)
+	struct RectParameter
 	{
-		for (uint32 index = 0; index < 32; ++index)
-		{
-			if ((parameterMask & (1u << index)) == 0)
-				continue;
-			const sint32 semantic = inputTable->getVertexShaderOutParamSemanticId(
-				LatteGPUState.contextNew.GetRawView(), index);
-			if (semantic < 0)
-				continue;
-			const auto* pixelImport = inputTable->getPSImportBySemanticId(semantic);
-			if (!pixelImport)
-				continue;
-			source.append(fmt::format("layout(location = {}) ",
-				inputTable->getPSImportLocationBySemanticId(semantic)));
-			if (pixelImport->isFlat)
-				source.append("flat ");
-			if (pixelImport->isNoPerspective)
-				source.append("noperspective ");
-			source.append(direction == 0 ? "in" : "out");
-			source.append(direction == 0 ?
-				fmt::format(" vec4 passParameterSem{}In[];\r\n", semantic) :
-				fmt::format(" vec4 passParameterSem{}Out;\r\n", semantic));
-		}
+		sint32 semantic{};
+		sint32 location{};
+		bool isFlat{};
+		bool isNoPerspective{};
+	};
+	std::vector<RectParameter> parameters;
+	const auto parameterMask = vertexShader->outputParameterMask;
+	for (uint32 index = 0; index < 32; ++index)
+	{
+		if ((parameterMask & (1u << index)) == 0)
+			continue;
+		const sint32 semantic = inputTable->getVertexShaderOutParamSemanticId(
+			LatteGPUState.contextNew.GetRawView(), index);
+		if (semantic < 0)
+			continue;
+		const auto* pixelImport = inputTable->getPSImportBySemanticId(semantic);
+		if (!pixelImport)
+			continue;
+		parameters.push_back({ semantic,
+			inputTable->getPSImportLocationBySemanticId(semantic),
+			pixelImport->isFlat, pixelImport->isNoPerspective });
+	}
+
+	// This helper is deliberately emitted directly as HLSL.  Passing a geometry
+	// shader through Vulkan GLSL and SPIR-V introduces Vulkan-only builtins which
+	// SPIRV-Cross cannot map to shader model 5, even though rectangle expansion
+	// itself only requires SV_Position and the user TEXCOORD semantics.
+	std::string source;
+	source.append("struct RectInput {\r\nfloat4 position : SV_Position;\r\n");
+	for (const auto& parameter : parameters)
+		source.append(fmt::format("float4 parameterSem{} : TEXCOORD{};\r\n",
+			parameter.semantic, parameter.location));
+	source.append("};\r\nstruct RectOutput {\r\nfloat4 position : SV_Position;\r\n");
+	for (const auto& parameter : parameters)
+	{
+		if (parameter.isFlat)
+			source.append("nointerpolation ");
+		else if (parameter.isNoPerspective)
+			source.append("noperspective ");
+		source.append(fmt::format("float4 parameterSem{} : TEXCOORD{};\r\n",
+			parameter.semantic, parameter.location));
 	}
 	source.append(
-		"vec4 gen4thVertexA(vec4 a,vec4 b,vec4 c){return b-(c-a);}\r\n"
-		"vec4 gen4thVertexB(vec4 a,vec4 b,vec4 c){return c-(b-a);}\r\n"
-		"vec4 gen4thVertexC(vec4 a,vec4 b,vec4 c){return c+(b-a);}\r\n"
-		"void main(){\r\n"
-		"float dist0_1=length(gl_in[1].gl_Position.xy-gl_in[0].gl_Position.xy);\r\n"
-		"float dist0_2=length(gl_in[2].gl_Position.xy-gl_in[0].gl_Position.xy);\r\n"
-		"float dist1_2=length(gl_in[2].gl_Position.xy-gl_in[1].gl_Position.xy);\r\n"
+		"};\r\n"
+		"float4 gen4thVertexA(float4 a,float4 b,float4 c){return b-(c-a);}\r\n"
+		"float4 gen4thVertexB(float4 a,float4 b,float4 c){return c-(b-a);}\r\n"
+		"float4 gen4thVertexC(float4 a,float4 b,float4 c){return c+(b-a);}\r\n"
+		"[maxvertexcount(4)]\r\n"
+		"void main(triangle RectInput inputVertices[3], inout TriangleStream<RectOutput> outputStream){\r\n"
+		"RectOutput outputVertex;\r\n"
+		"float dist0_1=length(inputVertices[1].position.xy-inputVertices[0].position.xy);\r\n"
+		"float dist0_2=length(inputVertices[2].position.xy-inputVertices[0].position.xy);\r\n"
+		"float dist1_2=length(inputVertices[2].position.xy-inputVertices[1].position.xy);\r\n"
 		"if(dist0_1>dist0_2&&dist0_1>dist1_2){\r\n");
-	rectsEmulationGS_outputVerticesCode(source, vertexShader, inputTable,
-		2, 1, 0, 3, "A", LatteGPUState.contextNew);
+	auto appendVertex = [&](sint32 vertex, const char* generatedVariant)
+	{
+		if (generatedVariant)
+		{
+			source.append(fmt::format(
+				"outputVertex.position=gen4thVertex{}(inputVertices[0].position,inputVertices[1].position,inputVertices[2].position);\r\n",
+				generatedVariant));
+			for (const auto& parameter : parameters)
+				source.append(fmt::format(
+					"outputVertex.parameterSem{}=gen4thVertex{}(inputVertices[0].parameterSem{},inputVertices[1].parameterSem{},inputVertices[2].parameterSem{});\r\n",
+					parameter.semantic, generatedVariant, parameter.semantic,
+					parameter.semantic, parameter.semantic));
+		}
+		else
+		{
+			source.append(fmt::format("outputVertex.position=inputVertices[{}].position;\r\n", vertex));
+			for (const auto& parameter : parameters)
+				source.append(fmt::format(
+					"outputVertex.parameterSem{}=inputVertices[{}].parameterSem{};\r\n",
+					parameter.semantic, vertex, parameter.semantic));
+		}
+		source.append("outputStream.Append(outputVertex);\r\n");
+	};
+	auto appendVertices = [&](sint32 p0, sint32 p1, sint32 p2, const char* variant)
+	{
+		appendVertex(p0, nullptr);
+		appendVertex(p1, nullptr);
+		appendVertex(p2, nullptr);
+		appendVertex(0, variant);
+	};
+	appendVertices(2, 1, 0, "A");
 	source.append("}else if(dist0_2>dist0_1&&dist0_2>dist1_2){\r\n");
-	rectsEmulationGS_outputVerticesCode(source, vertexShader, inputTable,
-		1, 2, 0, 3, "B", LatteGPUState.contextNew);
+	appendVertices(1, 2, 0, "B");
 	source.append("}else{\r\n");
-	rectsEmulationGS_outputVerticesCode(source, vertexShader, inputTable,
-		0, 1, 2, 3, "C", LatteGPUState.contextNew);
-	source.append("}\r\n}\r\n");
+	appendVertices(0, 1, 2, "C");
+	source.append("}\r\noutputStream.RestartStrip();\r\n}\r\n");
 
 	auto shader = std::make_unique<D3D11Shader>(m_device.Get(),
-		RendererShader::ShaderType::kGeometry, key, 0, false, source);
+		RendererShader::ShaderType::kGeometry, key, 0, false, source, true);
 	if (!shader->IsCompiled() || !shader->Geometry())
 	{
 		cemuLog_log(LogType::Force,
@@ -2490,6 +3920,33 @@ void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 vert
 	else if (shader->shaderType == LatteConst::ShaderType::Geometry) m_context->GSSetConstantBuffers(binding, 1, &buffer);
 }
 
+void D3D11Renderer::UpdateSamplerSwizzleBuffer(LatteDecompilerShader* shader)
+{
+	if (!shader || !shader->shader)
+		return;
+	auto* nativeShader = static_cast<D3D11Shader*>(shader->shader);
+	const UINT binding = nativeShader->SamplerSwizzleSlot();
+	if (binding == D3D11Shader::InvalidSlot)
+		return;
+	const uint32 stage = static_cast<uint32>(shader->shaderType);
+	if (stage >= m_samplerSwizzles.size())
+		return;
+	D3D11_BUFFER_DESC desc{};
+	desc.ByteWidth = sizeof(m_samplerSwizzles[stage]);
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+	D3D11_SUBRESOURCE_DATA initial{ m_samplerSwizzles[stage].data(), 0, 0 };
+	if (FAILED(m_device->CreateBuffer(&desc, &initial, &m_samplerSwizzleBuffers[stage])))
+		return;
+	ID3D11Buffer* buffer = m_samplerSwizzleBuffers[stage].Get();
+	if (shader->shaderType == LatteConst::ShaderType::Vertex)
+		m_context->VSSetConstantBuffers(binding, 1, &buffer);
+	else if (shader->shaderType == LatteConst::ShaderType::Pixel)
+		m_context->PSSetConstantBuffers(binding, 1, &buffer);
+	else if (shader->shaderType == LatteConst::ShaderType::Geometry)
+		m_context->GSSetConstantBuffers(binding, 1, &buffer);
+}
+
 void D3D11Renderer::UpdateInputLayout()
 {
 	auto* fetch = LatteSHRC_GetActiveFetchShader();
@@ -2499,7 +3956,13 @@ void D3D11Renderer::UpdateInputLayout()
 		return;
 	const uint64 key = fetch->key ^ shaderContext->baseHash ^ (shaderContext->auxHash << 1);
 	if (m_inputLayout && m_inputLayoutKey == key)
+	{
+		// Internal fullscreen copies temporarily bind a null input layout.  The
+		// cached COM object remains valid, so an early return must also restore it
+		// on the immediate context before the next indexed GX2 draw.
+		m_context->IASetInputLayout(m_inputLayout.Get());
 		return;
+	}
 	std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
 	for (const auto& group : fetch->bufferGroups)
 	{
@@ -2565,16 +4028,27 @@ void D3D11Renderer::ApplyPipelineState()
 	rasterizer.FrontCounterClockwise =
 		registers.PA_SU_SC_MODE_CNTL.get_FRONT_FACE() ==
 		Latte::LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW;
-	rasterizer.DepthClipEnable = !registers.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE();
+	const bool nearClipDisabled = registers.PA_CL_CLIP_CNTL.get_ZCLIP_NEAR_DISABLE();
+	const bool farClipDisabled = registers.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE();
+	// D3D11 exposes a single depth-clipping switch whereas GX2 can disable the
+	// near and far planes independently. Do not clip a plane explicitly disabled
+	// by the title; the remaining plane is conservatively depth-clamped.
+	rasterizer.DepthClipEnable = !nearClipDisabled && !farClipDisabled;
+	if (nearClipDisabled != farClipDisabled)
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 cannot independently disable near/far depth clipping; using depth clamp for this GX2 state");
 	rasterizer.ScissorEnable = TRUE;
 	rasterizer.MultisampleEnable = FALSE;
 	rasterizer.AntialiasedLineEnable = FALSE;
 	if (registers.PA_SU_SC_MODE_CNTL.get_OFFSET_FRONT_ENABLED())
 	{
-		rasterizer.DepthBias = static_cast<INT>(
-			registers.PA_SU_POLY_OFFSET_FRONT_OFFSET.get_OFFSET() * 16.0f);
+		// Match the factors used by the Vulkan path. GX2 stores the slope scale
+		// with sixteen times the host API value; D3D11's constant factor is an
+		// integer number of minimum depth units.
+		rasterizer.DepthBias = static_cast<INT>(std::lround(
+			registers.PA_SU_POLY_OFFSET_FRONT_OFFSET.get_OFFSET()));
 		rasterizer.SlopeScaledDepthBias =
-			registers.PA_SU_POLY_OFFSET_FRONT_SCALE.get_SCALE();
+			registers.PA_SU_POLY_OFFSET_FRONT_SCALE.get_SCALE() / 16.0f;
 		rasterizer.DepthBiasClamp = registers.PA_SU_POLY_OFFSET_CLAMP.get_CLAMP();
 	}
 	const uint64 rasterizerKey = HashBytes(&rasterizer, sizeof(rasterizer));
@@ -2606,14 +4080,14 @@ void D3D11Renderer::ApplyPipelineState()
 		target.BlendOp = BlendOp(source.get_COLOR_COMB_FCN());
 		if (source.get_SEPARATE_ALPHA_BLEND())
 		{
-			target.SrcBlendAlpha = BlendFactor(source.get_ALPHA_SRCBLEND());
-			target.DestBlendAlpha = BlendFactor(source.get_ALPHA_DSTBLEND());
+			target.SrcBlendAlpha = BlendFactorAlpha(source.get_ALPHA_SRCBLEND());
+			target.DestBlendAlpha = BlendFactorAlpha(source.get_ALPHA_DSTBLEND());
 			target.BlendOpAlpha = BlendOp(source.get_ALPHA_COMB_FCN());
 		}
 		else
 		{
-			target.SrcBlendAlpha = target.SrcBlend;
-			target.DestBlendAlpha = target.DestBlend;
+			target.SrcBlendAlpha = BlendFactorAlpha(source.get_COLOR_SRCBLEND());
+			target.DestBlendAlpha = BlendFactorAlpha(source.get_COLOR_DSTBLEND());
 			target.BlendOpAlpha = target.BlendOp;
 		}
 	}
@@ -2623,6 +4097,12 @@ void D3D11Renderer::ApplyPipelineState()
 	{
 		target.LogicOpEnable = logicOpEnabled;
 		target.LogicOp = LogicOp(gx2LogicOp);
+		// D3D11.1 requires logic operations and fixed-function blending to be
+		// mutually exclusive for a render target. GX2's ROP selects the logic
+		// result, so disabling blending here preserves the effective operation and
+		// avoids an invalid CreateBlendState1 descriptor.
+		if (logicOpEnabled)
+			target.BlendEnable = FALSE;
 	}
 	const uint64 blendKey = HashBytes(&blend, sizeof(blend));
 	auto blendIt = m_blendCache.find(blendKey);
@@ -2793,6 +4273,9 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	UpdateUniformVars(LatteSHRC_GetActiveVertexShader(), count);
 	UpdateUniformVars(LatteSHRC_GetActivePixelShader(), count);
 	UpdateUniformVars(LatteSHRC_GetActiveGeometryShader(), count);
+	UpdateSamplerSwizzleBuffer(LatteSHRC_GetActiveVertexShader());
+	UpdateSamplerSwizzleBuffer(LatteSHRC_GetActivePixelShader());
+	UpdateSamplerSwizzleBuffer(LatteSHRC_GetActiveGeometryShader());
 	ApplyPipelineState();
 	m_context->IASetPrimitiveTopology(PrimitiveTopology(primitive));
 	LatteStreamout_PrepareDrawcall(count, instanceCount);

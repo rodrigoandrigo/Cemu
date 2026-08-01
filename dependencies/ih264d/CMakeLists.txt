@@ -194,7 +194,7 @@ message(FATAL_ERROR "ih264d unknown architecture: ${IH264D_ARCHITECTURE}")
 endif()
 
 if(MSVC)
-set_property(TARGET ih264d PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+set_property(TARGET ih264d PROPERTY MSVC_RUNTIME_LIBRARY "${CEMU_MSVC_RUNTIME_LIBRARY}")
 
 # tune settings for slightly better performance
 target_compile_options(ih264d PRIVATE $<$<CONFIG:Release,RelWithDebInfo>:/Oi>) # enable intrinsic functions
