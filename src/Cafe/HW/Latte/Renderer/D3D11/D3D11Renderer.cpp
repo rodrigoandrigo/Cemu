@@ -2569,7 +2569,10 @@ DXGI_FORMAT VertexFormat(uint8 format)
 	case FMT_32_32_32: case FMT_32_32_32_FLOAT: return DXGI_FORMAT_R32G32B32_UINT;
 	case FMT_32_32_32_32: case FMT_32_32_32_32_FLOAT: return DXGI_FORMAT_R32G32B32A32_UINT;
 	case FMT_2_10_10_10: return DXGI_FORMAT_R32_UINT;
-	default: return DXGI_FORMAT_R8G8B8A8_UINT;
+	default:
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 unsupported vertex format 0x{:02X}; draw will be skipped", format);
+		return DXGI_FORMAT_UNKNOWN;
 	}
 }
 
@@ -3182,6 +3185,11 @@ void D3D11Renderer::CheckMemoryPressure()
 	std::vector<uint8>().swap(m_uploadBuffer);
 	m_context->Flush();
 	WaitForGpuIdle();
+	// The cache-copy scratch is reconstructible and only needed while cache nodes
+	// are merged. Release its peak allocation once all referencing GPU work has
+	// retired so it cannot permanently consume Series S headroom.
+	m_bufferCopyScratch.Reset();
+	m_bufferCopyScratchCapacity = 0;
 	ComPtr<IDXGIDevice3> dxgiDevice3;
 	if (SUCCEEDED(m_device.As(&dxgiDevice3)))
 		dxgiDevice3->Trim();
@@ -4162,7 +4170,8 @@ void D3D11Renderer::bufferCache_init(const sint32 size)
 
 void D3D11Renderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 offset)
 {
-	if (!m_bufferCache || !buffer || size <= 0 || offset + size > m_bufferCacheShadow.size())
+	if (!m_bufferCache || !buffer || size <= 0 ||
+		static_cast<uint64>(offset) + static_cast<uint32>(size) > m_bufferCacheShadow.size())
 		return;
 	std::memcpy(m_bufferCacheShadow.data() + offset, buffer, size);
 	D3D11_BOX box{ offset, 0, 0, offset + static_cast<UINT>(size), 1, 1 };
@@ -4176,22 +4185,56 @@ void D3D11Renderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 offset
 
 void D3D11Renderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size)
 {
-	if (srcOffset + size > m_bufferCacheShadow.size() || dstOffset + size > m_bufferCacheShadow.size())
+	if (!m_bufferCache || !size ||
+		static_cast<uint64>(srcOffset) + size > m_bufferCacheShadow.size() ||
+		static_cast<uint64>(dstOffset) + size > m_bufferCacheShadow.size())
 		return;
-	std::memmove(m_bufferCacheShadow.data() + dstOffset, m_bufferCacheShadow.data() + srcOffset, size);
-	D3D11_BOX box{ dstOffset, 0, 0, dstOffset + size, 1, 1 };
+	if (!m_bufferCopyScratch || m_bufferCopyScratchCapacity < size)
 	{
-		D3D11_DRIVER_TRACE(fmt::format(
-			"UpdateSubresource buffer-copy src={} dst={} size={}", srcOffset, dstOffset, size));
-		m_context->UpdateSubresource(m_bufferCache.Get(), 0, &box,
-			m_bufferCacheShadow.data() + dstOffset, 0, 0);
+		UINT newCapacity = m_bufferCopyScratchCapacity ? m_bufferCopyScratchCapacity : 256u * 1024u;
+		while (newCapacity < size && newCapacity <= (std::numeric_limits<UINT>::max)() / 2)
+			newCapacity *= 2;
+		newCapacity = (std::max)(newCapacity, size);
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = newCapacity;
+		desc.Usage = D3D11_USAGE_DEFAULT;
+		ComPtr<ID3D11Buffer> replacement;
+		const HRESULT hr = m_device->CreateBuffer(&desc, nullptr, &replacement);
+		if (FAILED(hr))
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 buffer-cache GPU copy skipped: scratch allocation {} bytes failed (0x{:08X})",
+				newCapacity, static_cast<uint32>(hr));
+			return;
+		}
+		m_bufferCopyScratch = std::move(replacement);
+		m_bufferCopyScratchCapacity = newCapacity;
 	}
+
+	// A cache node may contain transform-feedback data that exists only on the
+	// GPU. The old CPU-shadow UpdateSubresource path silently replaced those
+	// bytes with stale emulated RAM while ranges were merged. D3D11 buffers have
+	// one subresource, so use a distinct reusable scratch resource for the two
+	// asynchronous GPU copies required by the API.
+	D3D11_BOX sourceBox{ srcOffset, 0, 0, srcOffset + size, 1, 1 };
+	m_context->CopySubresourceRegion(m_bufferCopyScratch.Get(), 0, 0, 0, 0,
+		m_bufferCache.Get(), 0, &sourceBox);
+	D3D11_BOX scratchBox{ 0, 0, 0, size, 1, 1 };
+	m_context->CopySubresourceRegion(m_bufferCache.Get(), 0, dstOffset, 0, 0,
+		m_bufferCopyScratch.Get(), 0, &scratchBox);
+
+	// Keep the CPU mirror coherent for ordinary RAM-backed pages and uniform
+	// ranges. Stream-output-only bytes remain authoritative on the GPU, but are
+	// no longer uploaded back over the correct destination.
+	std::memmove(m_bufferCacheShadow.data() + dstOffset, m_bufferCacheShadow.data() + srcOffset, size);
+	D3D11_DRIVER_TRACE(fmt::format(
+		"GPU buffer-copy src={} dst={} size={}", srcOffset, dstOffset, size));
 }
 void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst, uint32 size)
 {
 	if (!m_bufferCache || !size ||
-		src + size > LatteStreamout_GetRingBufferSize() ||
-		dst + size > m_bufferCacheShadow.size())
+		static_cast<uint64>(src) + size > static_cast<uint32>(LatteStreamout_GetRingBufferSize()) ||
+		static_cast<uint64>(dst) + size > m_bufferCacheShadow.size())
 		return;
 	if (m_streamoutActive)
 	{
@@ -4210,7 +4253,12 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 		}
 	}
 	if (!sourceBuffer)
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 stream-output copy skipped: no completed source for offset {} size {}",
+			src, size);
 		return;
+	}
 	D3D11_BOX box{ src, 0, 0, src + size, 1, 1 };
 	m_context->CopySubresourceRegion(m_bufferCache.Get(), 0, dst, 0, 0,
 		sourceBuffer, 0, &box);
@@ -4220,7 +4268,9 @@ void D3D11Renderer::buffer_bindVertexBuffer(uint32 index, uint32 offset, uint32 
 {
 	if (index >= m_vertexBuffers.size())
 		return;
-	m_vertexBuffers[index] = size ? m_bufferCache : nullptr;
+	const bool validRange = size != 0 &&
+		static_cast<uint64>(offset) + size <= m_bufferCacheShadow.size();
+	m_vertexBuffers[index] = validRange ? m_bufferCache : nullptr;
 	m_vertexOffsets[index] = offset;
 	const uint32* regs = LatteGPUState.contextRegister + mmSQ_VTX_ATTRIBUTE_BLOCK_START + index * 7;
 	m_vertexStrides[index] = (regs[2] >> 11) & 0xFFFF;
@@ -4234,7 +4284,7 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 		return;
 	const uint32 stageIndex = static_cast<uint32>(stage);
 	ID3D11Buffer* native{};
-	if (size && offset + size <= m_bufferCacheShadow.size())
+	if (size && static_cast<uint64>(offset) + size <= m_bufferCacheShadow.size())
 	{
 		const UINT requiredSize = Align16(size);
 		auto& buffer = m_uniformBuffers[stageIndex][index];
@@ -4385,8 +4435,15 @@ void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffs
 {
 	if (index >= LATTE_NUM_STREAMOUT_BUFFER)
 		return;
-	m_streamoutEnabled[index] = rangeSize != 0;
-	m_streamoutOffsets[index] = static_cast<UINT>((std::max)(ringBufferOffset, 0));
+	const uint64 offset = static_cast<uint64>((std::max)(ringBufferOffset, 0));
+	const bool validRange = ringBufferOffset >= 0 && rangeSize != 0 &&
+		offset + rangeSize <= static_cast<uint32>(LatteStreamout_GetRingBufferSize());
+	m_streamoutEnabled[index] = validRange;
+	m_streamoutOffsets[index] = validRange ? static_cast<UINT>(offset) : 0;
+	if (rangeSize != 0 && !validRange)
+		cemuLog_log(LogType::Force,
+			"D3D11 stream-output buffer {} rejected invalid range offset={} size={}",
+			index, ringBufferOffset, rangeSize);
 }
 
 void D3D11Renderer::streamout_begin()
@@ -4398,11 +4455,26 @@ void D3D11Renderer::streamout_begin()
 	if (!shader || !shader->StreamoutGeometry())
 	{
 		cemuLog_log(LogType::Force, "D3D11 stream output was requested but its shader signature is unavailable");
+		// FinishDrawcall still runs in the common path. Clear these bindings so it
+		// cannot copy bytes left by an older transform-feedback draw into the new
+		// vertex range.
+		m_streamoutEnabled.fill(false);
+		m_streamoutActive = false;
 		return;
 	}
 	std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> buffers{};
+	bool hasOutputBuffer = false;
 	for (UINT i = 0; i < buffers.size(); ++i)
+	{
 		buffers[i] = m_streamoutEnabled[i] ? m_streamoutBuffers[i].Get() : nullptr;
+		hasOutputBuffer |= buffers[i] != nullptr;
+	}
+	if (!hasOutputBuffer)
+	{
+		m_streamoutEnabled.fill(false);
+		m_streamoutActive = false;
+		return;
+	}
 	m_context->GSSetShader(shader->StreamoutGeometry(), nullptr, 0);
 	m_context->SOSetTargets(static_cast<UINT>(buffers.size()), buffers.data(), m_streamoutOffsets.data());
 	m_streamoutActive = true;
@@ -4724,21 +4796,22 @@ void D3D11Renderer::UpdateSamplerSwizzleBuffer(LatteDecompilerShader* shader)
 		m_context->GSSetConstantBuffers(binding, 1, &buffer);
 }
 
-void D3D11Renderer::UpdateInputLayout()
+bool D3D11Renderer::UpdateInputLayout()
 {
 	auto* fetch = LatteSHRC_GetActiveFetchShader();
 	auto* shaderContext = LatteSHRC_GetActiveVertexShader();
 	auto* shader = shaderContext ? static_cast<D3D11Shader*>(shaderContext->shader) : nullptr;
 	if (!fetch || !shader || !shader->Bytecode())
-		return;
-	const uint64 key = fetch->key ^ shaderContext->baseHash ^ (shaderContext->auxHash << 1);
+		return false;
+	const uint64 keyValues[] = { fetch->key, shaderContext->baseHash, shaderContext->auxHash };
+	const uint64 key = HashBytes(keyValues, sizeof(keyValues));
 	if (m_inputLayoutKeyValid && m_inputLayoutKey == key)
 	{
 		// Internal fullscreen copies temporarily bind a null input layout.  The
 		// cached COM object remains valid, so an early return must also restore it
 		// on the immediate context before the next indexed GX2 draw.
 		m_context->IASetInputLayout(m_inputLayout.Get());
-		return;
+		return true;
 	}
 	if (const auto cached = m_inputLayoutCache.find(key); cached != m_inputLayoutCache.end())
 	{
@@ -4746,7 +4819,7 @@ void D3D11Renderer::UpdateInputLayout()
 		m_inputLayoutKey = key;
 		m_inputLayoutKeyValid = true;
 		m_context->IASetInputLayout(m_inputLayout.Get());
-		return;
+		return true;
 	}
 	std::vector<D3D11_INPUT_ELEMENT_DESC> elements;
 	for (const auto& group : fetch->bufferGroups)
@@ -4761,6 +4834,13 @@ void D3D11Renderer::UpdateInputLayout()
 			element.SemanticName = "TEXCOORD";
 			element.SemanticIndex = location;
 			element.Format = VertexFormat(attribute.format);
+			if (element.Format == DXGI_FORMAT_UNKNOWN)
+			{
+				m_context->IASetInputLayout(nullptr);
+				m_inputLayout.Reset();
+				m_inputLayoutKeyValid = false;
+				return false;
+			}
 			element.InputSlot = attribute.attributeBufferIndex;
 			element.AlignedByteOffset = attribute.offset;
 			element.InputSlotClass = attribute.fetchType == LatteConst::INSTANCE_DATA ?
@@ -4771,6 +4851,7 @@ void D3D11Renderer::UpdateInputLayout()
 		}
 	}
 	m_inputLayout.Reset();
+	m_context->IASetInputLayout(nullptr);
 	if (!elements.empty())
 	{
 		D3D11_DRIVER_TRACE(fmt::format("CreateInputLayout elements={} shader={:016x}_{:016x}",
@@ -4780,13 +4861,15 @@ void D3D11Renderer::UpdateInputLayout()
 		if (FAILED(hr))
 		{
 			cemuLog_log(LogType::Force, "D3D11 input layout creation failed (0x{:08X})", static_cast<uint32>(hr));
-			return;
+			m_inputLayoutKeyValid = false;
+			return false;
 		}
 	}
 	m_inputLayoutCache.emplace(key, m_inputLayout);
 	m_inputLayoutKey = key;
 	m_inputLayoutKeyValid = true;
 	m_context->IASetInputLayout(m_inputLayout.Get());
+	return true;
 }
 
 void D3D11Renderer::ApplyPipelineState()
@@ -5037,7 +5120,13 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 			LatteGPUState.activeShaderHasError = true;
 			return;
 		}
-		UpdateInputLayout();
+		if (!UpdateInputLayout())
+		{
+			// A later draw in the same GX2 sequence must retry the layout instead
+			// of continuing with the null layout installed by the failed attempt.
+			m_graphicsStateInvalid = true;
+			return;
+		}
 	}
 	if (LatteGPUState.activeShaderHasError || !HasRequiredShaders())
 		return;
@@ -5048,6 +5137,17 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	Renderer::IndexAllocation allocation{};
 	const void* indices = indexDataMPTR != MPTR_NULL ? memory_getPointerFromPhysicalOffset(indexDataMPTR) : nullptr;
 	LatteIndices_decode(indices, indexType, count, primitive, indexMax, hostIndexType, hostIndexCount, allocation);
+	if (indexMax > (std::numeric_limits<uint32>::max)() - baseVertex)
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 draw skipped: vertex range overflow (indexMax={} baseVertex={})",
+			indexMax, baseVertex);
+#if defined(CEMU_UWP)
+		LatteIndices_invalidateAll();
+#endif
+		LatteGPUState.drawCallCounter++;
+		return;
+	}
 	uint8 stageUniformModifiedMask{};
 	LatteBufferCache_Sync(indexMax + baseVertex, baseInstance, instanceCount,
 		drawcallContext.isFirst ? 0xFFFFFFFF : drawcallContext.vertexBufferDirtyMask,
@@ -5145,6 +5245,40 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		D3D11_DEBUG_CHECK("non-indexed GX2 draw");
 	}
 
+	const bool streamoutDrawIssued = drawIssued && m_streamoutActive;
+	if (!drawIssued && m_streamoutActive)
+		m_streamoutEnabled.fill(false);
+	// This also unbinds SO and restores the title/rectangle geometry shader.
+	// D3D stream-output shaders were deliberately created with
+	// D3D11_SO_NO_RASTERIZED_STREAM, so a GX2 operation that requests both
+	// transform feedback and rasterization needs a second, ordinary draw just as
+	// the OpenGL backend does.
+	LatteStreamout_FinishDrawcall(false);
+	bool rasterDrawIssued = drawIssued && !streamoutDrawIssued;
+	if (streamoutDrawIssued && !rasterizerKilled && !bothFacesCulled && !deferDriverPipeline)
+	{
+		if (hostIndexType != INDEX_TYPE::NONE)
+		{
+			auto* indexAllocation = static_cast<IndexBufferAllocation*>(allocation.rendererInternal);
+			ID3D11Buffer* buffer = indexAllocation ? indexAllocation->buffer.Get() : nullptr;
+			if (buffer)
+			{
+				m_context->IASetIndexBuffer(buffer,
+					hostIndexType == INDEX_TYPE::U16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT,
+					indexAllocation->offset);
+				m_context->DrawIndexedInstanced(hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
+				rasterDrawIssued = true;
+				D3D11_DEBUG_CHECK("indexed GX2 raster draw after stream output");
+			}
+		}
+		else
+		{
+			m_context->DrawInstanced(count, instanceCount, baseVertex, baseInstance);
+			rasterDrawIssued = true;
+			D3D11_DEBUG_CHECK("non-indexed GX2 raster draw after stream output");
+		}
+	}
+
 #if defined(CEMU_UWP)
 	if (drawIssued && newDriverPipeline)
 	{
@@ -5165,11 +5299,17 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	}
 	if (driverPipelineLock.owns_lock())
 		driverPipelineLock.unlock();
+	// The common index LRU was designed for allocations with independent immutable
+	// storage. This backend uses offsets into a transient DISCARD/NO_OVERWRITE
+	// ring, so retaining those offsets across draws can reuse data after the Xbox
+	// D3D11On12 driver has renamed the backing allocation. Decode again on the next
+	// indexed draw; the ring itself remains persistent and memory-stable.
+	if (hostIndexType != INDEX_TYPE::NONE)
+		LatteIndices_invalidateAll();
 #endif
 
-	if (drawIssued && LatteSHRC_GetActivePixelShader())
+	if (rasterDrawIssued && LatteSHRC_GetActivePixelShader())
 		LatteRenderTarget_trackUpdates();
-	LatteStreamout_FinishDrawcall(false);
 	LatteGPUState.drawCallCounter++;
 	LatteTextureReadback_Update();
 }
@@ -5252,9 +5392,20 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 
 	if (m_indexRingOffset > m_indexRingCapacity - alignedSize)
 	{
-		// All cached offsets refer to the storage that WRITE_DISCARD replaces.
+		// D3D11 permits DISCARD to rename the allocation, but the Xbox D3D11On12
+		// path can still have translated draws consuming the previous backing store.
+		// Retire that work before reusing offset zero; otherwise a quad can combine
+		// new and old indices and expand into the long triangles seen in gameplay.
 		m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
 		LatteIndices_invalidateAll();
+		if (!WaitForGpuIdle())
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 index upload skipped: GPU did not retire before ring wrap");
+			delete data;
+			allocation = {};
+			return;
+		}
 		m_indexRingOffset = 0;
 		++m_indexRingWrapCount;
 	}

@@ -96,7 +96,7 @@ private:
 	bool BindActiveShaders();
 	RendererShader* GetRectEmulationShader(class LatteDecompilerShader* vertexShader);
 	bool HasRequiredShaders() const;
-	void UpdateInputLayout();
+	bool UpdateInputLayout();
 	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance);
 	void UpdateSamplerSwizzleBuffer(class LatteDecompilerShader* shader);
 	bool UpdateDynamicConstantBuffer(Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
@@ -125,6 +125,7 @@ private:
 	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_backBuffer;
 	Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_backBufferView;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCache;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCopyScratch;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_indexRingBuffer;
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutBuffers{};
 	std::vector<uint8> m_bufferCacheShadow;
@@ -179,6 +180,7 @@ private:
 	uint64 m_indexRingWrapCount{};
 	UINT m_indexRingCapacity{};
 	UINT m_indexRingOffset{};
+	UINT m_bufferCopyScratchCapacity{};
 	uint32 m_memoryCheckFrame{};
 	std::atomic<uint32> m_compiledShaderCount{};
 	bool m_memoryPressureActive{};
