@@ -5,6 +5,7 @@
 #include <d3d11_3.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
+#include <atomic>
 #include <array>
 #include <memory>
 #include <unordered_map>
@@ -69,6 +70,7 @@ public:
 	void buffer_bindUniformBuffer(LatteConst::ShaderType, uint32, uint32, uint32) override;
 	RendererShader* shader_create(RendererShader::ShaderType, uint64, uint64,
 		const std::string&, bool, bool) override;
+	bool shader_creation_failed_temporary() const override;
 	void streamout_setupXfbBuffer(uint32, sint32, uint32, uint32) override;
 	void streamout_begin() override;
 	void streamout_rendererFinishDrawcall() override;
@@ -109,6 +111,10 @@ private:
 	void ResolveTextureFeedbackLoops(const std::array<ID3D11RenderTargetView*, 8>& targets,
 		ID3D11DepthStencilView* depth);
 	void RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache);
+	void CheckMemoryPressure();
+	bool WaitForGpuIdle();
+	uint64 QueryProcessCommitBytes() const;
+	uint64 BuildCurrentPipelineKey() const;
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
 	Microsoft::WRL::ComPtr<ID3D11Device1> m_device1;
@@ -119,6 +125,7 @@ private:
 	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_backBuffer;
 	Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_backBufferView;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCache;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_indexRingBuffer;
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutBuffers{};
 	std::vector<uint8> m_bufferCacheShadow;
 	std::vector<uint8> m_uploadBuffer;
@@ -154,6 +161,7 @@ private:
 	Microsoft::WRL::ComPtr<ID3D11BlendState> m_blendState;
 	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_depthStencilState;
 	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_surfaceCopyDepthState;
+	Microsoft::WRL::ComPtr<ID3D11Query> m_gpuIdleQuery;
 	Microsoft::WRL::ComPtr<ID3D11InputLayout> m_inputLayout;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11InputLayout>> m_inputLayoutCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11SamplerState>> m_samplerCache;
@@ -161,10 +169,20 @@ private:
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11BlendState>> m_blendCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> m_depthStencilCache;
 	std::unordered_map<uint64, std::unique_ptr<RendererShader>> m_rectShaderCache;
+	std::unordered_set<uint64> m_warmedPipelineKeys;
+	std::unordered_set<uint64> m_deferredPipelineKeys;
 	std::unordered_set<uint32> m_reportedDebugWarnings;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> m_feedbackResources;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> m_feedbackViews;
 	uint64 m_inputLayoutKey{};
+	uint64 m_indexUploadCount{};
+	uint64 m_indexRingWrapCount{};
+	UINT m_indexRingCapacity{};
+	UINT m_indexRingOffset{};
+	uint32 m_memoryCheckFrame{};
+	std::atomic<uint32> m_compiledShaderCount{};
+	bool m_memoryPressureActive{};
+	std::atomic_bool m_shaderCompilationBlocked{};
 	bool m_inputLayoutKeyValid{};
 	bool m_imguiInitialized{};
 	bool m_graphicsStateInvalid{};

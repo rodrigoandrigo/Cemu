@@ -861,7 +861,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 	g_renderer->indexData_uploadIndexMemory(indexAllocation);
 	if (!indexAllocation.rendererInternal)
 	{
-		// Upload failure is recoverable (notably DXGI_ERROR_OUT_OF_MEMORY on
+		// Upload failure is recoverable (notably E_OUTOFMEMORY on
 		// memory-constrained UWP consoles). Do not insert a failed allocation in
 		// the LRU, otherwise every cache hit would permanently skip this draw.
 		outputCount = 0;

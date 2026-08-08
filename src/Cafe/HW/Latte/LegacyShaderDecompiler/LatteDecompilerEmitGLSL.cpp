@@ -3942,7 +3942,14 @@ void LatteDecompiler_emitAttributeImport(LatteDecompilerShaderContext* shaderCon
 
 void LatteDecompiler_emitGLSLShader(LatteDecompilerShaderContext* shaderContext, LatteDecompilerShader* shader)
 {
-	StringBuf* src = new StringBuf(1024*1024*12); // reserve 12MB for generated source (we resize-to-fit at the end)
+#if defined(CEMU_UWP)
+	// Most Wii U shaders are far below 1 MiB. StringBuf grows dynamically, so the
+	// Xbox profile avoids committing the desktop 12 MiB worst-case reservation
+	// for every shader while retaining support for unusually large programs.
+	StringBuf* src = new StringBuf(1024 * 1024);
+#else
+	StringBuf* src = new StringBuf(1024 * 1024 * 12);
+#endif
 	shaderContext->shaderSource = src;
 	// GLSL shader header
 	src->add("#version 430" _CRLF); // 430 is required for shader storage (Vulkan alternative TF path)

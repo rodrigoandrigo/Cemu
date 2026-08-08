@@ -337,6 +337,11 @@ float* LatteTexture_getEffectiveTextureScale(LatteConst::ShaderType shaderType, 
 LatteTextureView* LatteTexture_CreateTexture(Latte::E_DIM dim, MPTR physAddress, MPTR physMipAddress, Latte::E_GX2SURFFMT format, uint32 width, uint32 height, uint32 depth, uint32 pitch, uint32 mipLevels, uint32 swizzle, Latte::E_HWTILEMODE tileMode, bool isDepth);
 void LatteTexture_Delete(LatteTexture* texture);
 
+// Releases textures that can be reconstructed from emulated memory and have
+// not been used recently. This is allocation-free so it remains usable when a
+// memory-constrained renderer is already close to the process limit.
+size_t LatteTC_TrimUnusedTextures(uint32 minUnusedFrames, size_t maxDelete);
+
 void LatteTextureLoader_writeReadbackTextureToMemory(LatteTextureDefinition* textureData, uint32 sliceIndex, uint32 mipIndex, uint8* linearPixelData);
 
 sint32 LatteTexture_getEffectiveWidth(LatteTexture* texture);

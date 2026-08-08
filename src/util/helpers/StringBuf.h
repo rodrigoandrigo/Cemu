@@ -20,26 +20,23 @@ public:
 	template<typename TFmt, typename ... TArgs>
 	void addFmt(const TFmt& format, TArgs&&... args)
 	{
-		auto r = fmt::vformat_to_n((char*)(this->str + this->length), (size_t)(this->limit - this->length), fmt::detail::to_string_view(format), fmt::make_format_args(args...));
-		this->length += (uint32)r.size;
+		const auto formatView = fmt::detail::to_string_view(format);
+		auto r = fmt::vformat_to_n((char*)(this->str + this->length),
+			(size_t)(this->limit - this->length), formatView, fmt::make_format_args(args...));
+		if (r.size + this->length + 1 >= this->limit)
+		{
+			_reserve(std::max<uint32>(this->length + static_cast<uint32>(r.size) + 64,
+				this->limit + this->limit / 2));
+			r = fmt::vformat_to_n((char*)(this->str + this->length),
+				(size_t)(this->limit - this->length), formatView, fmt::make_format_args(args...));
+		}
+		this->length += static_cast<uint32>(r.size);
+		this->str[this->length] = '\0';
 	}
 
 	void add(const char* appendedStr)
 	{
-		const char* outputStart = (char*)(this->str + this->length);
-		char* output = (char*)outputStart;
-		const char* outputEnd = (char*)(this->str + this->limit - 1);
-		while (output < outputEnd)
-		{
-			char c = *appendedStr;
-			if (c == '\0')
-				break;
-			*output = c;
-			appendedStr++;
-			output++;
-		}
-		this->length += (uint32)(output - outputStart);
-		*output = '\0';
+		add(std::string_view(appendedStr));
 	}
 
 	void add(std::string_view appendedStr)

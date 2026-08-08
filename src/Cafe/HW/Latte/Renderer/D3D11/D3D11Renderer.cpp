@@ -16,6 +16,7 @@
 #include <backends/imgui_impl_dx11.h>
 #include <d3dcompiler.h>
 #include <d3d11_4.h>
+#include <Psapi.h>
 #include <glslang/Public/ResourceLimits.h>
 #include <glslang/Public/ShaderLang.h>
 #include <glslang/SPIRV/GlslangToSpv.h>
@@ -47,6 +48,14 @@ void LatteDraw_handleSpecialState8_clearAsDepth();
 
 namespace
 {
+thread_local bool s_d3d11ShaderCreationFailureTemporary{};
+
+#if defined(CEMU_UWP)
+// Serialize Cemu shader translation with the first draw that makes D3D11On12
+// compile a native Xbox pipeline. Both paths have large transient footprints.
+std::mutex s_xboxShaderPipelineMutex;
+#endif
+
 #if defined(CEMU_D3D11_DRIVER_TRACE)
 std::atomic_uint64_t s_driverCallSequence{};
 
@@ -110,6 +119,34 @@ uint32 Align16(uint32 value)
 	return (value + 15u) & ~15u;
 }
 
+bool IsMemoryPressureResult(HRESULT result)
+{
+	return result == E_OUTOFMEMORY;
+}
+
+uint64 QueryProcessPrivateCommitBytes()
+{
+	PROCESS_MEMORY_COUNTERS_EX counters{};
+	counters.cb = sizeof(counters);
+	if (!GetProcessMemoryInfo(GetCurrentProcess(),
+		reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters)))
+		return 0;
+	return static_cast<uint64>(counters.PrivateUsage);
+}
+
+UINT RuntimeShaderCompileFlags()
+{
+	// Xbox's optimization pass causes very large transient allocations inside
+	// xbsc_xs.dll. Skip that pass entirely on UWP; SPIR-V is size-optimized before
+	// HLSL generation below, and the resulting DXBC remains cached on disk. The
+	// flags are part of the cache key.
+#if defined(CEMU_UWP)
+	return D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_SKIP_OPTIMIZATION;
+#else
+	return D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
+#endif
+}
+
 uint64 HashBytes(const void* data, size_t size, uint64 hash = 1469598103934665603ull)
 {
 	const auto* bytes = static_cast<const uint8*>(data);
@@ -117,6 +154,70 @@ uint64 HashBytes(const void* data, size_t size, uint64 hash = 146959810393466560
 		hash = (hash ^ bytes[i]) * 1099511628211ull;
 	return hash;
 }
+
+#if defined(CEMU_UWP)
+fs::path GetD3D11SpirvCachePath(const std::string& source, uint32 shaderType)
+{
+	uint64 hash = HashBytes(source.data(), source.size());
+	hash = HashBytes(&shaderType, sizeof(shaderType), hash);
+	// Bump when the glslang environment or SPIR-V optimization policy changes.
+	constexpr uint32 spirvCacheVersion = 1;
+	hash = HashBytes(&spirvCacheVersion, sizeof(spirvCacheVersion), hash);
+	return ActiveSettings::GetUserDataPath(
+		fmt::format("shaderCache/driver/d3d11/spirv/{:016x}.spv", hash));
+}
+
+bool LoadD3D11SpirvCache(const fs::path& path, std::vector<uint32>& spirv)
+{
+	std::ifstream input(path, std::ios::binary | std::ios::ate);
+	if (!input)
+		return false;
+	const std::streamoff length = static_cast<std::streamoff>(input.tellg());
+	if (length < 5 * static_cast<std::streamoff>(sizeof(uint32)) ||
+		length > 64 * 1024 * 1024 || (length % sizeof(uint32)) != 0)
+		return false;
+	spirv.resize(static_cast<size_t>(length) / sizeof(uint32));
+	input.seekg(0);
+	input.read(reinterpret_cast<char*>(spirv.data()), static_cast<std::streamsize>(length));
+	bool valid = input && spirv.size() > 5 && spirv[0] == 0x07230203u &&
+		spirv[3] != 0 && spirv[4] == 0;
+	// A truncated SPIR-V file often retains a valid header. Walk every
+	// instruction so SPIRV-Cross never receives a partial cached module and turns
+	// a recoverable cache-write interruption into a permanent missing shader.
+	for (size_t word = 5; valid && word < spirv.size();)
+	{
+		const uint32 instructionWords = spirv[word] >> 16;
+		if (instructionWords == 0 || instructionWords > spirv.size() - word)
+		{
+			valid = false;
+			break;
+		}
+		word += instructionWords;
+		if (word == spirv.size())
+			break;
+	}
+	if (!valid)
+	{
+		std::vector<uint32>().swap(spirv);
+		return false;
+	}
+	return true;
+}
+
+void StoreD3D11SpirvCache(const fs::path& path, const std::vector<uint32>& spirv)
+{
+	if (spirv.empty())
+		return;
+	std::error_code error;
+	fs::create_directories(path.parent_path(), error);
+	if (error)
+		return;
+	std::ofstream output(path, std::ios::binary | std::ios::trunc);
+	if (output)
+		output.write(reinterpret_cast<const char*>(spirv.data()),
+			static_cast<std::streamsize>(spirv.size() * sizeof(uint32)));
+}
+#endif
 
 HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* profile,
 	UINT flags, ID3DBlob** bytecode, ID3DBlob** errors)
@@ -152,7 +253,12 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 					input.seekg(0);
 					input.read(static_cast<char*>(cached->GetBufferPointer()),
 						static_cast<std::streamsize>(length));
-					if (input && std::memcmp(cached->GetBufferPointer(), "DXBC", 4) == 0)
+					ComPtr<ID3D11ShaderReflection> reflection;
+					const bool validDxbc = input &&
+						std::memcmp(cached->GetBufferPointer(), "DXBC", 4) == 0 &&
+						SUCCEEDED(D3DReflect(cached->GetBufferPointer(), cached->GetBufferSize(),
+							IID_PPV_ARGS(&reflection)));
+					if (validDxbc)
 					{
 						*bytecode = cached.Detach();
 						return S_OK;
@@ -162,14 +268,48 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 		}
 	}
 
+#if defined(CEMU_UWP)
+	// Shader-cache workers can reach this function concurrently. xbsc_xs.dll has
+	// a very large transient footprint, so overlapping cache misses can cross the
+	// 5 GiB title cap even when every worker passed its initial memory check. Keep
+	// cache hits parallel above, but serialize actual Xbox compilation and recheck
+	// memory only after acquiring ownership.
+	static std::mutex xboxCompilerMutex;
+	std::lock_guard compilerLock(xboxCompilerMutex);
+	HeapCompact(GetProcessHeap(), 0);
+	// A cache hit above remains safe and avoids invoking the Xbox compiler. For
+	// a cache miss, reserve ample space below the title cap for xbsc_xs.dll's
+	// transient working set. Series S traces showed one compilation interval grow
+	// PrivateUsage by well over 1 GiB before the compiler faulted.
+	constexpr uint64 shaderCompilerStopBytes = 4096ull * 1024 * 1024;
+	if (QueryProcessPrivateCommitBytes() >= shaderCompilerStopBytes)
+	{
+		OutputDebugStringA(
+			"[Cemu/D3D11] HLSL compilation skipped to preserve Series S memory headroom\n");
+		return E_OUTOFMEMORY;
+	}
+#endif
+
 	ComPtr<ID3DBlob> compiled;
 	ComPtr<ID3DBlob> compileErrors;
+#if defined(CEMU_UWP)
+	const uint64 compileStartCommitMB = QueryProcessPrivateCommitBytes() / (1024 * 1024);
+	cemuLog_log(LogType::Force,
+		"D3D11 Series S shader compiler start: profile {}, HLSL {} KB, process commit {} MB",
+		profile, (sourceSize + 1023) / 1024, compileStartCommitMB);
+#endif
 	const HRESULT result = D3DCompile(source, sourceSize, nullptr, nullptr, nullptr,
 		"main", profile, flags, 0, &compiled, &compileErrors);
 	if (errors && compileErrors)
 		*errors = compileErrors.Detach();
 	if (FAILED(result))
 		return result;
+#if defined(CEMU_UWP)
+	cemuLog_log(LogType::Force,
+		"D3D11 Series S shader compiler complete: profile {}, DXBC {} KB, process commit {} MB",
+		profile, (compiled->GetBufferSize() + 1023) / 1024,
+		QueryProcessPrivateCommitBytes() / (1024 * 1024));
+#endif
 
 	{
 		std::lock_guard lock(cacheMutex);
@@ -514,6 +654,7 @@ public:
 		: RendererShader(type, baseHash, auxHash, true, isGfxPack)
 	{
 		Compile(device, source);
+		ReleaseTransientBytecode();
 	}
 	D3D11Shader(ID3D11Device* device, ShaderType type, uint64 baseHash, uint64 auxHash,
 		bool isGfxPack, const std::string& source, bool sourceIsHlsl)
@@ -523,11 +664,13 @@ public:
 			CompileHLSL(device, source);
 		else
 			Compile(device, source);
+		ReleaseTransientBytecode();
 	}
 
 	void PreponeCompilation(bool) override {}
 	bool IsCompiled() override { return m_compiled; }
 	bool WaitForCompiled() override { return m_compiled; }
+	bool RetryableFailure() const { return m_retryableFailure; }
 	ID3D11VertexShader* Vertex() const { return m_vs.Get(); }
 	ID3D11PixelShader* Pixel() const { return m_ps.Get(); }
 	ID3D11GeometryShader* Geometry() const { return m_gs.Get(); }
@@ -545,6 +688,14 @@ public:
 	static constexpr UINT InvalidSlot = UINT_MAX;
 
 private:
+	void ReleaseTransientBytecode()
+	{
+		// Only vertex bytecode is needed later by CreateInputLayout. Pixel and
+		// geometry shaders already own their native code after creation.
+		if (GetType() != ShaderType::kVertex)
+			m_bytecode.Reset();
+	}
+
 	struct HlslTextureResource
 	{
 		std::string name;
@@ -1399,19 +1550,30 @@ void main(point GeometryInput inputVertices[1],
 				throw std::runtime_error("direct HLSL compilation is only used for D3D11 geometry helpers");
 			ComPtr<ID3DBlob> errors;
 			const HRESULT compileResult = CompileHLSLCached(source.data(), source.size(), "gs_5_0",
-				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+				RuntimeShaderCompileFlags(),
 				&m_bytecode, &errors);
 			if (FAILED(compileResult))
 			{
+				if (IsMemoryPressureResult(compileResult))
+					m_retryableFailure = true;
 				const char* message = errors ?
 					static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
 				throw std::runtime_error(message);
 			}
 			D3D11_DRIVER_TRACE(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
 				m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
-			ThrowIfFailed(device->CreateGeometryShader(m_bytecode->GetBufferPointer(),
-				m_bytecode->GetBufferSize(), nullptr, &m_gs), "CreateGeometryShader");
+			const HRESULT createResult = device->CreateGeometryShader(m_bytecode->GetBufferPointer(),
+				m_bytecode->GetBufferSize(), nullptr, &m_gs);
+			if (IsMemoryPressureResult(createResult))
+				m_retryableFailure = true;
+			ThrowIfFailed(createResult, "CreateGeometryShader");
 			m_compiled = true;
+		}
+		catch (const std::bad_alloc&)
+		{
+			m_retryableFailure = true;
+			m_compiled = false;
+			OutputDebugStringA("[Cemu/D3D11] HLSL shader creation deferred: out of memory\n");
 		}
 		catch (const std::exception& ex)
 		{
@@ -1430,34 +1592,50 @@ void main(point GeometryInput inputVertices[1],
 			UINT uniformSlot{};
 			const char* profile = GetType() == ShaderType::kVertex ? "vs_5_0" :
 				GetType() == ShaderType::kFragment ? "ps_5_0" : "gs_5_0";
-			// Keep the GLSL/SPIR-V translation in a shorter lifetime scope. On Xbox
-			// the D3D11On12 compiler shares the 5 GB title budget; retaining glslang,
-			// SPIRV-Cross and their IR while D3DCompile loads dxilconv creates a large
-			// avoidable peak and was producing std::bad_alloc.
-			{
-			EShLanguage stage = GetType() == ShaderType::kVertex ? EShLangVertex :
-				GetType() == ShaderType::kFragment ? EShLangFragment : EShLangGeometry;
-			glslang::TShader shader(stage);
-			const char* text = source.c_str();
-			shader.setStrings(&text, 1);
-			// EShClientVulkan already provides the VULKAN macro. Defining it in
-			// the preamble as well makes recent glslang versions reject every
-			// shader because the built-in macro uses a different substitution.
-			shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
-			shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
-			shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
-			const EShMessages messages = static_cast<EShMessages>(EShMsgSpvRules | EShMsgVulkanRules);
-			if (!shader.parse(GetDefaultResources(), 450, false, messages))
-				throw std::runtime_error(shader.getInfoLog());
-			glslang::TProgram program;
-			program.addShader(&shader);
-			if (!program.link(messages) || !program.mapIO())
-				throw std::runtime_error(program.getInfoLog());
 			std::vector<uint32> spirv;
-			glslang::SpvOptions spvOptions;
-			spvOptions.optimizeSize = true;
-			glslang::GlslangToSpv(*program.getIntermediate(stage), spirv, &spvOptions);
+#if defined(CEMU_UWP)
+			const fs::path spirvCachePath = GetD3D11SpirvCachePath(
+				source, static_cast<uint32>(GetType()));
+			const bool loadedCachedSpirv = LoadD3D11SpirvCache(spirvCachePath, spirv);
+#else
+			constexpr bool loadedCachedSpirv = false;
+#endif
+			// Match Vulkan's intermediate cache and keep glslang in its own lifetime
+			// scope. A cached module skips this allocation-heavy stage entirely.
+			if (!loadedCachedSpirv)
+			{
+				EShLanguage stage = GetType() == ShaderType::kVertex ? EShLangVertex :
+					GetType() == ShaderType::kFragment ? EShLangFragment : EShLangGeometry;
+				glslang::TShader shader(stage);
+				const char* text = source.c_str();
+				shader.setStrings(&text, 1);
+				// EShClientVulkan already provides the VULKAN macro. Defining it in
+				// the preamble as well makes recent glslang versions reject every
+				// shader because the built-in macro uses a different substitution.
+				shader.setEnvInput(glslang::EShSourceGlsl, stage, glslang::EShClientVulkan, 100);
+				shader.setEnvClient(glslang::EShClientVulkan, glslang::EShTargetVulkan_1_1);
+				shader.setEnvTarget(glslang::EShTargetSpv, glslang::EShTargetSpv_1_3);
+				const EShMessages messages = static_cast<EShMessages>(EShMsgSpvRules | EShMsgVulkanRules);
+				if (!shader.parse(GetDefaultResources(), 450, false, messages))
+					throw std::runtime_error(shader.getInfoLog());
+				glslang::TProgram program;
+				program.addShader(&shader);
+				if (!program.link(messages) || !program.mapIO())
+					throw std::runtime_error(program.getInfoLog());
+				glslang::SpvOptions spvOptions;
+				// Match the proven Vulkan path: reduce the IR before SPIRV-Cross emits
+				// HLSL, lowering the amount of code handed to the Xbox compiler.
+				spvOptions.disableOptimizer = false;
+				spvOptions.validate = false;
+				spvOptions.optimizeSize = true;
+				glslang::GlslangToSpv(*program.getIntermediate(stage), spirv, &spvOptions);
+#if defined(CEMU_UWP)
+				StoreD3D11SpirvCache(spirvCachePath, spirv);
+#endif
+			}
 
+			// Release glslang before SPIRV-Cross builds its separate IR graph.
+			{
 			spirv_cross::CompilerHLSL compiler(spirv);
 			const auto resources = compiler.get_shader_resources();
 			const auto executionModel = compiler.get_execution_model();
@@ -1544,13 +1722,22 @@ void main(point GeometryInput inputVertices[1],
 			if (m_usesRuntimeSwizzle)
 				m_samplerSwizzleSlot = uniformSlot;
 			}
+			std::vector<uint32>().swap(spirv);
 
+#if defined(CEMU_UWP)
+			// The translation scope above has released glslang/SPIRV-Cross. Give the
+			// allocator a chance to return their transient regions before xbsc_xs.dll
+			// begins its own large allocation phase.
+			HeapCompact(GetProcessHeap(), 0);
+#endif
 			ComPtr<ID3DBlob> errors;
 			HRESULT hr = CompileHLSLCached(hlsl.data(), hlsl.size(), profile,
-				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+				RuntimeShaderCompileFlags(),
 				&m_bytecode, &errors);
 			if (FAILED(hr))
 			{
+				if (IsMemoryPressureResult(hr))
+					m_retryableFailure = true;
 				const char* message = errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
 				throw std::runtime_error(message);
 			}
@@ -1558,19 +1745,31 @@ void main(point GeometryInput inputVertices[1],
 			{
 				D3D11_DRIVER_TRACE(fmt::format("CreateVertexShader {:016x}_{:016x} bytecode={}",
 					m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
-				ThrowIfFailed(device->CreateVertexShader(m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(), nullptr, &m_vs), "CreateVertexShader");
+				const HRESULT createResult = device->CreateVertexShader(m_bytecode->GetBufferPointer(),
+					m_bytecode->GetBufferSize(), nullptr, &m_vs);
+				if (IsMemoryPressureResult(createResult))
+					m_retryableFailure = true;
+				ThrowIfFailed(createResult, "CreateVertexShader");
 			}
 			else if (GetType() == ShaderType::kFragment)
 			{
 				D3D11_DRIVER_TRACE(fmt::format("CreatePixelShader {:016x}_{:016x} bytecode={}",
 					m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
-				ThrowIfFailed(device->CreatePixelShader(m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(), nullptr, &m_ps), "CreatePixelShader");
+				const HRESULT createResult = device->CreatePixelShader(m_bytecode->GetBufferPointer(),
+					m_bytecode->GetBufferSize(), nullptr, &m_ps);
+				if (IsMemoryPressureResult(createResult))
+					m_retryableFailure = true;
+				ThrowIfFailed(createResult, "CreatePixelShader");
 			}
 			else
 			{
 				D3D11_DRIVER_TRACE(fmt::format("CreateGeometryShader {:016x}_{:016x} bytecode={}",
 					m_baseHash, m_auxHash, m_bytecode->GetBufferSize()));
-				ThrowIfFailed(device->CreateGeometryShader(m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(), nullptr, &m_gs), "CreateGeometryShader");
+				const HRESULT createResult = device->CreateGeometryShader(m_bytecode->GetBufferPointer(),
+					m_bytecode->GetBufferSize(), nullptr, &m_gs);
+				if (IsMemoryPressureResult(createResult))
+					m_retryableFailure = true;
+				ThrowIfFailed(createResult, "CreateGeometryShader");
 			}
 			CreateStreamoutShader(device, source);
 			m_compiled = true;
@@ -1581,6 +1780,7 @@ void main(point GeometryInput inputVertices[1],
 			// constrained memory budget. Do not invoke the allocating logger here.
 			// The common cache will reject this uncompiled shader safely.
 			OutputDebugStringA("[Cemu/D3D11] Shader compilation skipped: out of memory\n");
+			m_retryableFailure = true;
 			m_compiled = false;
 		}
 		catch (const std::exception& ex)
@@ -1659,6 +1859,7 @@ void main(point GeometryInput inputVertices[1],
 	}
 
 	bool m_compiled{};
+	bool m_retryableFailure{};
 	ComPtr<ID3DBlob> m_bytecode;
 	ComPtr<ID3D11VertexShader> m_vs;
 	ComPtr<ID3D11PixelShader> m_ps;
@@ -2296,7 +2497,8 @@ public:
 		source.MiscFlags = 0;
 		source.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 		ThrowIfFailed(m_renderer->GetDevice()->CreateTexture2D(&source, nullptr, &m_staging), "Create readback texture");
-		const UINT subresource = D3D11CalcSubresource(m_view->firstMip, m_view->firstSlice, texture->mipLevels);
+		const UINT subresource = D3D11CalcSubresource(m_view->firstMip, m_view->firstSlice,
+			texture->EffectiveMipLevels());
 		m_renderer->GetContext()->CopySubresourceRegion(m_staging.Get(), 0, 0, 0, 0, texture->Resource(), subresource, nullptr);
 		D3D11_QUERY_DESC queryDesc{ D3D11_QUERY_EVENT, 0 };
 		ThrowIfFailed(m_renderer->GetDevice()->CreateQuery(&queryDesc, &m_event), "Create readback event");
@@ -2344,6 +2546,7 @@ struct IndexBufferAllocation
 {
 	std::vector<uint8> data;
 	ComPtr<ID3D11Buffer> buffer;
+	UINT offset{};
 };
 
 DXGI_FORMAT VertexFormat(uint8 format)
@@ -2395,7 +2598,7 @@ ComPtr<ID3DBlob> CompileInternalShader(const char* source, const char* profile)
 	ComPtr<ID3DBlob> blob;
 	ComPtr<ID3DBlob> errors;
 	HRESULT hr = CompileHLSLCached(source, std::strlen(source), profile,
-		D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3, &blob, &errors);
+		RuntimeShaderCompileFlags(), &blob, &errors);
 	if (FAILED(hr))
 		throw std::runtime_error(errors ? static_cast<const char*>(errors->GetBufferPointer()) : "D3DCompile failed");
 	return blob;
@@ -2412,6 +2615,8 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 	m_blendCache.reserve(256);
 	m_depthStencilCache.reserve(128);
 	m_rectShaderCache.reserve(128);
+	m_warmedPipelineKeys.reserve(512);
+	m_deferredPipelineKeys.reserve(64);
 	m_reportedDebugWarnings.reserve(128);
 	for (auto& stage : m_samplerSwizzles)
 		for (auto& selectors : stage)
@@ -2425,6 +2630,15 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 	m_device.As(&m_device1);
 	m_context = static_cast<ID3D11DeviceContext*>(surface->immediate_context);
 	m_context.As(&m_context1);
+	// Allocate this while pressure is low. Creating a query after the first draw
+	// is too late because that draw can already have started xbsc_xs.dll on a
+	// driver worker and consumed the remaining title budget.
+	D3D11_QUERY_DESC idleQueryDesc{ D3D11_QUERY_EVENT, 0 };
+	const HRESULT idleQueryResult = m_device->CreateQuery(&idleQueryDesc, &m_gpuIdleQuery);
+	if (FAILED(idleQueryResult))
+		cemuLog_log(LogType::Force,
+			"D3D11: unable to create the reusable GPU-idle query (HRESULT 0x{:08X})",
+			static_cast<uint32>(idleQueryResult));
 	// The immediate context is exclusively owned by LatteThread after the host
 	// hands the surface to Cemu. Enabling ID3D11Multithread here adds a lock to
 	// every D3D call and is especially expensive for draw-heavy Wii U titles.
@@ -2667,6 +2881,7 @@ void D3D11Renderer::SwapBuffers(bool swapTV, bool)
 	m_context->OMSetRenderTargets(0, nullptr, nullptr);
 	m_backBufferView.Reset();
 	m_backBuffer.Reset();
+	CheckMemoryPressure();
 }
 
 void D3D11Renderer::HandleScreenshotRequest(LatteTextureView* textureView, bool padView)
@@ -2764,21 +2979,45 @@ void D3D11Renderer::Flush(bool waitIdle)
 {
 	m_context->Flush();
 	if (waitIdle)
+		WaitForGpuIdle();
+}
+
+bool D3D11Renderer::WaitForGpuIdle()
+{
+	if (!m_gpuIdleQuery)
 	{
 		D3D11_QUERY_DESC desc{ D3D11_QUERY_EVENT, 0 };
-		ComPtr<ID3D11Query> event;
-		if (SUCCEEDED(m_device->CreateQuery(&desc, &event)))
+		const HRESULT createResult = m_device->CreateQuery(&desc, &m_gpuIdleQuery);
+		if (FAILED(createResult))
 		{
-			m_context->End(event.Get());
-			uint32 spinCount = 0;
-			while (m_context->GetData(event.Get(), nullptr, 0,
-				D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_FALSE)
-			{
-				_mm_pause();
-				if ((++spinCount & 0x3FF) == 0)
-					std::this_thread::yield();
-			}
+			cemuLog_log(LogType::Force,
+				"D3D11: GPU-idle wait unavailable (CreateQuery HRESULT 0x{:08X})",
+				static_cast<uint32>(createResult));
+			return false;
 		}
+	}
+
+	// End is ordered after earlier draws. Flush must follow End because GetData
+	// deliberately uses DONOTFLUSH and therefore cannot submit the query itself.
+	m_context->End(m_gpuIdleQuery.Get());
+	m_context->Flush();
+	uint32 spinCount = 0;
+	for (;;)
+	{
+		const HRESULT status = m_context->GetData(m_gpuIdleQuery.Get(), nullptr, 0,
+			D3D11_ASYNC_GETDATA_DONOTFLUSH);
+		if (status == S_OK)
+			return true;
+		if (status != S_FALSE)
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11: GPU-idle wait failed with HRESULT 0x{:08X}",
+				static_cast<uint32>(status));
+			return false;
+		}
+		_mm_pause();
+		if ((++spinCount & 0x3FF) == 0)
+			std::this_thread::yield();
 	}
 }
 
@@ -2787,19 +3026,32 @@ void D3D11Renderer::RecoverFromMemoryPressure(const char* resourceName, bool evi
 	int usageInMB = -1;
 	int budgetInMB = -1;
 	GetVRAMInfo(usageInMB, budgetInMB);
+	const uint64 processCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+
+	// Resource-creation retries occur inside an active draw. Clearing SRVs/RTVs or
+	// evicting textures here leaves that draw with null bindings and produces
+	// missing geometry/textures. Full texture eviction is performed by
+	// CheckMemoryPressure() from the presentation path; here only retire work and
+	// release explicitly requested transient index entries.
 	cemuLog_log(LogType::Force,
-		"D3D11 memory pressure while creating {} (usage {} MB, budget {} MB); requesting driver trim{}",
-		resourceName ? resourceName : "resource", usageInMB, budgetInMB,
+		"D3D11 memory pressure while creating {} (process commit {} MB, video usage {} MB, "
+		"video budget {} MB); requesting driver trim{}",
+		resourceName ? resourceName : "resource", processCommitMB, usageInMB, budgetInMB,
 		evictIndexCache ? " after evicting transient index data" : "");
 
-	// The decoded-index LRU owns independent immutable buffers. They can be
-	// recreated from emulated memory, making them the safest resources to evict.
+	// Cached decoded-index offsets can be recreated from emulated memory. Drop
+	// them before a ring retry so no cache entry can refer to discarded storage.
 	if (evictIndexCache)
 	{
 		m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
 		LatteIndices_invalidateAll();
 	}
+	// D3D11On12 retains the native allocations referenced by submitted command
+	// lists even after every Cemu-side ComPtr is released. A plain Flush only
+	// submits those lists; it does not retire them, so Trim has nothing it can
+	// reclaim while the process continues racing toward the title cap.
 	m_context->Flush();
+	WaitForGpuIdle();
 
 	// On UWP (and D3D11On12 on Xbox) Trim asks DXGI to release allocations that
 	// became unreferenced above before the retry. Desktop drivers may not expose
@@ -2807,6 +3059,147 @@ void D3D11Renderer::RecoverFromMemoryPressure(const char* resourceName, bool evi
 	ComPtr<IDXGIDevice3> dxgiDevice3;
 	if (SUCCEEDED(m_device.As(&dxgiDevice3)))
 		dxgiDevice3->Trim();
+#if defined(CEMU_UWP)
+	HeapCompact(GetProcessHeap(), 0);
+#endif
+}
+
+uint64 D3D11Renderer::QueryProcessCommitBytes() const
+{
+	return QueryProcessPrivateCommitBytes();
+}
+
+uint64 D3D11Renderer::BuildCurrentPipelineKey() const
+{
+	uint64 hash = 1469598103934665603ull;
+	auto addPointer = [&](const void* value)
+	{
+		const uintptr_t pointer = reinterpret_cast<uintptr_t>(value);
+		hash = HashBytes(&pointer, sizeof(pointer), hash);
+	};
+
+	ComPtr<ID3D11VertexShader> vertexShader;
+	ComPtr<ID3D11PixelShader> pixelShader;
+	ComPtr<ID3D11GeometryShader> geometryShader;
+	ComPtr<ID3D11InputLayout> inputLayout;
+	ComPtr<ID3D11RasterizerState> rasterizerState;
+	ComPtr<ID3D11BlendState> blendState;
+	ComPtr<ID3D11DepthStencilState> depthStencilState;
+	m_context->VSGetShader(&vertexShader, nullptr, nullptr);
+	m_context->PSGetShader(&pixelShader, nullptr, nullptr);
+	m_context->GSGetShader(&geometryShader, nullptr, nullptr);
+	m_context->IAGetInputLayout(&inputLayout);
+	m_context->RSGetState(&rasterizerState);
+	FLOAT blendFactor[4]{};
+	UINT sampleMask{};
+	m_context->OMGetBlendState(&blendState, blendFactor, &sampleMask);
+	UINT stencilReference{};
+	m_context->OMGetDepthStencilState(&depthStencilState, &stencilReference);
+	addPointer(vertexShader.Get());
+	addPointer(pixelShader.Get());
+	addPointer(geometryShader.Get());
+	addPointer(inputLayout.Get());
+	addPointer(rasterizerState.Get());
+	addPointer(blendState.Get());
+	addPointer(depthStencilState.Get());
+	hash = HashBytes(&sampleMask, sizeof(sampleMask), hash);
+
+	D3D11_PRIMITIVE_TOPOLOGY topology{};
+	m_context->IAGetPrimitiveTopology(&topology);
+	hash = HashBytes(&topology, sizeof(topology), hash);
+
+	std::array<ID3D11RenderTargetView*, 8> rawTargets{};
+	ID3D11DepthStencilView* rawDepth{};
+	m_context->OMGetRenderTargets(static_cast<UINT>(rawTargets.size()), rawTargets.data(), &rawDepth);
+	for (auto* rawTarget : rawTargets)
+	{
+		ComPtr<ID3D11RenderTargetView> target;
+		target.Attach(rawTarget);
+		DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+		D3D11_RTV_DIMENSION dimension = D3D11_RTV_DIMENSION_UNKNOWN;
+		if (target)
+		{
+			D3D11_RENDER_TARGET_VIEW_DESC desc{};
+			target->GetDesc(&desc);
+			format = desc.Format;
+			dimension = desc.ViewDimension;
+		}
+		hash = HashBytes(&format, sizeof(format), hash);
+		hash = HashBytes(&dimension, sizeof(dimension), hash);
+	}
+	ComPtr<ID3D11DepthStencilView> depth;
+	depth.Attach(rawDepth);
+	DXGI_FORMAT depthFormat = DXGI_FORMAT_UNKNOWN;
+	D3D11_DSV_DIMENSION depthDimension = D3D11_DSV_DIMENSION_UNKNOWN;
+	if (depth)
+	{
+		D3D11_DEPTH_STENCIL_VIEW_DESC desc{};
+		depth->GetDesc(&desc);
+		depthFormat = desc.Format;
+		depthDimension = desc.ViewDimension;
+	}
+	hash = HashBytes(&depthFormat, sizeof(depthFormat), hash);
+	hash = HashBytes(&depthDimension, sizeof(depthDimension), hash);
+	return hash;
+}
+
+void D3D11Renderer::CheckMemoryPressure()
+{
+#if defined(CEMU_UWP)
+	// Sampling every 10 presents catches rapidly growing title workloads while
+	// keeping the accounting overhead negligible. On
+	// Xbox, PrivateUsage already reaches the 5120 MiB title cap and includes the
+	// driver-backed commitment. Adding DXGI CurrentUsage double-counts a large
+	// portion of graphics memory, so use it only as diagnostic information.
+	// Ten-frame sampling is sufficient in the normal state. Once the soft limit
+	// has been crossed, enforce retirement every frame until hysteresis clears;
+	// the Series S log showed in-flight commitment grow from 2817 to 5099 MiB
+	// while the old guard waited between effective reclamation opportunities.
+	if ((++m_memoryCheckFrame % 10) != 0 && !m_memoryPressureActive)
+		return;
+	const uint64 processCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	int videoUsageMB = -1;
+	int videoBudgetMB = -1;
+	GetVRAMInfo(videoUsageMB, videoBudgetMB);
+	constexpr uint64 softLimitMB = 4096;
+	constexpr uint64 releaseLimitMB = 3968;
+	if (processCommitMB < softLimitMB)
+	{
+		if (m_memoryPressureActive && processCommitMB < releaseLimitMB)
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 Series S memory pressure cleared (process commit {} MB)", processCommitMB);
+			m_memoryPressureActive = false;
+		}
+		return;
+	}
+
+	ClearShaderResources();
+	m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+	LatteGPUState.repeatTextureInitialization = true;
+	LatteIndices_invalidateAll();
+	const size_t evictedTextures = LatteTC_TrimUnusedTextures(3, 96);
+	std::vector<uint8>().swap(m_uploadBuffer);
+	m_context->Flush();
+	WaitForGpuIdle();
+	ComPtr<IDXGIDevice3> dxgiDevice3;
+	if (SUCCEEDED(m_device.As(&dxgiDevice3)))
+		dxgiDevice3->Trim();
+	HeapCompact(GetProcessHeap(), 0);
+	const uint64 postTrimCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	if (!m_memoryPressureActive || evictedTextures != 0 || (m_memoryCheckFrame % 60) == 0)
+	{
+		cemuLog_log(LogType::Force,
+			"D3D11 Series S memory guard: process commit {} MB, video usage {} MB, "
+			"video budget {} MB; evicted {} textures, post-retirement commit {} MB, "
+			"compiled shaders {}, index uploads {}, ring wraps {}",
+			processCommitMB, videoUsageMB, videoBudgetMB, evictedTextures,
+			postTrimCommitMB,
+			m_compiledShaderCount.load(std::memory_order_relaxed),
+			m_indexUploadCount, m_indexRingWrapCount);
+	}
+	m_memoryPressureActive = true;
+#endif
 }
 
 void D3D11Renderer::NotifyLatteCommandProcessorIdle()
@@ -3004,6 +3397,13 @@ void D3D11Renderer::ClearShaderResources()
 void D3D11Renderer::ResolveTextureFeedbackLoops(
 	const std::array<ID3D11RenderTargetView*, 8>& targets, ID3D11DepthStencilView* depth)
 {
+	// These holders only need to bridge the current feedback resolution. The
+	// immediate context keeps references to views that remain bound. Retaining
+	// every prior snapshot here caused full texture copies to accumulate until a
+	// memory-pressure cleanup happened.
+	m_feedbackViews.clear();
+	m_feedbackResources.clear();
+
 	std::vector<ComPtr<ID3D11Resource>> outputResources;
 	for (auto* target : targets)
 	{
@@ -3021,6 +3421,15 @@ void D3D11Renderer::ResolveTextureFeedbackLoops(
 	}
 	if (outputResources.empty())
 		return;
+#if defined(CEMU_UWP)
+	// A feedback snapshot duplicates the complete native texture. Under pressure,
+	// let D3D11 null the conflicting SRV when the output merger is rebound. A
+	// localized missing sample is preferable to crossing the Series S title cap.
+	constexpr uint64 feedbackSnapshotStopBytes = 4096ull * 1024 * 1024;
+	if (QueryProcessPrivateCommitBytes() >= feedbackSnapshotStopBytes)
+		return;
+#endif
+	std::unordered_map<ID3D11Resource*, ComPtr<ID3D11Resource>> snapshotsBySource;
 
 	auto replaceConflicts = [&](auto getResources, auto setResources)
 	{
@@ -3042,62 +3451,71 @@ void D3D11Renderer::ResolveTextureFeedbackLoops(
 				continue;
 
 			ComPtr<ID3D11Resource> snapshot;
-			D3D11_RESOURCE_DIMENSION dimension{};
-			source->GetType(&dimension);
-			if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D)
+			if (const auto existing = snapshotsBySource.find(source.Get());
+				existing != snapshotsBySource.end())
 			{
-				ComPtr<ID3D11Texture1D> sourceTexture;
-				source.As(&sourceTexture);
-				D3D11_TEXTURE1D_DESC desc{};
-				sourceTexture->GetDesc(&desc);
-				desc.Usage = D3D11_USAGE_DEFAULT;
-				desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-				desc.CPUAccessFlags = 0;
-				ComPtr<ID3D11Texture1D> copy;
-				if (FAILED(m_device->CreateTexture1D(&desc, nullptr, &copy)))
-					continue;
-				snapshot = copy;
+				snapshot = existing->second;
 			}
-			else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+			else
 			{
-				ComPtr<ID3D11Texture2D> sourceTexture;
-				source.As(&sourceTexture);
-				D3D11_TEXTURE2D_DESC desc{};
-				sourceTexture->GetDesc(&desc);
-				desc.Usage = D3D11_USAGE_DEFAULT;
-				desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-				desc.CPUAccessFlags = 0;
-				ComPtr<ID3D11Texture2D> copy;
-				if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &copy)))
+				D3D11_RESOURCE_DIMENSION dimension{};
+				source->GetType(&dimension);
+				if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D)
+				{
+					ComPtr<ID3D11Texture1D> sourceTexture;
+					source.As(&sourceTexture);
+					D3D11_TEXTURE1D_DESC desc{};
+					sourceTexture->GetDesc(&desc);
+					desc.Usage = D3D11_USAGE_DEFAULT;
+					desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+					desc.CPUAccessFlags = 0;
+					ComPtr<ID3D11Texture1D> copy;
+					if (FAILED(m_device->CreateTexture1D(&desc, nullptr, &copy)))
+						continue;
+					snapshot = copy;
+				}
+				else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
+				{
+					ComPtr<ID3D11Texture2D> sourceTexture;
+					source.As(&sourceTexture);
+					D3D11_TEXTURE2D_DESC desc{};
+					sourceTexture->GetDesc(&desc);
+					desc.Usage = D3D11_USAGE_DEFAULT;
+					desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+					desc.CPUAccessFlags = 0;
+					ComPtr<ID3D11Texture2D> copy;
+					if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &copy)))
+						continue;
+					snapshot = copy;
+				}
+				else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+				{
+					ComPtr<ID3D11Texture3D> sourceTexture;
+					source.As(&sourceTexture);
+					D3D11_TEXTURE3D_DESC desc{};
+					sourceTexture->GetDesc(&desc);
+					desc.Usage = D3D11_USAGE_DEFAULT;
+					desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+					desc.CPUAccessFlags = 0;
+					ComPtr<ID3D11Texture3D> copy;
+					if (FAILED(m_device->CreateTexture3D(&desc, nullptr, &copy)))
+						continue;
+					snapshot = copy;
+				}
+				if (!snapshot)
 					continue;
-				snapshot = copy;
+				m_context->CopyResource(snapshot.Get(), source.Get());
+				snapshotsBySource.emplace(source.Get(), snapshot);
+				m_feedbackResources.emplace_back(snapshot);
 			}
-			else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
-			{
-				ComPtr<ID3D11Texture3D> sourceTexture;
-				source.As(&sourceTexture);
-				D3D11_TEXTURE3D_DESC desc{};
-				sourceTexture->GetDesc(&desc);
-				desc.Usage = D3D11_USAGE_DEFAULT;
-				desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-				desc.CPUAccessFlags = 0;
-				ComPtr<ID3D11Texture3D> copy;
-				if (FAILED(m_device->CreateTexture3D(&desc, nullptr, &copy)))
-					continue;
-				snapshot = copy;
-			}
-			if (!snapshot)
-				continue;
 
 			D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
 			current[slot]->GetDesc(&viewDesc);
 			ComPtr<ID3D11ShaderResourceView> snapshotView;
-			m_context->CopyResource(snapshot.Get(), source.Get());
 			if (FAILED(m_device->CreateShaderResourceView(snapshot.Get(), &viewDesc, &snapshotView)))
 				continue;
 			ID3D11ShaderResourceView* replacement = snapshotView.Get();
 			setResources(slot, &replacement);
-			m_feedbackResources.emplace_back(std::move(snapshot));
 			m_feedbackViews.emplace_back(std::move(snapshotView));
 		}
 	};
@@ -3177,7 +3595,16 @@ void* D3D11Renderer::texture_acquireTextureUploadBuffer(uint32 size)
 	m_uploadBuffer.resize(size);
 	return m_uploadBuffer.data();
 }
-void D3D11Renderer::texture_releaseTextureUploadBuffer(uint8*) {}
+void D3D11Renderer::texture_releaseTextureUploadBuffer(uint8*)
+{
+#if defined(CEMU_UWP)
+	// Reuse ordinary upload storage, but do not let one unusually large decoded
+	// texture permanently define the CPU-side high-water mark on Series S.
+	constexpr size_t maxRetainedUploadCapacity = 16 * 1024 * 1024;
+	if (m_uploadBuffer.capacity() > maxRetainedUploadCapacity)
+		std::vector<uint8>().swap(m_uploadBuffer);
+#endif
+}
 
 TextureDecoder* D3D11Renderer::texture_chooseDecodedFormat(Latte::E_GX2SURFFMT format, bool isDepth,
 	Latte::E_DIM, uint32, uint32)
@@ -3256,7 +3683,6 @@ void D3D11Renderer::texture_loadSlice(LatteTexture* texture, sint32 width, sint3
 		return;
 	auto* d3d = static_cast<D3D11Texture*>(texture);
 	d3d->AllocateOnHost();
-	d3d->BeginNativeWrite();
 	const auto& info = d3d->NativeFormat();
 	const UINT sourceWidth = static_cast<UINT>((std::max)(width, 1));
 	const UINT sourceHeight = static_cast<UINT>((std::max)(height, 1));
@@ -3281,6 +3707,7 @@ void D3D11Renderer::texture_loadSlice(LatteTexture* texture, sint32 width, sint3
 		const UINT mipWidth = (std::max)(desc.Width >> mipIndex, 1u);
 		const D3D11_BOX box{ 0, 0, 0, (std::min)(sourceWidth, mipWidth), 1, 1 };
 		const UINT subresource = D3D11CalcSubresource(mipIndex, sliceIndex, desc.MipLevels);
+		d3d->BeginNativeWrite();
 		m_context->UpdateSubresource(d3d->Resource(), subresource, &box, pixels, rowPitch, 0);
 		return;
 	}
@@ -3299,6 +3726,7 @@ void D3D11Renderer::texture_loadSlice(LatteTexture* texture, sint32 width, sint3
 		const D3D11_BOX box{ 0, 0, static_cast<UINT>(sliceIndex),
 			(std::min)(sourceWidth, mipWidth), (std::min)(sourceHeight, mipHeight),
 			static_cast<UINT>(sliceIndex) + uploadDepth };
+		d3d->BeginNativeWrite();
 		m_context->UpdateSubresource(d3d->Resource(), static_cast<UINT>(mipIndex), &box,
 			pixels, rowPitch, rowPitch * rowCount);
 		return;
@@ -3363,6 +3791,7 @@ void D3D11Renderer::texture_loadSlice(LatteTexture* texture, sint32 width, sint3
 			uploadWidth, uploadHeight,
 			info.compressed ? " full-bc" : (destinationBoxPtr ? "" : " full-depth"),
 			uploadRowPitch, uploadSize));
+		d3d->BeginNativeWrite();
 		m_context->UpdateSubresource(d3d->Resource(), subresource, destinationBoxPtr, uploadPixels,
 			uploadRowPitch, static_cast<UINT>((std::min<uint64>)(uploadSize, UINT_MAX)));
 	}
@@ -3558,11 +3987,49 @@ void D3D11Renderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
 	auto* destination = static_cast<D3D11Texture*>(dst);
 	source->AllocateOnHost(); destination->AllocateOnHost();
 	source->CommitAliasWriter();
-	destination->BeginNativeWrite();
 	if (width <= 0 || height <= 0 || depth <= 0)
+		return;
+	const UINT sourceMipLevels = source->EffectiveMipLevels();
+	const UINT destinationMipLevels = destination->EffectiveMipLevels();
+	if (srcMip < 0 || dstMip < 0 || static_cast<UINT>(srcMip) >= sourceMipLevels ||
+		static_cast<UINT>(dstMip) >= destinationMipLevels || srcSlice < 0 || dstSlice < 0)
 		return;
 	const bool source3D = src->Is3DTexture();
 	const bool destination3D = dst->Is3DTexture();
+	const auto arraySize = [](D3D11Texture* texture)
+	{
+		if (texture->Texture1D())
+		{
+			D3D11_TEXTURE1D_DESC desc{};
+			texture->Texture1D()->GetDesc(&desc);
+			return desc.ArraySize;
+		}
+		if (texture->Texture2D())
+		{
+			D3D11_TEXTURE2D_DESC desc{};
+			texture->Texture2D()->GetDesc(&desc);
+			return desc.ArraySize;
+		}
+		return 1u;
+	};
+	if ((!source3D && static_cast<uint64>(srcSlice) + depth > arraySize(source)) ||
+		(!destination3D && static_cast<uint64>(dstSlice) + depth > arraySize(destination)))
+		return;
+	if (source3D)
+	{
+		D3D11_TEXTURE3D_DESC desc{};
+		source->Texture3D()->GetDesc(&desc);
+		if (static_cast<uint64>(srcSlice) + depth > (std::max)(desc.Depth >> srcMip, 1u))
+			return;
+	}
+	if (destination3D)
+	{
+		D3D11_TEXTURE3D_DESC desc{};
+		destination->Texture3D()->GetDesc(&desc);
+		if (static_cast<uint64>(dstSlice) + depth > (std::max)(desc.Depth >> dstMip, 1u))
+			return;
+	}
+	destination->BeginNativeWrite();
 	const uint32 copyIterations = source3D && destination3D ? 1u : static_cast<uint32>(depth);
 	for (uint32 layer = 0; layer < copyIterations; ++layer)
 	{
@@ -3574,9 +4041,9 @@ void D3D11Renderer::texture_copyImageSubData(LatteTexture* src, sint32 srcMip, s
 			static_cast<UINT>((std::max)(srcX + width, 0)),
 			static_cast<UINT>((std::max)(srcY + height, 0)), sourceZ + boxDepth };
 		const UINT sourceSubresource = source3D ? static_cast<UINT>(srcMip) :
-			D3D11CalcSubresource(srcMip, srcSlice + layer, src->mipLevels);
+			D3D11CalcSubresource(srcMip, srcSlice + layer, sourceMipLevels);
 		const UINT destinationSubresource = destination3D ? static_cast<UINT>(dstMip) :
-			D3D11CalcSubresource(dstMip, dstSlice + layer, dst->mipLevels);
+			D3D11CalcSubresource(dstMip, dstSlice + layer, destinationMipLevels);
 		m_context->CopySubresourceRegion(destination->Resource(), destinationSubresource,
 			static_cast<UINT>((std::max)(dstX, 0)), static_cast<UINT>((std::max)(dstY, 0)),
 			destinationZ, source->Resource(), sourceSubresource, &box);
@@ -3790,7 +4257,7 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 			ComPtr<ID3D11Buffer> replacement;
 			HRESULT hr = m_device->CreateBuffer(&desc, nullptr, &replacement);
-			if (hr == E_OUTOFMEMORY)
+			if (IsMemoryPressureResult(hr))
 			{
 				// Do not evict the decoded index selected for this same draw: the
 				// local IndexAllocation still references it until DrawIndexed below.
@@ -3841,19 +4308,77 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, uint64 baseHash,
 	uint64 auxHash, const std::string& source, bool, bool isGfxPackSource)
 {
+	s_d3d11ShaderCreationFailureTemporary = false;
+#if defined(CEMU_UWP)
+	// The desktop cache benefits from parallel compilation, but Xbox compiler and
+	// translation workers share one strict process budget. Serialize the complete
+	// pipeline so glslang, SPIRV-Cross and xbsc_xs.dll cannot overlap across jobs.
+	std::lock_guard pipelineLock(s_xboxShaderPipelineMutex);
+	constexpr uint64 resumeCompileMB = 3840;
+	constexpr uint64 stopCompileMB = 4096;
+	// Return fragmented process-heap regions before deciding whether enough
+	// headroom remains for the Xbox shader compiler's next transient peak.
+	HeapCompact(GetProcessHeap(), 0);
+	uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	if (m_shaderCompilationBlocked.load(std::memory_order_relaxed))
+	{
+		if (commitMB < resumeCompileMB)
+			m_shaderCompilationBlocked.store(false, std::memory_order_relaxed);
+		else
+		{
+			s_d3d11ShaderCreationFailureTemporary = true;
+			return nullptr;
+		}
+	}
+	if (commitMB >= stopCompileMB)
+	{
+		// This function may execute on a shader-cache worker. Never use the D3D11
+		// immediate context here to evict resources: doing so races the graphics
+		// thread and can clear live texture/shader bindings. The present-thread
+		// memory guard performs retirement safely; this shader remains retryable.
+		cemuLog_log(LogType::Force,
+			"D3D11 Series S shader compilation paused at {} MB process commit "
+			"after {} compiled shaders",
+			commitMB, m_compiledShaderCount.load(std::memory_order_relaxed));
+		m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
+		s_d3d11ShaderCreationFailureTemporary = true;
+		return nullptr;
+	}
+#endif
 	try
 	{
 		auto shader = std::make_unique<D3D11Shader>(m_device.Get(), type, baseHash,
 			auxHash, isGfxPackSource, source);
+#if defined(CEMU_UWP)
+		// glslang, SPIRV-Cross and the Xbox shader compiler create many short-lived
+		// allocations. Compact between synchronous compilations so free process
+		// heap regions can be returned before the next shader raises the high-water
+		// mark of the 5 GiB title budget.
+		HeapCompact(GetProcessHeap(), 0);
+#endif
 		if (!shader->IsCompiled())
+		{
+			s_d3d11ShaderCreationFailureTemporary = shader->RetryableFailure();
 			return nullptr;
+		}
+		m_compiledShaderCount.fetch_add(1, std::memory_order_relaxed);
 		return shader.release();
 	}
 	catch (const std::bad_alloc&)
 	{
+#if defined(CEMU_UWP)
+		HeapCompact(GetProcessHeap(), 0);
+		m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
+#endif
 		OutputDebugStringA("[Cemu/D3D11] Shader creation skipped: out of memory\n");
+		s_d3d11ShaderCreationFailureTemporary = true;
 		return nullptr;
 	}
+}
+
+bool D3D11Renderer::shader_creation_failed_temporary() const
+{
+	return s_d3d11ShaderCreationFailureTemporary;
 }
 
 void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffset, uint32, uint32 rangeSize)
@@ -4541,6 +5066,30 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	ApplyPipelineState();
 	m_context->IASetPrimitiveTopology(PrimitiveTopology(primitive));
 	LatteStreamout_PrepareDrawcall(count, instanceCount);
+	bool drawIssued = false;
+	bool deferDriverPipeline = false;
+#if defined(CEMU_UWP)
+	const uint64 driverPipelineKey = BuildCurrentPipelineKey();
+	const bool newDriverPipeline = !m_warmedPipelineKeys.contains(driverPipelineKey);
+	std::unique_lock<std::mutex> driverPipelineLock;
+	if (newDriverPipeline)
+	{
+		// Close the race where a shader worker could consume the reserved headroom
+		// after this draw passed its memory guard but before the driver compiled it.
+		driverPipelineLock = std::unique_lock<std::mutex>(s_xboxShaderPipelineMutex);
+		HeapCompact(GetProcessHeap(), 0);
+		constexpr uint64 pipelineWarmupStopMB = 4096;
+		const uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
+		deferDriverPipeline = commitMB >= pipelineWarmupStopMB;
+		if (deferDriverPipeline)
+		{
+			if (m_deferredPipelineKeys.emplace(driverPipelineKey).second)
+				cemuLog_log(LogType::Force,
+					"D3D11 Series S deferred new driver pipeline at {} MB process commit",
+					commitMB);
+		}
+	}
+#endif
 
 	const bool rasterizerKilled =
 		LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_DX_RASTERIZATION_KILL() &&
@@ -4548,7 +5097,8 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	const bool bothFacesCulled =
 		LatteGPUState.contextNew.PA_SU_SC_MODE_CNTL.get_CULL_FRONT() &&
 		LatteGPUState.contextNew.PA_SU_SC_MODE_CNTL.get_CULL_BACK();
-	const bool skipRasterDraw = (rasterizerKilled || bothFacesCulled) && !m_streamoutActive;
+	const bool skipRasterDraw =
+		((rasterizerKilled || bothFacesCulled) && !m_streamoutActive) || deferDriverPipeline;
 
 	if (skipRasterDraw)
 	{
@@ -4568,13 +5118,15 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		else
 		{
 			m_context->IASetIndexBuffer(buffer,
-				hostIndexType == INDEX_TYPE::U16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT, 0);
+				hostIndexType == INDEX_TYPE::U16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT,
+				indexAllocation->offset);
 			{
 				D3D11_DRIVER_TRACE(fmt::format(
 					"DrawIndexedInstanced indices={} instances={} baseVertex={} baseInstance={} buffer={}",
 					hostIndexCount, instanceCount, baseVertex, baseInstance,
 					static_cast<const void*>(buffer)));
 				m_context->DrawIndexedInstanced(hostIndexCount, instanceCount, 0, baseVertex, baseInstance);
+				drawIssued = true;
 			}
 			D3D11_DEBUG_CHECK("indexed GX2 draw");
 		}
@@ -4589,10 +5141,33 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 			"DrawInstanced vertices={} instances={} baseVertex={} baseInstance={}",
 			count, instanceCount, baseVertex, baseInstance));
 		m_context->DrawInstanced(count, instanceCount, baseVertex, baseInstance);
+		drawIssued = true;
 		D3D11_DEBUG_CHECK("non-indexed GX2 draw");
 	}
 
-	if (LatteSHRC_GetActivePixelShader())
+#if defined(CEMU_UWP)
+	if (drawIssued && newDriverPipeline)
+	{
+		// D3D11On12 creates its native pipeline lazily. Waiting after the first draw
+		// prevents several xbsc_xs.dll jobs from overlapping behind subsequent draws.
+		m_context->Flush();
+		if (WaitForGpuIdle())
+		{
+			m_warmedPipelineKeys.emplace(driverPipelineKey);
+			m_deferredPipelineKeys.erase(driverPipelineKey);
+		}
+		else
+		{
+			m_deferredPipelineKeys.emplace(driverPipelineKey);
+			cemuLog_log(LogType::Force,
+				"D3D11 Series S driver pipeline warmup was not confirmed; pipeline remains guarded");
+		}
+	}
+	if (driverPipelineLock.owns_lock())
+		driverPipelineLock.unlock();
+#endif
+
+	if (drawIssued && LatteSHRC_GetActivePixelShader())
 		LatteRenderTarget_trackUpdates();
 	LatteStreamout_FinishDrawcall(false);
 	LatteGPUState.drawCallCounter++;
@@ -4634,32 +5209,77 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 	auto* data = static_cast<IndexBufferAllocation*>(allocation.rendererInternal);
 	if (!data || data->data.empty())
 		return;
-	D3D11_BUFFER_DESC desc{};
-	desc.ByteWidth = static_cast<UINT>(data->data.size());
-	desc.Usage = D3D11_USAGE_IMMUTABLE;
-	desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-	D3D11_SUBRESOURCE_DATA initial{ data->data.data(), 0, 0 };
-	D3D11_DRIVER_TRACE(fmt::format("CreateBuffer index bytes={} source={}",
-		data->data.size(), static_cast<const void*>(data->data.data())));
-	HRESULT hr = m_device->CreateBuffer(&desc, &initial, &data->buffer);
-	if (hr == E_OUTOFMEMORY)
+	const UINT dataSize = static_cast<UINT>(data->data.size());
+	const UINT alignedSize = (dataSize + 3u) & ~3u;
+	constexpr UINT initialRingCapacity = 4u * 1024u * 1024u;
+	const UINT requiredCapacity = (std::max)(initialRingCapacity, alignedSize);
+	if (!m_indexRingBuffer || requiredCapacity > m_indexRingCapacity)
 	{
-		RecoverFromMemoryPressure("index buffer", true);
-		hr = m_device->CreateBuffer(&desc, &initial, &data->buffer);
+		UINT newCapacity = m_indexRingCapacity ? m_indexRingCapacity : initialRingCapacity;
+		while (newCapacity < requiredCapacity &&
+			newCapacity <= (std::numeric_limits<UINT>::max)() / 2)
+			newCapacity *= 2;
+		newCapacity = (std::max)(newCapacity, requiredCapacity);
+
+		D3D11_BUFFER_DESC desc{};
+		desc.ByteWidth = newCapacity;
+		desc.Usage = D3D11_USAGE_DYNAMIC;
+		desc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+		desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		ComPtr<ID3D11Buffer> replacement;
+		HRESULT createResult = m_device->CreateBuffer(&desc, nullptr, &replacement);
+		if (IsMemoryPressureResult(createResult))
+		{
+			RecoverFromMemoryPressure("index upload ring", true);
+			createResult = m_device->CreateBuffer(&desc, nullptr, &replacement);
+		}
+		if (FAILED(createResult))
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 index upload skipped: ring CreateBuffer failed with HRESULT 0x{:08X}",
+				static_cast<uint32>(createResult));
+			delete data;
+			allocation = {};
+			return;
+		}
+
+		m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+		LatteIndices_invalidateAll();
+		m_indexRingBuffer = std::move(replacement);
+		m_indexRingCapacity = newCapacity;
+		m_indexRingOffset = 0;
 	}
-	if (FAILED(hr))
+
+	if (m_indexRingOffset > m_indexRingCapacity - alignedSize)
+	{
+		// All cached offsets refer to the storage that WRITE_DISCARD replaces.
+		m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+		LatteIndices_invalidateAll();
+		m_indexRingOffset = 0;
+		++m_indexRingWrapCount;
+	}
+
+	D3D11_MAPPED_SUBRESOURCE mapped{};
+	const D3D11_MAP mapMode = m_indexRingOffset == 0 ?
+		D3D11_MAP_WRITE_DISCARD : D3D11_MAP_WRITE_NO_OVERWRITE;
+	const HRESULT mapResult = m_context->Map(m_indexRingBuffer.Get(), 0, mapMode, 0, &mapped);
+	if (FAILED(mapResult))
 	{
 		cemuLog_log(LogType::Force,
-			"D3D11 index upload skipped: CreateBuffer failed with HRESULT 0x{:08X} for {} bytes",
-			static_cast<uint32>(hr), data->data.size());
+			"D3D11 index upload skipped: ring Map failed with HRESULT 0x{:08X} for {} bytes",
+			static_cast<uint32>(mapResult), dataSize);
 		delete data;
 		allocation = {};
 		return;
 	}
 
-	// The immutable GPU buffer owns a driver copy after CreateBuffer returns.
-	// Keeping the decoded CPU vector in all eight LRU entries only duplicates
-	// memory and is especially expensive in the Xbox 5 GB shared budget.
+	std::memcpy(static_cast<uint8*>(mapped.pData) + m_indexRingOffset,
+		data->data.data(), dataSize);
+	m_context->Unmap(m_indexRingBuffer.Get(), 0);
+	data->buffer = m_indexRingBuffer;
+	data->offset = m_indexRingOffset;
+	m_indexRingOffset += alignedSize;
+	++m_indexUploadCount;
 	std::vector<uint8>().swap(data->data);
 	allocation.mem = nullptr;
 }

@@ -421,6 +421,40 @@ std::vector<LatteTexture*> LatteTC_GetDeleteableTextures()
 	return texList;
 }
 
+size_t LatteTC_TrimUnusedTextures(uint32 minUnusedFrames, size_t maxDelete)
+{
+	size_t deletedCount = 0;
+	const uint32 currentFrameCount = LatteGPUState.frameCounter;
+
+	// Pick one candidate at a time because LatteTexture_Delete removes it from
+	// g_allTextures. Avoid building a temporary vector: allocating a list while
+	// the Xbox process is already under pressure can itself throw bad_alloc.
+	while (deletedCount < maxDelete)
+	{
+		LatteTexture* oldestCandidate = nullptr;
+		uint32 oldestAge = 0;
+		for (LatteTexture* texture : g_allTextures)
+		{
+			if (!texture || texture->lastAccessFrameCount == 0)
+				continue;
+			const uint32 age = currentFrameCount - texture->lastAccessFrameCount;
+			if (age < minUnusedFrames || age < oldestAge)
+				continue;
+			if (texture->isUpdatedOnGPU && !LatteTC_IsTextureDataOverwritten(texture))
+				continue;
+			oldestCandidate = texture;
+			oldestAge = age;
+		}
+
+		if (!oldestCandidate)
+			break;
+		LatteTexture_Delete(oldestCandidate);
+		++deletedCount;
+	}
+
+	return deletedCount;
+}
+
 void LatteTC_UnloadAllTextures()
 {
 	std::vector<LatteTexture*> allTexturesCopy = LatteTexture::GetAllTextures();

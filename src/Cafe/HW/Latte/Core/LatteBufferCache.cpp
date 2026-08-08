@@ -1269,6 +1269,14 @@ private:
 			m_pageInfo[firstPage + i].hash = hashPage(s_pageUploadBuffer.data() + i * CACHE_PAGE_SIZE);
 		}
 		g_renderer->bufferCache_upload(s_pageUploadBuffer.data(), uploadRangeEnd - uploadRangeBegin, getBufferOffset(uploadRangeBegin));
+#if defined(CEMU_UWP)
+		// The renderer has consumed this CPU copy synchronously. Preserve a modest
+		// reusable buffer, but do not retain a title's largest vertex upload for the
+		// rest of the session in the Series S process budget.
+		constexpr size_t maxRetainedPageUploadCapacity = 16 * 1024 * 1024;
+		if (s_pageUploadBuffer.capacity() > maxRetainedPageUploadCapacity)
+			std::vector<uint8>().swap(s_pageUploadBuffer);
+#endif
 	}
 
 	// upload only non-streamout data of a single page
