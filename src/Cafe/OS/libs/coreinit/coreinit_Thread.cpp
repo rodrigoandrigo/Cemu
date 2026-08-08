@@ -8,12 +8,15 @@
 #include "Cafe/HW/Espresso/Debugger/GDBStub.h"
 #include "Cafe/HW/Espresso/Interpreter/PPCInterpreterInternal.h"
 #include "Cafe/HW/Espresso/Recompiler/PPCRecompiler.h"
+#include "Common/CemuRuntime.h"
 
 #include "util/helpers/Semaphore.h"
 #include "util/helpers/ConcurrentQueue.h"
 #include "util/Fiber/Fiber.h"
 
 #include "util/helpers/helpers.h"
+
+#include <new>
 
 #ifdef __arm64__
 #if defined(__clang__)
@@ -1390,7 +1393,7 @@ namespace coreinit
 	}
 #endif
 
-	void OSSchedulerCoreEmulationThread(void* _assignedCoreIndex)
+	void OSSchedulerCoreEmulationThreadImpl(void* _assignedCoreIndex)
 	{
 		SetThreadName(fmt::format("OSSched[core={}]", (uintptr_t)_assignedCoreIndex).c_str());
 		t_assignedCoreIndex = (sint32)(uintptr_t)_assignedCoreIndex;
@@ -1421,6 +1424,22 @@ namespace coreinit
 		Fiber::Switch(*g_idleLoopFiber[t_assignedCoreIndex]);
 		// returned from scheduler loop, exit thread
 		cemu_assert_debug(!__OSHasSchedulerLock());
+	}
+
+	void OSSchedulerCoreEmulationThread(void* assignedCoreIndex)
+	{
+		try
+		{
+			OSSchedulerCoreEmulationThreadImpl(assignedCoreIndex);
+		}
+		catch (const std::bad_alloc&)
+		{
+			// HLE and synchronous PPC recompilation execute on these host threads.
+			// Letting an allocation failure escape a std::thread invokes terminate.
+			// Keep this path allocation-free so the embedding host can report the
+			// constrained Xbox memory budget on its next Pump call.
+			CemuRuntime::RecordOutOfMemory();
+		}
 	}
 
 	std::vector<std::thread::native_handle_type> g_schedulerThreadHandles;

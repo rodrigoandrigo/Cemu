@@ -20,6 +20,8 @@
 #include "Cafe/CafeSystem.h"
 #include "Common/CemuRuntime.h"
 
+#include <new>
+
 LatteGPUState_t LatteGPUState = {};
 
 std::atomic_bool sLatteThreadRunning = false;
@@ -113,7 +115,7 @@ void LatteThread_HandleOSScreen()
 		g_renderer->SwapBuffers(swapTV, swapDRC);
 }
 
-int Latte_ThreadEntry()
+int Latte_ThreadEntryImpl()
 {
 	SetThreadName("LatteThread");
 	sint32 w,h;
@@ -221,6 +223,44 @@ int Latte_ThreadEntry()
 	return 0;
 }
 
+int Latte_ThreadEntry()
+{
+	try
+	{
+		return Latte_ThreadEntryImpl();
+	}
+	catch (const CemuRuntime::FatalError& error)
+	{
+		cemuLog_log(LogType::Force, "Latte thread aborted: {}", error.what());
+		CemuRuntime::RecordFatalError(error.what());
+	}
+	catch (const std::bad_alloc&)
+	{
+		// This path must not format strings or allocate more memory.
+		CemuRuntime::RecordOutOfMemory();
+	}
+	catch (const std::exception& error)
+	{
+		// Renderer failures used to escape this std::thread and invoke
+		// std::terminate, which closes the UWP app without surfacing the failing
+		// D3D11 operation.  Convert them into the embedding error channel.
+		const std::string message = fmt::format(
+			"Latte graphics thread failed: {}", error.what());
+		cemuLog_log(LogType::Force, "{}", message);
+		CemuRuntime::RecordFatalError(message);
+	}
+	catch (...)
+	{
+		const std::string message = "Latte graphics thread failed with an unknown exception";
+		cemuLog_log(LogType::Force, "{}", message);
+		CemuRuntime::RecordFatalError(message);
+	}
+
+	sLatteThreadRunning = false;
+	sLatteThreadFinishedInit = true;
+	return -1;
+}
+
 std::thread sLatteThread;
 std::mutex sLatteThreadStateMutex;
 
@@ -244,7 +284,17 @@ void Latte_Stop()
 {
 	std::unique_lock _lock(sLatteThreadStateMutex);
 	if (!sLatteThreadRunning)
+	{
+		// A caught renderer exception leaves a completed but joinable thread.
+		// Join it here so destruction or a later assignment cannot call
+		// std::terminate a second time.
+		if (sLatteThread.joinable())
+		{
+			_lock.unlock();
+			sLatteThread.join();
+		}
 		return;
+	}
 	sLatteThreadRunning = false;
 	_lock.unlock();
 	sLatteThread.join();

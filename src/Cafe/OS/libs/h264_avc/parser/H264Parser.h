@@ -194,6 +194,18 @@ private:
 class NALInputBitstream
 {
 public:
+	// Annex-B H.264 streams may use either 00 00 01 or 00 00 00 01 as a
+	// start-code prefix. Keep this in one place so callers do not accidentally
+	// treat the last zero of the long prefix as part of the NAL payload.
+	static uint32 GetStartCodeLength(const uint8* stream, uint32 length)
+	{
+		if (length >= 4 && stream[0] == 0 && stream[1] == 0 && stream[2] == 0 && stream[3] == 1)
+			return 4;
+		if (length >= 3 && stream[0] == 0 && stream[1] == 0 && stream[2] == 1)
+			return 3;
+		return 0;
+	}
+
 	NALInputBitstream(uint8* stream, uint32 length)
 	{
 		this->nalStreamPtr = stream;
@@ -219,13 +231,10 @@ public:
 		if (indexNextStartSignature <= readIndex)
 			return false;
 		// skip current start signature
-		if ((nalStreamLength - readIndex) >= 3 && nalStreamPtr[readIndex + 0] == 0 && nalStreamPtr[readIndex + 1] == 0 && nalStreamPtr[readIndex + 2] == 1)
+		const uint32 startCodeLength = GetStartCodeLength(nalStreamPtr + readIndex, nalStreamLength - readIndex);
+		if (startCodeLength != 0)
 		{
-			readIndex += 3;
-		}
-		else if ((nalStreamLength - readIndex) >= 3 && nalStreamPtr[readIndex + 0] == 0 && nalStreamPtr[readIndex + 1] == 0 && nalStreamPtr[readIndex + 2] == 0 && nalStreamPtr[readIndex + 3] == 1)
-		{
-			readIndex += 4;
+			readIndex += startCodeLength;
 		}
 		else
 		{
@@ -251,27 +260,15 @@ private:
 			return -1;
 		sint32 offset = readIndex;
 		// if there is a start signature at the current address, skip it
-		if ((offset + 3) <= nalStreamLength && nalStreamPtr[offset + 0] == 0x00 && nalStreamPtr[offset + 1] == 0x00 && nalStreamPtr[offset + 2] == 0x01)
+		const uint32 initialStartCodeLength = GetStartCodeLength(nalStreamPtr + offset, nalStreamLength - offset);
+		if (initialStartCodeLength != 0)
 		{
-			offset += 3;
+			offset += initialStartCodeLength;
 		}
-		else if ((offset + 4) <= nalStreamLength && nalStreamPtr[offset + 0] == 0x00 && nalStreamPtr[offset + 1] == 0x00 && nalStreamPtr[offset + 2] == 0x00 && nalStreamPtr[offset + 3] == 0x01)
+		while (offset + 3 <= nalStreamLength)
 		{
-			offset += 4;
-		}
-		while (offset < (nalStreamLength - 3))
-		{
-			if (nalStreamPtr[offset + 0] == 0x00 && nalStreamPtr[offset + 1] == 0x00)
-			{
-				if (nalStreamPtr[offset + 2] == 0x01)
-				{
-					return offset;
-				}
-				else if ((nalStreamLength - offset) >= 4 && nalStreamPtr[offset + 2] == 0x00 && nalStreamPtr[offset + 3] == 0x01)
-				{
-					return offset;
-				}
-			}
+			if (GetStartCodeLength(nalStreamPtr + offset, nalStreamLength - offset) != 0)
+				return offset;
 			offset++;
 		}
 		return -1;

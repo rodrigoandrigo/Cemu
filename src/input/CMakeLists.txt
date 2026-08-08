@@ -9,6 +9,8 @@ add_library(CemuInput
 	api/ControllerState.cpp
 	api/InputAPI.h
 	api/ControllerProvider.h
+	api/UWP/UWPGamepadController.cpp
+	api/UWP/UWPGamepadController.h
 	api/DSU/DSUController.h
 	api/DSU/DSUControllerProvider.cpp
 	api/DSU/DSUController.cpp

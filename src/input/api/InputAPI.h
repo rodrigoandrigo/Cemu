@@ -63,14 +63,13 @@ namespace InputAPI
 			return GameCube;
 		else if (str == to_string(DSUClient))
 			return DSUClient;
+		else if (str == to_string(WGIGamepad))
+			return WGIGamepad;
 		else if (str == to_string(SDLController))
 			return SDLController;
 		else if (str == "DSU") // legacy
 			return DSUClient;
 		
-		//else if (str == "WGIGamepad")
-		//	return WGIGamepad;
-		//
 		//else if (str == "WGIRawController")
 		//	return WGIRawController;
 

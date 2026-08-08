@@ -108,6 +108,7 @@ private:
 	void ClearShaderResources();
 	void ResolveTextureFeedbackLoops(const std::array<ID3D11RenderTargetView*, 8>& targets,
 		ID3D11DepthStencilView* depth);
+	void RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache);
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
 	Microsoft::WRL::ComPtr<ID3D11Device1> m_device1;
@@ -126,6 +127,7 @@ private:
 	std::array<UINT, 16> m_vertexStrides{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 16> m_vertexBuffers{};
 	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBuffers{};
+	std::array<std::array<UINT, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBufferCapacity{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_uniformVarsBuffers{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_samplerSwizzleBuffers{};
 	std::array<UINT, 3> m_uniformVarsBufferCapacity{};

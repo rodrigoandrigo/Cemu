@@ -17,5 +17,7 @@ namespace CemuRuntime
 	void RecordFatalError(std::string message);
 	bool HasFatalError();
 	std::string GetFatalError();
+	void RecordOutOfMemory() noexcept;
+	bool HasOutOfMemory() noexcept;
 	[[noreturn]] void RaiseFatalError(std::string message, int desktopExitCode = -1);
 }

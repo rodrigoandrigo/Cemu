@@ -71,6 +71,10 @@ namespace iosu
 
 		void CreatePlaystats()
 		{
+			// On a fresh UWP/Xbox LocalState the per-account PDM directory does
+			// not exist yet. PlayStats is opened before PlayDiary, so relying on
+			// CreatePlayDiary() to create it makes the first launch fail.
+			MakeDirectory();
 			PlayStats.fs = FileStream::createFile2(GetPDFile("PlayStats.dat"));
 			if (!PlayStats.fs)
 			{

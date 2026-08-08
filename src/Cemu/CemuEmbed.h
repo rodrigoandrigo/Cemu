@@ -25,6 +25,7 @@ extern "C" {
 #define CEMU_EMBED_D3D11_SURFACE_VERSION 1u
 #define CEMU_EMBED_LIBRARY_VERSION 2u
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
+#define CEMU_EMBED_GAMEPAD_VERSION 1u
 typedef struct CemuEmbedInstance CemuEmbedInstance;
 
 typedef enum CemuEmbedResult { CEMU_EMBED_OK, CEMU_EMBED_INVALID_ARGUMENT, CEMU_EMBED_INVALID_STATE, CEMU_EMBED_BUSY, CEMU_EMBED_INITIALIZATION_FAILED, CEMU_EMBED_LAUNCH_FAILED, CEMU_EMBED_STORAGE_FAILED } CemuEmbedResult;
@@ -75,6 +76,23 @@ typedef struct CemuEmbedD3D11Surface {
 	void* swap_chain;         // IDXGISwapChain
 	void* render_target_view; // ID3D11RenderTargetView
 } CemuEmbedD3D11Surface;
+
+// Host-fed Xbox/Windows.Gaming.Input state. Buttons use the SDL gamepad
+// layout: South/A=bit 0, East/B=1, West/X=2, North/Y=3, View=4, Menu=6,
+// thumbsticks=7/8, shoulders=9/10 and D-pad Up/Down/Left/Right=11..14.
+// Stick axes are [-1, 1], triggers are [0, 1].
+typedef struct CemuEmbedGamepadState {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	int32_t connected;
+	uint32_t buttons;
+	float left_x;
+	float left_y;
+	float right_x;
+	float right_y;
+	float left_trigger;
+	float right_trigger;
+} CemuEmbedGamepadState;
 
 // A brokered folder is deliberately represented by host-owned opaque handles.
 // This keeps the DLL usable from C, C#, and C++/WinRT without tying its ABI to
@@ -200,10 +218,16 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledF
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ApplySafeGraphicPackPolicyForTitle(
 	CemuEmbedInstance* instance, uint64_t base_title_id,
 	uint32_t* affected_pack_count);
-// Creates player one's Wii U GamePad profile from the first SDL gamepad,
-// preferring an Xbox device. Existing configured profiles are never replaced.
+// Creates player one's Wii U GamePad profile. On a UWP/Xbox host, the host's
+// Windows.Gaming.Input snapshot takes precedence and replaces a stale SDL
+// profile copied from a desktop session. Desktop builds use the first SDL
+// gamepad, preferring an Xbox device.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile(
 	CemuEmbedInstance* instance, int32_t* profile_ready);
+// Publishes the latest host-owned gamepad state. This has no WinRT objects in
+// its ABI and is safe to call from the XAML/Windows.Gaming.Input thread.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetHostGamepadState(
+	CemuEmbedInstance* instance, const CemuEmbedGamepadState* state);
 // Publishes a host-owned virtual mouse in physical surface pixels. While it is
 // enabled, the UWP SDL path reserves A, L/R and the left stick for the mouse.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(

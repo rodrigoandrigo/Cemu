@@ -34,6 +34,8 @@ public:
 private:
 	void event_thread();
 	static void HandleSDLEvent(union SDL_Event& event);
+	static void QueueRumble(SDL_JoystickID instanceId, Uint16 lowFrequency, Uint16 highFrequency);
+	static void ApplyPendingRumble();
 #if !BOOST_OS_MACOS
 	static void InitSDL();
 	static void ShutdownSDL();
@@ -44,6 +46,8 @@ private:
 	inline static std::shared_mutex s_mutex;
 	inline static std::atomic_bool s_running = false;
 	inline static std::thread s_thread;
+	inline static std::mutex s_rumbleMutex;
+	inline static std::unordered_map<SDL_JoystickID, std::pair<Uint16, Uint16>> s_pendingRumble;
 
 	struct MotionInfoTracking
 	{

@@ -28,8 +28,13 @@ InputManager::InputManager()
 #if HAS_KEYBOARD
 	create_provider<KeyboardControllerProvider>();
 #endif
-#ifdef HAS_SDL
+#if defined(HAS_SDL) && !defined(CEMU_UWP)
 	create_provider<SDLControllerProvider>();
+#elif defined(HAS_SDL) && defined(CEMU_UWP)
+	// The embedding host owns Windows.Gaming.Input on its XAML apartment and
+	// publishes a POD snapshot through UWPGamepadController. Starting SDL's WGI
+	// provider here performs a second PnP enumeration on an MTA worker; Xbox can
+	// reject that path with E_INVALIDARG and it also duplicates each controller.
 #endif
 #if HAS_XINPUT
 	create_provider<XInputControllerProvider>();
@@ -121,6 +126,16 @@ bool InputManager::load(size_t player_index, std::string_view filename)
 			const auto api_node = cnode.child("api");
 			if (!api_node)
 				continue;
+
+#if defined(CEMU_UWP)
+			// Legacy host profiles stored the WinRT display name as an InputAPI.
+			// The current host feeds a POD snapshot into UWPGamepadController, so
+			// trying to recreate WGI here is both redundant and unsafe on Xbox.
+			const std::string_view storedApi = api_node.child_value();
+			if (storedApi == "Windows.Gaming.Input" || storedApi == "WGIGamepad" ||
+				storedApi == "WGIRawController")
+				continue;
+#endif
 
 			const auto uuid_node = cnode.child("uuid");
 			if (!uuid_node)

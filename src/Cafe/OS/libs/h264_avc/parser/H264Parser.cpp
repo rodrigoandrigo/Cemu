@@ -872,20 +872,12 @@ void h264Parse(h264ParserState_t* h264ParserState, h264ParserOutput_t* output, u
 
 sint32 h264GetUnitLength(h264ParserState_t* h264ParserState, uint8* data, uint32 length)
 {
-	NALInputBitstream nalStream(data, length);
-
-	if (nalStream.hasError())
-	{
-		cemu_assert_debug(false);
-		return -1;
-	}
-
 	// search for start code
 	sint32 startCodeOffset = 0;
 	bool hasStartcode = false;
-	while (startCodeOffset < (sint32)(length - 3))
+	while (startCodeOffset + 3 <= (sint32)length)
 	{
-		if (data[startCodeOffset + 0] == 0x00 && data[startCodeOffset + 1] == 0x00 && data[startCodeOffset + 2] == 0x01)
+		if (NALInputBitstream::GetStartCodeLength(data + startCodeOffset, length - startCodeOffset) != 0)
 		{
 			hasStartcode = true;
 			break;
@@ -894,8 +886,14 @@ sint32 h264GetUnitLength(h264ParserState_t* h264ParserState, uint8* data, uint32
 	}
 	if (hasStartcode == false)
 		return -1;
-	data += startCodeOffset;
-	length -= startCodeOffset;
+
+	// Start parsing at the first Annex-B prefix, but construct the bitstream
+	// after applying the offset. Constructing it before this adjustment was the
+	// source of incorrect unit lengths for four-byte prefixes.
+	uint8* streamStart = data + startCodeOffset;
+	NALInputBitstream nalStream(streamStart, length - startCodeOffset);
+	if (nalStream.hasError())
+		return -1;
 
 	// parse NAL data
 	while (true)
@@ -932,9 +930,7 @@ sint32 h264GetUnitLength(h264ParserState_t* h264ParserState, uint8* data, uint32
 			// note: We cant parse the slice data because we dont have SPS and PPS data reliably available
 			// 
 			// currently we just assume there is 1 slice per unit
-			return (sint32)((rbspStream.getBasePtr() + rbspStream.getBaseLength()) - data) + startCodeOffset;
-			
-			break;
+			return (sint32)((rbspStream.getBasePtr() + rbspStream.getBaseLength()) - streamStart) + startCodeOffset;
 		}
 		case 6:
 			// SEI
@@ -953,8 +949,6 @@ sint32 h264GetUnitLength(h264ParserState_t* h264ParserState, uint8* data, uint32
 			break;
 		default:
 			cemuLog_logDebug(LogType::Force, "Unsupported NAL unit type {}", nal_unit_type);
-			assert_dbg(); // todo - NAL 10 is used in DKC TF
-			// todo
 			break;
 		}
 	}

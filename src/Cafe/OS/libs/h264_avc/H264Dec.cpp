@@ -128,21 +128,13 @@ namespace H264
 	{
 		if (!ptr || length < 4 || !offsetOut)
 			return H264DEC_STATUS::INVALID_PARAM;
-		for (uint32 i = 0; i < length - 4; ++i)
+		for (uint32 i = 0; i + 4 <= length; ++i)
 		{
-			uint8 b = ptr[i];
-			if (b != 0)
+			const uint32 startCodeLength = NALInputBitstream::GetStartCodeLength(ptr + i, length - i);
+			if (startCodeLength == 0 || i + startCodeLength >= length)
 				continue;
 
-			b = ptr[i + 1];
-			if (b != 0)
-				continue;
-
-			b = ptr[i + 2];
-			if (b != 1)
-				continue;
-
-			b = ptr[i + 3];
+			uint8 b = ptr[i + startCodeLength];
 			b &= 0x9F;
 			if (b != 7) // check for NAL type SPS
 				continue;
@@ -162,21 +154,13 @@ namespace H264
 		if (!ptr || length < 4 || !offsetOut)
 			return H264DEC_STATUS::INVALID_PARAM;
 
-		for (uint32 i = 0; i < length - 4; ++i)
+		for (uint32 i = 0; i + 4 <= length; ++i)
 		{
-			uint8 b = ptr[i];
-			if (b != 0)
+			const uint32 startCodeLength = NALInputBitstream::GetStartCodeLength(ptr + i, length - i);
+			if (startCodeLength == 0 || i + startCodeLength >= length)
 				continue;
 
-			b = ptr[i + 1];
-			if (b != 0)
-				continue;
-
-			b = ptr[i + 2];
-			if (b != 1)
-				continue;
-
-			b = ptr[i + 3];
+			uint8 b = ptr[i + startCodeLength];
 			b &= 0x9F;
 			if (b != 5 && b != 7 && b != 8) // check for NAL type IDR slice, but also accept SPS or PPS slices
 				continue;
@@ -304,27 +288,21 @@ namespace H264
 			return H264DEC_STATUS::INVALID_PARAM;
 		uint8* cur = stream + offset;
 		uint8* end = stream + streamSize;
-		while (cur < end-2)
+		while (cur < end)
 		{
-			// check for start code
-			if(*cur != 1)
+			const uint32 startCodeLength = NALInputBitstream::GetStartCodeLength(cur, (uint32)(end - cur));
+			if (startCodeLength == 0 || cur + startCodeLength >= end)
 			{
 				cur++;
 				continue;
 			}
-			// check if this is a valid NAL header
-			if(cur[-2] != 0 || cur[-1] != 0 || cur[0] != 1) // if offset is < 2, this will read out of bounds. The console implementation has this behavior too so we have to replicate this bug
-			{
-				cur++;
-				continue;
-			}
-			uint8 nalHeader = cur[1];
+			uint8 nalHeader = cur[startCodeLength];
 			if((nalHeader & 0x1F) != 7)
 			{
 				cur++;
 				continue;
 			}
-			uint8* spsStart = cur + 2;
+			uint8* spsStart = cur + startCodeLength + 1;
 			uint32 spsLength = (uint32)(end - spsStart);
 			H264Dec_SeqParameterSet psp;
 			RBSPInputBitstream rbspStream(spsStart, spsLength, false);
@@ -696,20 +674,12 @@ namespace H264
 		data += offset;
 		maxLength -= offset;
 
-		NALInputBitstream nalStream(data, maxLength);
-
-		if (nalStream.hasError())
-		{
-			cemu_assert_debug(false);
-			return H264DEC_STATUS::BAD_STREAM;
-		}
-
 		// search for start code
 		sint32 startCodeOffset = 0;
 		bool hasStartcode = false;
-		while (startCodeOffset < (sint32)(maxLength - 3))
+		while (startCodeOffset + 3 <= (sint32)maxLength)
 		{
-			if (data[startCodeOffset + 0] == 0x00 && data[startCodeOffset + 1] == 0x00 && data[startCodeOffset + 2] == 0x01)
+			if (NALInputBitstream::GetStartCodeLength(data + startCodeOffset, maxLength - startCodeOffset) != 0)
 			{
 				hasStartcode = true;
 				break;
@@ -718,8 +688,11 @@ namespace H264
 		}
 		if (hasStartcode == false)
 			return H264DEC_STATUS::BAD_STREAM;
-		data += startCodeOffset;
-		maxLength -= startCodeOffset;
+
+		uint8* streamStart = data + startCodeOffset;
+		NALInputBitstream nalStream(streamStart, maxLength - startCodeOffset);
+		if (nalStream.hasError())
+			return H264DEC_STATUS::BAD_STREAM;
 
 		// parse NAL data
 		while (true)
@@ -753,7 +726,7 @@ namespace H264
 			case 1:
 			case 5:
 			{
-				*unitLengthOut = (sint32)((rbspStream.getBasePtr() + rbspStream.getBaseLength()) - data) + startCodeOffset;
+				*unitLengthOut = (sint32)((rbspStream.getBasePtr() + rbspStream.getBaseLength()) - streamStart) + startCodeOffset;
 				return H264DEC_STATUS::SUCCESS;
 			}
 			case 6:
@@ -773,8 +746,6 @@ namespace H264
 				break;
 			default:
 				cemuLog_logDebug(LogType::Force, "Unsupported NAL unit type {}", nal_unit_type);
-				cemu_assert_unimplemented();
-				// todo
 				break;
 			}
 		}

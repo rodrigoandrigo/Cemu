@@ -33,6 +33,7 @@
 #include "imgui/imgui_extension.h"
 #include <limits>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string_view>
 #include <system_error>
@@ -92,7 +93,16 @@ private:
 void ThrowIfFailed(HRESULT result, const char* operation)
 {
 	if (FAILED(result))
-		throw std::runtime_error(fmt::format("{} failed with HRESULT 0x{:08X}", operation, static_cast<uint32>(result)));
+	{
+		const std::string message = fmt::format(
+			"{} failed with HRESULT 0x{:08X}", operation,
+			static_cast<uint32>(result));
+		// Preserve the failing operation in log.txt even when this originated on
+		// a worker thread.  Visual Studio's first-chance _com_error entry alone
+		// does not contain enough information to diagnose an Xbox driver failure.
+		cemuLog_log(LogType::Force, "D3D11: {}", message);
+		throw std::runtime_error(message);
+	}
 }
 
 uint32 Align16(uint32 value)
@@ -1416,6 +1426,15 @@ void main(point GeometryInput inputVertices[1],
 		{
 			m_textureSlots.fill(InvalidSlot);
 			m_uniformSlots.fill(InvalidSlot);
+			std::string hlsl;
+			UINT uniformSlot{};
+			const char* profile = GetType() == ShaderType::kVertex ? "vs_5_0" :
+				GetType() == ShaderType::kFragment ? "ps_5_0" : "gs_5_0";
+			// Keep the GLSL/SPIR-V translation in a shorter lifetime scope. On Xbox
+			// the D3D11On12 compiler shares the 5 GB title budget; retaining glslang,
+			// SPIRV-Cross and their IR while D3DCompile loads dxilconv creates a large
+			// avoidable peak and was producing std::bad_alloc.
+			{
 			EShLanguage stage = GetType() == ShaderType::kVertex ? EShLangVertex :
 				GetType() == ShaderType::kFragment ? EShLangFragment : EShLangGeometry;
 			glslang::TShader shader(stage);
@@ -1473,7 +1492,6 @@ void main(point GeometryInput inputVertices[1],
 					m_textureSlots[originalBinding] = textureSlot;
 				textureSlot += count;
 			}
-			UINT uniformSlot{};
 			for (const auto& resource : resources.uniform_buffers)
 			{
 				const UINT originalBinding =
@@ -1521,13 +1539,12 @@ void main(point GeometryInput inputVertices[1],
 			// Preserve the SPIR-V name for stages supported by the HLSL backend.
 			options.use_entry_point_name = true;
 			compiler.set_hlsl_options(options);
-			std::string hlsl = compiler.compile();
+			hlsl = compiler.compile();
 			hlsl = AddRuntimeSamplerSwizzles(std::move(hlsl), uniformSlot, m_usesRuntimeSwizzle);
 			if (m_usesRuntimeSwizzle)
 				m_samplerSwizzleSlot = uniformSlot;
+			}
 
-			const char* profile = GetType() == ShaderType::kVertex ? "vs_5_0" :
-				GetType() == ShaderType::kFragment ? "ps_5_0" : "gs_5_0";
 			ComPtr<ID3DBlob> errors;
 			HRESULT hr = CompileHLSLCached(hlsl.data(), hlsl.size(), profile,
 				D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
@@ -1557,6 +1574,14 @@ void main(point GeometryInput inputVertices[1],
 			}
 			CreateStreamoutShader(device, source);
 			m_compiled = true;
+		}
+		catch (const std::bad_alloc&)
+		{
+			// On Xbox, D3D11On12, glslang and SPIRV-Cross share the title's
+			// constrained memory budget. Do not invoke the allocating logger here.
+			// The common cache will reject this uncompiled shader safely.
+			OutputDebugStringA("[Cemu/D3D11] Shader compilation skipped: out of memory\n");
+			m_compiled = false;
 		}
 		catch (const std::exception& ex)
 		{
@@ -2756,6 +2781,34 @@ void D3D11Renderer::Flush(bool waitIdle)
 		}
 	}
 }
+
+void D3D11Renderer::RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache)
+{
+	int usageInMB = -1;
+	int budgetInMB = -1;
+	GetVRAMInfo(usageInMB, budgetInMB);
+	cemuLog_log(LogType::Force,
+		"D3D11 memory pressure while creating {} (usage {} MB, budget {} MB); requesting driver trim{}",
+		resourceName ? resourceName : "resource", usageInMB, budgetInMB,
+		evictIndexCache ? " after evicting transient index data" : "");
+
+	// The decoded-index LRU owns independent immutable buffers. They can be
+	// recreated from emulated memory, making them the safest resources to evict.
+	if (evictIndexCache)
+	{
+		m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
+		LatteIndices_invalidateAll();
+	}
+	m_context->Flush();
+
+	// On UWP (and D3D11On12 on Xbox) Trim asks DXGI to release allocations that
+	// became unreferenced above before the retry. Desktop drivers may not expose
+	// IDXGIDevice3, in which case the eviction and Flush are still useful.
+	ComPtr<IDXGIDevice3> dxgiDevice3;
+	if (SUCCEEDED(m_device.As(&dxgiDevice3)))
+		dxgiDevice3->Trim();
+}
+
 void D3D11Renderer::NotifyLatteCommandProcessorIdle()
 {
 	// D3D11 submits work automatically. Flushing every time the emulated GX2
@@ -3716,18 +3769,58 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 	ID3D11Buffer* native{};
 	if (size && offset + size <= m_bufferCacheShadow.size())
 	{
-		D3D11_BUFFER_DESC desc{};
-		desc.ByteWidth = Align16(size);
-		desc.Usage = D3D11_USAGE_DEFAULT;
-		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-		std::vector<uint8> initial(desc.ByteWidth);
-		std::memcpy(initial.data(), m_bufferCacheShadow.data() + offset, size);
-		D3D11_SUBRESOURCE_DATA data{ initial.data(), 0, 0 };
-		if (SUCCEEDED(m_device->CreateBuffer(&desc, &data, &m_uniformBuffers[stageIndex][index])))
-			native = m_uniformBuffers[stageIndex][index].Get();
+		const UINT requiredSize = Align16(size);
+		auto& buffer = m_uniformBuffers[stageIndex][index];
+		auto& capacity = m_uniformBufferCapacity[stageIndex][index];
+		if (!buffer || capacity < requiredSize)
+		{
+			// Grow geometrically and reuse the allocation. Recreating a DEFAULT
+			// buffer on every bind leaves many driver allocations in flight and
+			// quickly exhausts the shared Xbox memory budget.
+			UINT newCapacity = 256;
+			while (newCapacity < requiredSize &&
+				newCapacity <= (std::numeric_limits<UINT>::max() / 2))
+				newCapacity *= 2;
+			newCapacity = (std::max)(newCapacity, requiredSize);
+
+			D3D11_BUFFER_DESC desc{};
+			desc.ByteWidth = newCapacity;
+			desc.Usage = D3D11_USAGE_DYNAMIC;
+			desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			ComPtr<ID3D11Buffer> replacement;
+			HRESULT hr = m_device->CreateBuffer(&desc, nullptr, &replacement);
+			if (hr == E_OUTOFMEMORY)
+			{
+				// Do not evict the decoded index selected for this same draw: the
+				// local IndexAllocation still references it until DrawIndexed below.
+				buffer.Reset();
+				capacity = 0;
+				RecoverFromMemoryPressure("uniform buffer", false);
+				hr = m_device->CreateBuffer(&desc, nullptr, &replacement);
+			}
+			if (SUCCEEDED(hr))
+			{
+				buffer = std::move(replacement);
+				capacity = newCapacity;
+			}
+		}
+
+		if (buffer && capacity >= requiredSize)
+		{
+			D3D11_MAPPED_SUBRESOURCE mapped{};
+			if (SUCCEEDED(m_context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+			{
+				std::memcpy(mapped.pData, m_bufferCacheShadow.data() + offset, size);
+				if (capacity > size)
+					std::memset(static_cast<uint8*>(mapped.pData) + size, 0, capacity - size);
+				m_context->Unmap(buffer.Get(), 0);
+				native = buffer.Get();
+			}
+		}
 	}
-	else
-		m_uniformBuffers[stageIndex][index].Reset();
+	// Keep an unused slot allocated. The next bind can reuse it without asking
+	// the Xbox driver for another resource; native remains null for this bind.
 	LatteDecompilerShader* shader{};
 	if (stage == LatteConst::ShaderType::Vertex) shader = LatteSHRC_GetActiveVertexShader();
 	else if (stage == LatteConst::ShaderType::Pixel) shader = LatteSHRC_GetActivePixelShader();
@@ -3748,13 +3841,19 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, uint64 baseHash,
 	uint64 auxHash, const std::string& source, bool, bool isGfxPackSource)
 {
-	auto* shader = new D3D11Shader(m_device.Get(), type, baseHash, auxHash, isGfxPackSource, source);
-	if (!shader->IsCompiled())
+	try
 	{
-		delete shader;
+		auto shader = std::make_unique<D3D11Shader>(m_device.Get(), type, baseHash,
+			auxHash, isGfxPackSource, source);
+		if (!shader->IsCompiled())
+			return nullptr;
+		return shader.release();
+	}
+	catch (const std::bad_alloc&)
+	{
+		OutputDebugStringA("[Cemu/D3D11] Shader creation skipped: out of memory\n");
 		return nullptr;
 	}
-	return shader;
 }
 
 void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffset, uint32, uint32 rangeSize)
@@ -4504,9 +4603,24 @@ void D3D11Renderer::draw_endSequence() {}
 
 Renderer::IndexAllocation D3D11Renderer::indexData_reserveIndexMemory(uint32 size)
 {
-	auto* allocation = new IndexBufferAllocation();
-	allocation->data.resize(size);
-	return { allocation->data.data(), allocation };
+	for (uint32 attempt = 0; attempt < 2; ++attempt)
+	{
+		try
+		{
+			auto allocation = std::make_unique<IndexBufferAllocation>();
+			allocation->data.resize(size);
+			void* memory = allocation->data.data();
+			return { memory, allocation.release() };
+		}
+		catch (const std::bad_alloc&)
+		{
+			if (attempt == 0)
+				RecoverFromMemoryPressure("index staging memory", true);
+		}
+	}
+	cemuLog_log(LogType::Force,
+		"D3D11 index allocation skipped: unable to reserve {} bytes", size);
+	return {};
 }
 
 void D3D11Renderer::indexData_releaseIndexMemory(IndexAllocation& allocation)
@@ -4527,7 +4641,27 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 	D3D11_SUBRESOURCE_DATA initial{ data->data.data(), 0, 0 };
 	D3D11_DRIVER_TRACE(fmt::format("CreateBuffer index bytes={} source={}",
 		data->data.size(), static_cast<const void*>(data->data.data())));
-	ThrowIfFailed(m_device->CreateBuffer(&desc, &initial, &data->buffer), "Create index buffer");
+	HRESULT hr = m_device->CreateBuffer(&desc, &initial, &data->buffer);
+	if (hr == E_OUTOFMEMORY)
+	{
+		RecoverFromMemoryPressure("index buffer", true);
+		hr = m_device->CreateBuffer(&desc, &initial, &data->buffer);
+	}
+	if (FAILED(hr))
+	{
+		cemuLog_log(LogType::Force,
+			"D3D11 index upload skipped: CreateBuffer failed with HRESULT 0x{:08X} for {} bytes",
+			static_cast<uint32>(hr), data->data.size());
+		delete data;
+		allocation = {};
+		return;
+	}
+
+	// The immutable GPU buffer owns a driver copy after CreateBuffer returns.
+	// Keeping the decoded CPU vector in all eight LRU entries only duplicates
+	// memory and is especially expensive in the Xbox 5 GB shared budget.
+	std::vector<uint8>().swap(data->data);
+	allocation.mem = nullptr;
 }
 
 LatteQueryObject* D3D11Renderer::occlusionQuery_create() { return new D3D11Query(m_device.Get(), m_context.Get()); }

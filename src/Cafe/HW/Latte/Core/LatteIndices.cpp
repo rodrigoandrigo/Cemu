@@ -695,6 +695,17 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 	// query index buffer from renderer
 	indexAllocation = g_renderer->indexData_reserveIndexMemory(indexOutputSize);
 	void* indexOutputPtr = indexAllocation.mem;
+	if (!indexOutputPtr || !indexAllocation.rendererInternal)
+	{
+		// A renderer may reject a transient allocation under memory pressure.
+		// Treat that draw as empty instead of decoding through a null pointer and
+		// terminating the graphics thread.
+		outputCount = 0;
+		indexMax = 0;
+		renderIndexType = Renderer::INDEX_TYPE::NONE;
+		indexAllocation = {};
+		return;
+	}
 
 	// decode indices
 	indexMax = std::numeric_limits<uint32>::min();
@@ -848,6 +859,15 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 		LatteIndices_alternativeCalculateIndexMax(indexData, indexType, count, indexMax);
 	}
 	g_renderer->indexData_uploadIndexMemory(indexAllocation);
+	if (!indexAllocation.rendererInternal)
+	{
+		// Upload failure is recoverable (notably DXGI_ERROR_OUT_OF_MEMORY on
+		// memory-constrained UWP consoles). Do not insert a failed allocation in
+		// the LRU, otherwise every cache hit would permanently skip this draw.
+		outputCount = 0;
+		renderIndexType = Renderer::INDEX_TYPE::NONE;
+		return;
+	}
 	performanceMonitor.cycle[performanceMonitor.cycleIndex].indexDataUploaded += indexOutputSize;
 	// get least recently used cache entry
 	auto lruEntry = std::min_element(LatteIndexCache.entry.begin(), LatteIndexCache.entry.end(), [](const auto& a, const auto& b)

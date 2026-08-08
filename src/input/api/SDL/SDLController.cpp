@@ -82,7 +82,12 @@ bool SDLController::connect()
 		m_has_accel = SDL_SetGamepadSensorEnabled(m_controller, SDL_SENSOR_ACCEL, true);
 	if (SDL_GamepadHasSensor(m_controller, SDL_SENSOR_GYRO))
 		m_has_gyro = SDL_SetGamepadSensorEnabled(m_controller, SDL_SENSOR_GYRO, true);
-	m_has_rumble = SDL_RumbleGamepad(m_controller, 0, 0, 0);
+	// Do not probe rumble by issuing a WGI vibration call here.  On UWP this
+	// method can run outside the controller's COM apartment.  SDL already
+	// publishes the capability when the gamepad is opened.
+	m_has_rumble = SDL_GetBooleanProperty(
+		SDL_GetGamepadProperties(m_controller),
+		SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false);
 	return true;
 }
 
@@ -93,7 +98,13 @@ void SDLController::start_rumble()
 		return;
 	if (m_settings.rumble <= 0)
 		return;
+#if defined(CEMU_UWP)
+	SDLControllerProvider::QueueRumble(
+		m_diid, (Uint16)(m_settings.rumble * 0xFFFF),
+		(Uint16)(m_settings.rumble * 0xFFFF));
+#else
 	SDL_RumbleGamepad(m_controller, (Uint16)(m_settings.rumble * 0xFFFF), (Uint16)(m_settings.rumble * 0xFFFF), 5 * 1000);
+#endif
 }
 
 void SDLController::stop_rumble()
@@ -101,7 +112,11 @@ void SDLController::stop_rumble()
 	std::scoped_lock lock(m_controller_mutex);
 	if (!is_connected() || !m_has_rumble)
 		return;
+#if defined(CEMU_UWP)
+	SDLControllerProvider::QueueRumble(m_diid, 0, 0);
+#else
 	SDL_RumbleGamepad(m_controller, 0, 0, 0);
+#endif
 }
 
 MotionSample SDLController::get_motion_sample()
@@ -121,13 +136,6 @@ std::string SDLController::get_button_name(uint64 button) const
 ControllerState SDLController::raw_state()
 {
 	ControllerState result{};
-#if defined(CEMU_UWP)
-	// WGI controllers are polled through GetCurrentReading. SDL_WaitEvent()
-	// handles device arrival/removal, but it does not guarantee a fresh input
-	// sample while no window-system event is pending. Refresh the joystick
-	// snapshot at the point where Cemu performs VPADRead.
-	SDL_UpdateGamepads();
-#endif
 	std::scoped_lock lock(m_controller_mutex);
 	if (!is_connected())
 		return result;

@@ -6,6 +6,10 @@
 #include <SDL3/SDL.h>
 #include <boost/functional/hash.hpp>
 
+#if defined(CEMU_UWP)
+#include <roapi.h>
+#endif
+
 struct SDL_JoystickGUIDHash
 {
 	std::size_t operator()(const SDL_GUID& guid) const
@@ -160,6 +164,34 @@ void SDLControllerProvider::InitSDL()
 #endif
 }
 
+void SDLControllerProvider::QueueRumble(SDL_JoystickID instanceId, Uint16 lowFrequency, Uint16 highFrequency)
+{
+	if (instanceId < 0)
+		return;
+	std::scoped_lock lock(s_rumbleMutex);
+	s_pendingRumble[instanceId] = { lowFrequency, highFrequency };
+}
+
+void SDLControllerProvider::ApplyPendingRumble()
+{
+	std::unordered_map<SDL_JoystickID, std::pair<Uint16, Uint16>> pending;
+	{
+		std::scoped_lock lock(s_rumbleMutex);
+		pending.swap(s_pendingRumble);
+	}
+
+	for (const auto& [instanceId, strength] : pending)
+	{
+		if (SDL_Gamepad* gamepad = SDL_GetGamepadFromID(instanceId))
+		{
+			// Wii U patterns are refreshed continuously.  Keep a finite timeout
+			// so a suspended/removed controller cannot remain vibrating.
+			SDL_RumbleGamepad(gamepad, strength.first, strength.second,
+				(strength.first || strength.second) ? 250 : 0);
+		}
+	}
+}
+
 void SDLControllerProvider::ShutdownSDL()
 {
 	Uint32 subsystemFlags = SDL_INIT_GAMEPAD;
@@ -208,6 +240,10 @@ void SDLControllerProvider::HandleSDLEvent(SDL_Event& event)
 		}
 		case SDL_EVENT_GAMEPAD_REMOVED: /**< An opened Game controller has been removed */
 		{
+			{
+				std::scoped_lock rumbleLock(s_rumbleMutex);
+				s_pendingRumble.erase(event.gdevice.which);
+			}
 			std::scoped_lock _l(s_mutex);
 			InputManager::instance().on_device_changed();
 			s_motion_states.erase(event.gdevice.which);
@@ -316,14 +352,50 @@ void SDLControllerProvider::event_thread()
 	SetThreadName("SDL_events");
 	try
 	{
+#if defined(CEMU_UWP)
+		// SDL's WGI objects are created and updated on this worker.  A std::thread
+		// does not inherit the XAML thread's COM apartment, which is especially
+		// important when the package runs as a game on Xbox.  Keep every
+		// GetCurrentReading call on this initialized MTA instead of invoking
+		// SDL_UpdateGamepads from Cemu's input/PPC threads.
+		const HRESULT apartmentResult = RoInitialize(RO_INIT_MULTITHREADED);
+		const bool uninitializeApartment = SUCCEEDED(apartmentResult);
+		if (FAILED(apartmentResult) && apartmentResult != RPC_E_CHANGED_MODE)
+			throw std::runtime_error(fmt::format(
+				"couldn't initialize the UWP controller COM apartment: 0x{:08X}",
+				static_cast<uint32_t>(apartmentResult)));
+#endif
 		InitSDL();
 		while (s_running.load(std::memory_order_relaxed))
 		{
+#if defined(CEMU_UWP)
+			// WGI is a polling backend.  SDL_WaitEvent alone only guarantees
+			// arrival/removal delivery and used to leave polling to raw_state(),
+			// where it raced the event thread and crossed COM apartments.  A 4 ms
+			// cadence is fast enough for an Xbox controller while keeping one
+			// unambiguous owner for the WGI runtime objects.
+			SDL_UpdateGamepads();
+			SDL_Event event{};
+			while (SDL_PollEvent(&event))
+			{
+				HandleSDLEvent(event);
+				if (!s_running.load(std::memory_order_relaxed))
+					break;
+			}
+			// Process removal events before resolving an instance ID for rumble.
+			ApplyPendingRumble();
+			SDL_Delay(4);
+#else
 			SDL_Event event{};
 			SDL_WaitEvent(&event);
 			HandleSDLEvent(event);
+#endif
 		}
 		ShutdownSDL();
+#if defined(CEMU_UWP)
+		if (uninitializeApartment)
+			RoUninitialize();
+#endif
 	}
 	catch (const std::exception& error)
 	{

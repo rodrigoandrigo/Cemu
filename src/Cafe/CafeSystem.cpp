@@ -28,6 +28,8 @@
 #include "GamePatch.h"
 #include "HW/Espresso/Debugger/GDBStub.h"
 
+#include <new>
+
 #include "Cafe/IOSU/legacy/iosu_ioctl.h"
 #include "Cafe/IOSU/legacy/iosu_act.h"
 #include "Cafe/IOSU/legacy/iosu_fpd.h"
@@ -1009,6 +1011,31 @@ namespace CafeSystem
 		catch (const CemuRuntime::FatalError& error)
 		{
 			cemuLog_log(LogType::Force, "Title launch aborted: {}", error.what());
+			ShutdownTitle();
+		}
+		catch (const std::bad_alloc&)
+		{
+			// Avoid a second allocation while reporting allocator exhaustion.
+			CemuRuntime::RecordOutOfMemory();
+			ShutdownTitle();
+		}
+		catch (const std::exception& error)
+		{
+			// A backend or emulated service may report a recoverable platform
+			// failure as a normal C++ exception.  Letting it escape this detached
+			// thread invokes std::terminate and closes the entire UWP package before
+			// the embedding host can display the actual error.
+			const std::string message = fmt::format(
+				"Title thread failed: {}", error.what());
+			cemuLog_log(LogType::Force, "{}", message);
+			CemuRuntime::RecordFatalError(message);
+			ShutdownTitle();
+		}
+		catch (...)
+		{
+			const std::string message = "Title thread failed with an unknown exception";
+			cemuLog_log(LogType::Force, "{}", message);
+			CemuRuntime::RecordFatalError(message);
 			ShutdownTitle();
 		}
 	}

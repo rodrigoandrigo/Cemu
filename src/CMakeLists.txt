@@ -246,8 +246,11 @@ if(MINGW AND NOT CEMU_UWP)
 	)
 endif()
 
-if(CEMU_UWP AND MSVC AND CMAKE_SYSTEM_NAME STREQUAL "WindowsStore")
-	target_link_libraries(CemuBin PRIVATE WindowsApp d3d11 dxgi)
+if(CEMU_UWP AND MSVC)
+	# RoInitialize/RoUninitialize are used by the dedicated SDL/WGI controller
+	# thread. WindowsApp does not add their import library transitively for this
+	# DLL target on every Windows SDK/Visual Studio combination.
+	target_link_libraries(CemuBin PRIVATE WindowsApp runtimeobject d3d11 dxgi)
 endif()
 
 if(UNIX AND NOT APPLE)

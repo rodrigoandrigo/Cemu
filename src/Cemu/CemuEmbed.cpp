@@ -10,13 +10,16 @@
 #include "Cafe/TitleList/TitleList.h"
 #include "Common/CemuRuntime.h"
 #include "input/InputManager.h"
+#include "input/ControllerFactory.h"
 #include "input/api/Controller.h"
+#include "input/api/UWP/UWPGamepadController.h"
 #include "interface/WindowSystem.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <charconv>
+#include <exception>
 #include <fstream>
 #include <limits>
 #include <mutex>
@@ -131,6 +134,7 @@ struct BrokeredCopyContext {
 	const CemuEmbedBrokeredStorage& storage;
 	fs::path destination;
 	uint64_t totalBytes{};
+	size_t transferBufferSize{1024 * 1024};
 	uint64_t copiedBytes{};
 	uint64_t lastReportedBytes{};
 	std::string error;
@@ -380,9 +384,10 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 	// Broker callbacks commonly run on a thread-pool worker whose stack can be
 	// close to 1 MiB. Keep the transfer buffer on the heap so merely entering
 	// this callback cannot exhaust that stack (including directory entries).
-	// One MiB keeps callback overhead low for multi-gigabyte titles while also
-	// bounding the memory used by UWP DataReader and the destination stream.
-	std::vector<uint8_t> buffer(1024 * 1024);
+	// The caller selects the transfer size: ordinary staging and graphic packs
+	// retain the 1 MiB default, while installed titles use a larger sequential
+	// block to reduce broker and stream overhead.
+	std::vector<uint8_t> buffer(context.transferBufferSize);
 	uint64_t offset = 0;
 	while (offset < size) {
 		const uint32_t requested = static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), size - offset));
@@ -418,7 +423,8 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 
 CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHandle,
 	const CemuEmbedBrokeredStorage& storage, std::string_view stagingName,
-	bool normalizeMergedMetadata, fs::path& stagedPath, bool compactPath = false) {
+	bool normalizeMergedMetadata, fs::path& stagedPath, bool compactPath = false,
+	size_t transferBufferSize = 1024 * 1024) {
 	const fs::path cachePath = _utf8ToPath(instance->cachePath);
 	stagedPath = compactPath
 		? cachePath / stagingName
@@ -462,7 +468,7 @@ CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHan
 		ReportError(instance, CEMU_EMBED_STORAGE_FAILED, "Cemu could not create its brokered-title cache.");
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
-	BrokeredCopyContext context{storage, stagedPath, scan.totalBytes};
+	BrokeredCopyContext context{storage, stagedPath, scan.totalBytes, transferBufferSize};
 	if (storage.progress)
 		storage.progress(storage.user_data, 0, scan.totalBytes, "");
 	if (storage.enumerate_recursive(storage.user_data, folderHandle, CopyBrokeredEntry, &context) != CEMU_EMBED_OK) {
@@ -780,7 +786,12 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallTitleFromBrokeredFol
 
 	fs::path stagedPath;
 	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
-		"installing", false, stagedPath);
+		// The UWP DataReader owns an intermediate buffer in addition to Cemu's
+		// transfer buffer. Eight MiB caused long broker stalls and memory pressure
+		// on Xbox. Two MiB keeps sequential throughput high while allowing the
+		// storage service to complete each request promptly. The independent
+		// 1 MiB graphic-pack import path is intentionally unchanged.
+		"installing", false, stagedPath, false, 2 * 1024 * 1024);
 	if (stageResult != CEMU_EMBED_OK)
 		return stageResult;
 	const auto installResult = InstallTitleFromStaging(instance, stagedPath,
@@ -1090,6 +1101,58 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile
 	*profileReady = 0;
 	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
 		return CEMU_EMBED_INVALID_STATE;
+#if defined(CEMU_UWP)
+	// On Xbox, WGI objects are apartment-affine. Do not ask SDL to open a WGI
+	// controller from Cemu's worker thread; the host publishes a plain state
+	// snapshot instead. This also replaces stale desktop SDL profiles.
+	if (UWPGamepadController::IsHostGamepadConnected()) {
+		try {
+		auto& input = InputManager::instance();
+		auto emulated = input.get_controller(0);
+		std::shared_ptr<ControllerBase> controller;
+		if (emulated) {
+			for (const auto& configured : emulated->get_controllers()) {
+				if (configured && configured->api() == InputAPI::WGIGamepad) {
+					controller = configured;
+					break;
+				}
+			}
+		}
+		if (!controller) {
+			// Build a complete replacement before publishing it to InputManager.
+			// Mutating an active EmulatedController in place can race the 1 ms
+			// input update thread on Xbox and caused crashes when a game first
+			// consumed controller input.
+			auto replacement = ControllerFactory::CreateEmulatedController(
+				0, EmulatedController::Type::VPAD);
+			if (!replacement)
+				return CEMU_EMBED_INITIALIZATION_FAILED;
+			controller = std::make_shared<UWPGamepadController>();
+			replacement->add_controller(controller);
+			if (!replacement->set_default_mapping(controller))
+				return CEMU_EMBED_INITIALIZATION_FAILED;
+			input.set_controller(replacement);
+			if (!input.save(0))
+				cemuLog_log(LogType::Force, "Could not save the host Xbox GamePad profile");
+			input.on_device_changed();
+			cemuLog_log(LogType::Force,
+				"Configured the host Xbox GamePad profile safely without SDL/WGI cross-thread access");
+		}
+		*profileReady = controller->is_connected() ? 1 : 0;
+		return CEMU_EMBED_OK;
+		}
+		catch (const std::exception& exception) {
+			cemuLog_log(LogType::Force,
+				"Could not configure the host Xbox GamePad profile: {}", exception.what());
+			return CEMU_EMBED_INITIALIZATION_FAILED;
+		}
+		catch (...) {
+			cemuLog_log(LogType::Force,
+				"Could not configure the host Xbox GamePad profile due to an unknown error");
+			return CEMU_EMBED_INITIALIZATION_FAILED;
+		}
+	}
+#endif
 #ifdef HAS_SDL
 	auto& input = InputManager::instance();
 	auto emulated = input.get_controller(0);
@@ -1150,6 +1213,16 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile
 #endif
 	return CEMU_EMBED_OK;
 }
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetHostGamepadState(
+	CemuEmbedInstance* instance, const CemuEmbedGamepadState* state) {
+	if (!instance || !state || state->struct_size < sizeof(CemuEmbedGamepadState) ||
+		state->abi_version != CEMU_EMBED_GAMEPAD_VERSION)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	UWPGamepadController::SetHostState(state->connected != 0, state->buttons,
+		state->left_x, state->left_y, state->right_x, state->right_y,
+		state->left_trigger, state->right_trigger);
+	return CEMU_EMBED_OK;
+}
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
 	CemuEmbedInstance* instance, int32_t x, int32_t y,
 	int32_t leftDown, int32_t enabled) {
@@ -1165,6 +1238,13 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance) {
 	if (!instance) return CEMU_EMBED_INVALID_ARGUMENT;
+	if (CemuRuntime::HasOutOfMemory()) {
+		ReportError(instance, CEMU_EMBED_INITIALIZATION_FAILED,
+			"Cemu exhausted the Xbox shared memory budget while running the title.");
+		SetState(instance, CEMU_EMBED_STATE_FAILED);
+		CemuRuntime::ClearFatalError();
+		return CEMU_EMBED_INITIALIZATION_FAILED;
+	}
 	if (CemuRuntime::HasFatalError()) {
 		const auto message = CemuRuntime::GetFatalError();
 		ReportError(instance, CEMU_EMBED_INITIALIZATION_FAILED, message.c_str());

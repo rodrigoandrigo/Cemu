@@ -134,6 +134,18 @@ namespace H264
 			coreinit::OSSignalEvent(m_displayQueueEvt);
 		}
 
+		void PushNoFrameResult(DecodedSlice& decodedSlice)
+		{
+			std::unique_lock _l(m_decodeQueueMtx);
+			if (decodedSlice.result.isDecoded)
+				return;
+			decodedSlice.result.isDecoded = true;
+			decodedSlice.result.hasFrame = false;
+			m_displayQueue.push_back((uint32)std::distance(m_decodedSliceArray.data(), &decodedSlice));
+			_l.unlock();
+			coreinit::OSSignalEvent(m_displayQueueEvt);
+		}
+
 		// called from async worker thread
 		void Decode(DecodedSlice& decodedSlice)
 		{
@@ -143,15 +155,23 @@ namespace H264
 				if (!DetermineBufferSizes(decodedSlice.dataToDecode.m_data, decodedSlice.dataToDecode.m_length, numByteConsumed))
 				{
 					cemuLog_log(LogType::Force, "H264AVC: Unable to determine picture size. Ignoring decode input");
-					std::unique_lock _l(m_decodeQueueMtx);
-					decodedSlice.result.isDecoded = true;
-					decodedSlice.result.hasFrame = false;
-					coreinit::OSSignalEvent(m_displayQueueEvt);
+					PushNoFrameResult(decodedSlice);
+					return;
+				}
+				if (numByteConsumed > decodedSlice.dataToDecode.m_length)
+				{
+					cemuLog_log(LogType::Force, "H264AVC: Header decode reported an invalid consumed-byte count");
+					PushNoFrameResult(decodedSlice);
 					return;
 				}
 				decodedSlice.dataToDecode.m_length -= numByteConsumed;
 				decodedSlice.dataToDecode.m_data = (uint8*)decodedSlice.dataToDecode.m_data + numByteConsumed;
 				m_hasBufferSizeInfo = true;
+			}
+			if (decodedSlice.dataToDecode.m_length == 0)
+			{
+				PushNoFrameResult(decodedSlice);
+				return;
 			}
 
 			ivd_video_decode_ip_t s_dec_ip{ 0 };
@@ -170,6 +190,7 @@ namespace H264
 			s_dec_ip.s_out_buffer.u4_min_out_buf_size[0] = 0;
 			s_dec_ip.s_out_buffer.u4_min_out_buf_size[1] = 0;
 			s_dec_ip.s_out_buffer.u4_num_bufs = 0;
+			const uint32 inputLength = decodedSlice.dataToDecode.m_length;
 
 			BenchmarkTimer bt;
 			bt.Start();
@@ -186,18 +207,19 @@ namespace H264
 			else if (status != 0)
 			{
 				cemuLog_log(LogType::Force, "H264: Failed to decode frame (error 0x{:08x})", status);
-				decodedSlice.result.hasFrame = false;
-				cemu_assert_unimplemented();
+				PushNoFrameResult(decodedSlice);
 				return;
 			}
 
 			bt.Stop();
 			double decodeTime = bt.GetElapsedMilliseconds();
 
-			cemu_assert(s_dec_op.u4_frame_decoded_flag);
-			cemu_assert_debug(s_dec_op.u4_num_bytes_consumed == decodedSlice.dataToDecode.m_length);
-
-			cemu_assert_debug(m_isBufferedMode || s_dec_op.u4_output_present); // if buffered mode is disabled, then every input should output a frame (except for partial slices?)
+			if (s_dec_op.u4_num_bytes_consumed == 0 || s_dec_op.u4_num_bytes_consumed > inputLength)
+			{
+				cemuLog_log(LogType::Force, "H264: Decoder consumed {} bytes from a {}-byte input", s_dec_op.u4_num_bytes_consumed, inputLength);
+				PushNoFrameResult(decodedSlice);
+				return;
+			}
 
 			if (s_dec_op.u4_output_present)
 			{
@@ -241,6 +263,20 @@ namespace H264
 
 			if (s_dec_op.u4_frame_decoded_flag)
 				m_numDecodedFrames++;
+
+			// ih264d may consume only a NAL prefix or a single slice at a time.
+			// Continue with the unconsumed bytes instead of asserting that one API
+			// call must consume the complete input access unit.
+			if (s_dec_op.u4_num_bytes_consumed < inputLength)
+			{
+				decodedSlice.dataToDecode.m_data = (uint8*)decodedSlice.dataToDecode.m_data + s_dec_op.u4_num_bytes_consumed;
+				decodedSlice.dataToDecode.m_length -= s_dec_op.u4_num_bytes_consumed;
+				Decode(decodedSlice);
+				return;
+			}
+
+			if (!s_dec_op.u4_output_present)
+				PushNoFrameResult(decodedSlice);
 			// get VUI
 			//ih264d_ctl_get_vui_params_ip_t s_ctl_get_vui_params_ip;
 			//ih264d_ctl_get_vui_params_op_t s_ctl_get_vui_params_op;
@@ -464,7 +500,10 @@ namespace H264
 
 			ps_ctl_ip->u4_disp_wd = 0;
 			ps_ctl_ip->e_frm_skip_mode = IVD_SKIP_NONE;
-			ps_ctl_ip->e_frm_out_mode = m_isBufferedMode ? IVD_DISPLAY_FRAME_OUT : IVD_DECODE_FRAME_OUT;
+			// The display-frame mode can delay output and leave a synchronous Wii U
+			// H.264 call waiting forever. Decode-frame output is the mode expected
+			// by the emulated API for both buffered and non-buffered sessions.
+			ps_ctl_ip->e_frm_out_mode = IVD_DECODE_FRAME_OUT;
 			ps_ctl_ip->e_vid_dec_mode = headerDecodeOnly ? IVD_DECODE_HEADER : IVD_DECODE_FRAME;
 			ps_ctl_ip->e_cmd = IVD_CMD_VIDEO_CTL;
 			ps_ctl_ip->e_sub_cmd = IVD_CMD_CTL_SETPARAMS;

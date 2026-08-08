@@ -8,6 +8,7 @@
 #include "input/api/Keyboard/KeyboardController.h"
 #include "input/api/DSU/DSUController.h"
 #include "input/api/GameCube/GameCubeController.h"
+#include "input/api/UWP/UWPGamepadController.h"
 
 #if HAS_XINPUT
 #include "input/api/XInput/XInputController.h"
@@ -107,13 +108,11 @@ ControllerPtr ControllerFactory::CreateController(InputAPI::Type api, std::strin
 			return std::make_shared<NativeWiimoteController>(index);
 		}
 #endif
+	case InputAPI::WGIGamepad:
+		return std::make_shared<UWPGamepadController>();
 	default:
 		throw std::invalid_argument(fmt::format("unhandled controller api: {}", api));
 	}
-	/*
-	case InputAPI::WGIGamepad: break;
-	case InputAPI::WGIRawController: break;
-	*/
 }
 
 EmulatedControllerPtr

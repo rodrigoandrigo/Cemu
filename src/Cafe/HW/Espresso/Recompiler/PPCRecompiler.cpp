@@ -20,6 +20,8 @@
 #endif
 #include "util/highresolutiontimer/HighResolutionTimer.h"
 
+#include <new>
+
 #define PPCREC_FORCE_SYNCHRONOUS_COMPILATION	0 // if 1, then function recompilation will block and execute on the thread that called PPCRecompiler_visitAddressNoBlock
 #define PPCREC_LOG_RECOMPILATION_RESULTS		0
 
@@ -450,7 +452,7 @@ void PPCRecompiler_recompileAtAddress(uint32 address)
 	PPCRecompiler_makeRecompiledFunctionActive(address, range, func, functionEntryPoints);
 }
 
-void PPCRecompiler_thread()
+void PPCRecompiler_threadImpl()
 {
 	SetThreadName("PPCRecompiler");
 #if PPCREC_FORCE_SYNCHRONOUS_COMPILATION
@@ -490,6 +492,22 @@ void PPCRecompiler_thread()
 			if(s_ppcRecompilerState.workerThreadStopSignal)
 				return;
 		}
+	}
+}
+
+void PPCRecompiler_thread()
+{
+	try
+	{
+		PPCRecompiler_threadImpl();
+	}
+	catch (const std::bad_alloc&)
+	{
+		// This worker is an optimization. If Xbox exhausts its shared memory
+		// budget while compiling a new PPC function, leave the already compiled
+		// code active and let uncompiled functions use the normal interpreter
+		// fallback. Propagating from std::thread would terminate the whole title.
+		s_ppcRecompilerState.workerThreadStopSignal = true;
 	}
 }
 

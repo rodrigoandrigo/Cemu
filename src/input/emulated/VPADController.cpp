@@ -637,6 +637,26 @@ bool VPADController::set_default_mapping(const std::shared_ptr<ControllerBase>& 
 		break;
 	}
 #endif
+	case InputAPI::WGIGamepad:
+		// The host normalizes Windows.Gaming.Input into SDL-style button slots.
+		// Keeping the mapping identical to an Xbox SDL controller makes a saved
+		// profile portable between the desktop and Xbox UWP host.
+		mapping =
+		{
+			{kButtonId_A, kButton1}, {kButtonId_B, kButton0},
+			{kButtonId_X, kButton3}, {kButtonId_Y, kButton2},
+			{kButtonId_L, kButton9}, {kButtonId_R, kButton10},
+			{kButtonId_ZL, kTriggerXP}, {kButtonId_ZR, kTriggerYP},
+			{kButtonId_Plus, kButton6}, {kButtonId_Minus, kButton4},
+			{kButtonId_Up, kButton11}, {kButtonId_Down, kButton12},
+			{kButtonId_Left, kButton13}, {kButtonId_Right, kButton14},
+			{kButtonId_StickL, kButton7}, {kButtonId_StickR, kButton8},
+			{kButtonId_StickL_Up, kAxisYP}, {kButtonId_StickL_Down, kAxisYN},
+			{kButtonId_StickL_Left, kAxisXN}, {kButtonId_StickL_Right, kAxisXP},
+			{kButtonId_StickR_Up, kRotationYP}, {kButtonId_StickR_Down, kRotationYN},
+			{kButtonId_StickR_Left, kRotationXN}, {kButtonId_StickR_Right, kRotationXP},
+		};
+		break;
 	case InputAPI::XInput:
 	{
 		mapping =
