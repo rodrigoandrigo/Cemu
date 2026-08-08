@@ -791,7 +791,7 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallTitleFromBrokeredFol
 		// on Xbox. Two MiB keeps sequential throughput high while allowing the
 		// storage service to complete each request promptly. The independent
 		// 1 MiB graphic-pack import path is intentionally unchanged.
-		"installing", false, stagedPath, false, 2 * 1024 * 1024);
+		"installing", false, stagedPath, false, 4 * 1024 * 1024);
 	if (stageResult != CEMU_EMBED_OK)
 		return stageResult;
 	const auto installResult = InstallTitleFromStaging(instance, stagedPath,
