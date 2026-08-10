@@ -14,6 +14,11 @@
 #include "util/SystemInfo/SystemInfo.h"
 
 #include <cinttypes>
+#include <atomic>
+
+// -1 follows the desktop configuration, 0 forces metrics off and 1 forces the
+// embedded-host preset on. Desktop builds never activate the override.
+static std::atomic_int s_hostPerformanceMetricsMode{ -1 };
 
 struct OverlayStats
 {
@@ -71,6 +76,9 @@ const float kBackgroundAlpha = 0.65f;
 void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 direction, float fontSize, bool pad)
 {
 	auto& config = GetConfig();
+	const int hostMode = s_hostPerformanceMetricsMode.load(std::memory_order_acquire);
+	const bool hostControlsMetrics = hostMode >= 0;
+	const bool hostMetrics = hostMode > 0;
 
 	const auto font = ImGui_GetFont(fontSize);
 	ImGui::PushFont(font);
@@ -78,22 +86,22 @@ void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 directio
 	const ImVec4 color = ImGui::ColorConvertU32ToFloat4(config.overlay.text_color);
 	ImGui::PushStyleColor(ImGuiCol_Text, color);
 	// stats overlay
-	if (config.overlay.fps || config.overlay.drawcalls || config.overlay.cpu_usage || config.overlay.cpu_per_core_usage || config.overlay.ram_usage)
+	if (hostMetrics || (!hostControlsMetrics && (config.overlay.fps || config.overlay.drawcalls || config.overlay.cpu_usage || config.overlay.cpu_per_core_usage || config.overlay.ram_usage)))
 	{
 		ImGui::SetNextWindowPos(position, ImGuiCond_Always, pivot);
 		ImGui::SetNextWindowBgAlpha(kBackgroundAlpha);
 		if (ImGui::Begin("Stats overlay", nullptr, kPopupFlags))
 		{
-			if (config.overlay.fps)
+			if (hostMetrics || (!hostControlsMetrics && config.overlay.fps))
 				ImGui::Text("FPS: %.2lf", g_state.fps);
 
-			if (config.overlay.drawcalls)
+			if (hostMetrics || (!hostControlsMetrics && config.overlay.drawcalls))
 				ImGui::Text("Draws/f: %d (fast: %d)", g_state.draw_calls_per_frame, g_state.fast_draw_calls_per_frame);
 
-			if (config.overlay.cpu_usage)
+			if (hostMetrics || (!hostControlsMetrics && config.overlay.cpu_usage))
 				ImGui::Text("CPU: %.2lf%%", g_state.cpu_usage);
 
-			if (config.overlay.cpu_per_core_usage)
+			if (!hostControlsMetrics && config.overlay.cpu_per_core_usage)
 			{
 				for (sint32 i = 0; i < g_state.processor_count; ++i)
 				{
@@ -101,13 +109,13 @@ void LatteOverlay_renderOverlay(ImVec2& position, ImVec2& pivot, sint32 directio
 				}
 			}
 
-			if (config.overlay.ram_usage)
+			if (hostMetrics || (!hostControlsMetrics && config.overlay.ram_usage))
 				ImGui::Text("RAM: %dMB", g_state.ram_usage);
 
-			if(config.overlay.vram_usage && g_state.vramUsage != -1 && g_state.vramTotal != -1)
+			if((hostMetrics || (!hostControlsMetrics && config.overlay.vram_usage)) && g_state.vramUsage != -1 && g_state.vramTotal != -1)
 				ImGui::Text("VRAM: %dMB / %dMB", g_state.vramUsage, g_state.vramTotal);
 
-			if (config.overlay.debug)
+			if (!hostControlsMetrics && config.overlay.debug)
 			{
 				// general debug info
 				ImGui::Text("--- Debug info ---");
@@ -517,7 +525,11 @@ void LatteOverlay_translateScreenPosition(ScreenPosition pos, const Vector2f& wi
 void LatteOverlay_render(bool pad_view)
 {
 	const auto& config = GetConfig();
-	if(config.overlay.position == ScreenPosition::kDisabled && config.notification.position == ScreenPosition::kDisabled)
+	const int hostMode = s_hostPerformanceMetricsMode.load(std::memory_order_acquire);
+	const auto overlayPosition = hostMode >= 0
+		? (hostMode > 0 ? ScreenPosition::kTopRight : ScreenPosition::kDisabled)
+		: config.overlay.position;
+	if(overlayPosition == ScreenPosition::kDisabled && config.notification.position == ScreenPosition::kDisabled)
 		return;
 
 	sint32 w = 0, h = 0;
@@ -547,16 +559,16 @@ void LatteOverlay_render(bool pad_view)
 	ImVec2 position{}, pivot{};
 	sint32 direction{};
 
-	if (config.overlay.position != ScreenPosition::kDisabled)
+	if (overlayPosition != ScreenPosition::kDisabled)
 	{
-		LatteOverlay_translateScreenPosition(config.overlay.position, window_size, position, pivot, direction);
+		LatteOverlay_translateScreenPosition(overlayPosition, window_size, position, pivot, direction);
 		LatteOverlay_renderOverlay(position, pivot, direction, overlayFontSize, pad_view);
 	}
 	
 
 	if (config.notification.position != ScreenPosition::kDisabled)
 	{
-		if(config.overlay.position != config.notification.position)
+		if(overlayPosition != config.notification.position)
 			LatteOverlay_translateScreenPosition(config.notification.position, window_size, position, pivot, direction);
 
 		LatteOverlay_RenderNotifications(position, pivot, direction, notificationsFontSize, pad_view);
@@ -565,7 +577,7 @@ void LatteOverlay_render(bool pad_view)
 
 void LatteOverlay_init()
 {
-	g_state.processor_count = GetProcessorCount();
+	g_state.processor_count = (std::max)(static_cast<int>(GetProcessorCount()), 1);
 
 	g_state.processor_times.resize(g_state.processor_count);
 	g_state.cpu_per_core.resize(g_state.processor_count);
@@ -599,18 +611,32 @@ static void UpdateStats_CpuPerCore()
 
 void LatteOverlay_updateStats(double fps, sint32 drawcalls, sint32 fastDrawcalls)
 {
-	if (GetConfig().overlay.position == ScreenPosition::kDisabled)
+	const int hostMode = s_hostPerformanceMetricsMode.load(std::memory_order_acquire);
+	if (hostMode == 0 ||
+		(hostMode < 0 && GetConfig().overlay.position == ScreenPosition::kDisabled))
 		return;
+	// The embedded frontend has no wxApp startup path. Keep this defensive
+	// guard so a future embedded caller cannot consume uninitialized vectors.
+	if (g_state.processor_count <= 0 ||
+		g_state.processor_times.size() != static_cast<size_t>(g_state.processor_count) ||
+		g_state.cpu_per_core.size() != static_cast<size_t>(g_state.processor_count))
+		LatteOverlay_init();
 
 	g_state.fps = fps;
 	g_state.draw_calls_per_frame = drawcalls;
 	g_state.fast_draw_calls_per_frame = fastDrawcalls;
 	UpdateStats_CemuCpu();
-	UpdateStats_CpuPerCore();
+	if (hostMode < 0 && GetConfig().overlay.cpu_per_core_usage)
+		UpdateStats_CpuPerCore();
 
 	// update ram
 	g_state.ram_usage = (QueryRamUsage() / 1000) / 1000;
 
 	// update vram
 	g_renderer->GetVRAMInfo(g_state.vramUsage, g_state.vramTotal);
+}
+
+void LatteOverlay_setHostPerformanceMetrics(bool enabled)
+{
+	s_hostPerformanceMetricsMode.store(enabled ? 1 : 0, std::memory_order_release);
 }

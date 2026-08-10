@@ -7,6 +7,7 @@
 #include "Cafe/CafeSystem.h"
 #include "Cafe/Account/Account.h"
 #include "Cafe/GraphicPack/GraphicPack2.h"
+#include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/TitleList/TitleList.h"
 #include "Common/CemuRuntime.h"
 #include "input/InputManager.h"
@@ -138,6 +139,9 @@ struct BrokeredCopyContext {
 	uint64_t copiedBytes{};
 	uint64_t lastReportedBytes{};
 	std::string error;
+	std::vector<uint8_t> transferBuffer;
+	bool usedDirectCopy{};
+	bool usedBufferedCopy{};
 };
 
 struct BrokeredScanContext {
@@ -370,7 +374,22 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 		context.error = "Cemu could not create a brokered-title parent directory.";
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
+	if (context.storage.copy_file &&
+		context.storage.copy_file(context.storage.user_data, fileHandle,
+			_pathToUtf8(destination).c_str()) == CEMU_EMBED_OK) {
+		context.copiedBytes += size;
+		context.usedDirectCopy = true;
+		if (context.storage.progress &&
+			(context.copiedBytes == context.totalBytes ||
+				context.copiedBytes - context.lastReportedBytes >= 64ull * 1024 * 1024)) {
+			context.lastReportedBytes = context.copiedBytes;
+			context.storage.progress(context.storage.user_data, context.copiedBytes,
+				context.totalBytes, relativePathUtf8);
+		}
+		return CEMU_EMBED_OK;
+	}
 	void* stream = nullptr;
+	context.usedBufferedCopy = true;
 	if (context.storage.open_read(context.storage.user_data, fileHandle, &stream) != CEMU_EMBED_OK || !stream) {
 		context.error = "The broker could not open a title file for reading.";
 		return CEMU_EMBED_STORAGE_FAILED;
@@ -387,7 +406,9 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 	// The caller selects the transfer size: ordinary staging and graphic packs
 	// retain the 1 MiB default, while installed titles use a larger sequential
 	// block to reduce broker and stream overhead.
-	std::vector<uint8_t> buffer(context.transferBufferSize);
+	auto& buffer = context.transferBuffer;
+	if (buffer.size() != context.transferBufferSize)
+		buffer.resize(context.transferBufferSize);
 	uint64_t offset = 0;
 	while (offset < size) {
 		const uint32_t requested = static_cast<uint32_t>(std::min<uint64_t>(buffer.size(), size - offset));
@@ -471,17 +492,28 @@ CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHan
 	BrokeredCopyContext context{storage, stagedPath, scan.totalBytes, transferBufferSize};
 	if (storage.progress)
 		storage.progress(storage.user_data, 0, scan.totalBytes, "");
+	const auto copyStart = std::chrono::steady_clock::now();
 	if (storage.enumerate_recursive(storage.user_data, folderHandle, CopyBrokeredEntry, &context) != CEMU_EMBED_OK) {
 		fs::remove_all(stagedPath, error);
 		ReportError(instance, CEMU_EMBED_STORAGE_FAILED, context.error.empty() ? "The broker could not enumerate the selected title folder." : context.error.c_str());
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
+	const auto copySeconds = std::chrono::duration<double>(
+		std::chrono::steady_clock::now() - copyStart).count();
+	const double copiedMiB = static_cast<double>(context.copiedBytes) / (1024.0 * 1024.0);
+	const char* copyMode = context.usedDirectCopy
+		? (context.usedBufferedCopy ? "mixed direct/buffered" : "platform direct")
+		: "buffered fallback";
 	if (context.copiedBytes != scan.totalBytes) {
 		fs::remove_all(stagedPath, error);
 		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
 			"The selected title changed while it was being staged.");
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
+	cemuLog_log(LogType::Force,
+		"Brokered staging complete: {:.1f} MiB in {:.2f}s ({:.1f} MiB/s, {})",
+		copiedMiB, copySeconds, copySeconds > 0.0 ? copiedMiB / copySeconds : 0.0,
+		copyMode);
 	if (normalizeMergedMetadata) {
 		std::string normalizationError;
 		const auto normalizationResult = NormalizeMergedTitleMetadata(stagedPath, normalizationError);
@@ -693,6 +725,10 @@ void Initialize(CemuEmbedInstance* instance) {
 		cemuLog_setCallbacks(&instance->loggingCallbacks);
 		instance->loggingCallbacksInstalled.store(true, std::memory_order_release);
 		cemuLog_createLogFile(false);
+		// Embedded hosts own the session overlay state through the ABI. Start
+		// hidden even if a desktop settings.xml enabled the overlay previously.
+		LatteOverlay_init();
+		LatteOverlay_setHostPerformanceMetrics(false);
 		CemuCommonInit(true);
 		instance->initialized.store(true, std::memory_order_release);
 		SetState(instance, instance->state.load(std::memory_order_acquire) == CEMU_EMBED_STATE_STOPPING ? CEMU_EMBED_STATE_STOPPED : CEMU_EMBED_STATE_READY);
@@ -788,7 +824,7 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallTitleFromBrokeredFol
 	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
 		// The UWP DataReader owns an intermediate buffer in addition to Cemu's
 		// transfer buffer. Eight MiB caused long broker stalls and memory pressure
-		// on Xbox. Two MiB keeps sequential throughput high while allowing the
+		// on Xbox. Four MiB keeps sequential throughput high while allowing the
 		// storage service to complete each request promptly. The independent
 		// 1 MiB graphic-pack import path is intentionally unchanged.
 		"installing", false, stagedPath, false, 4 * 1024 * 1024);
@@ -1234,6 +1270,16 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
 		enabled != 0,
 		{ (std::max)(x, 0), (std::max)(y, 0) },
 		leftDown != 0);
+	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetPerformanceMetrics(
+	CemuEmbedInstance* instance, int32_t enabled) {
+	if (!instance)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+
+	LatteOverlay_setHostPerformanceMetrics(enabled != 0);
 	return CEMU_EMBED_OK;
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance) {

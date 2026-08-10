@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define CEMU_EMBED_ABI_VERSION 1u
-#define CEMU_EMBED_BROKERED_STORAGE_VERSION 2u
+#define CEMU_EMBED_BROKERED_STORAGE_VERSION 3u
 #define CEMU_EMBED_D3D11_SURFACE_VERSION 1u
 #define CEMU_EMBED_LIBRARY_VERSION 2u
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
@@ -121,6 +121,12 @@ typedef void (CEMU_EMBED_CALL *CemuEmbedBrokeredCloseCallback)(void* user_data, 
 typedef void (CEMU_EMBED_CALL *CemuEmbedBrokeredProgressCallback)(
 	void* user_data, uint64_t bytes_copied, uint64_t total_bytes,
 	const char* relative_path_utf8);
+// Optional direct-copy fast path in version 3. The host may use its brokered
+// StorageFile handle to let the platform storage service copy directly into
+// the app-owned destination. Returning anything other than OK makes Cemu use
+// the open/read fallback for that file.
+typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedBrokeredCopyFileCallback)(
+	void* user_data, void* file_handle, const char* destination_path_utf8);
 
 typedef struct CemuEmbedBrokeredStorage {
 	uint32_t struct_size;
@@ -133,6 +139,8 @@ typedef struct CemuEmbedBrokeredStorage {
 	// Optional in version 2. Called periodically on the thread performing the
 	// synchronous staging operation.
 	CemuEmbedBrokeredProgressCallback progress;
+	// Optional in version 3. Avoids routing the full file through ABI buffers.
+	CemuEmbedBrokeredCopyFileCallback copy_file;
 } CemuEmbedBrokeredStorage;
 
 typedef enum CemuEmbedInstallType {
@@ -233,6 +241,10 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetHostGamepadState(
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
 	CemuEmbedInstance* instance, int32_t x, int32_t y,
 	int32_t left_down, int32_t enabled);
+// Shows or hides Cemu's native performance overlay. The embedded preset uses
+// the top-right corner and reports FPS, draw calls, CPU, RAM and VRAM.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetPerformanceMetrics(
+	CemuEmbedInstance* instance, int32_t enabled);
 // Non-blocking: call this from the host dispatcher. It never creates wxEntry.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance);
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RequestStop(CemuEmbedInstance* instance);
