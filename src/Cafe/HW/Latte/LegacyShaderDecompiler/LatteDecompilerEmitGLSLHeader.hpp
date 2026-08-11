@@ -550,7 +550,30 @@ namespace LatteDecompiler
 			}
 			else
 			{
-				sint32 locationOffset = 0; // glslang wants a location for xfb outputs
+				// Transform-feedback outputs share the same location namespace as the
+				// ordinary outputs of this shader stage. Starting every XFB block at
+				// zero aliases VS varyings, VS-to-GS ring parameters or GS-to-PS
+				// varyings and makes glslang reject otherwise valid shaders with
+				// "overlapping use of location". Place XFB data after the highest
+				// regular output location instead.
+				uint32 locationOffset = 0;
+				if (decompilerContext->shaderType == LatteConst::ShaderType::Vertex)
+				{
+					if (decompilerContext->options->usesGeometryShader)
+						locationOffset = decompilerContext->shader->ringParameterCount;
+					else
+						locationOffset = static_cast<uint32>(LatteSHRC_GetPSInputTable()->count);
+				}
+				else if (decompilerContext->shaderType == LatteConst::ShaderType::Geometry)
+				{
+					for (sint32 p = 0; p < decompilerContext->parsedGSCopyShader->numParam; ++p)
+					{
+						const auto& mapping = decompilerContext->parsedGSCopyShader->paramMapping[p];
+						if (mapping.exportType == 2)
+							locationOffset = (std::max)(locationOffset,
+								static_cast<uint32>((mapping.exportParam & 0x7F) + 1));
+					}
+				}
 				for (uint32 i = 0; i < LATTE_NUM_STREAMOUT_BUFFER; i++)
 				{
 					if (!decompilerContext->output->streamoutBufferWriteMask[i])

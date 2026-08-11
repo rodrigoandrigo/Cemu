@@ -837,6 +837,15 @@ bool InputManager::is_valid_profilename(const std::string& name)
 
 glm::ivec2 InputManager::get_mouse_position(bool pad_window) const
 {
+	// The embedded UWP host owns the pointer while virtual capture is active.
+	// ImGui (including swkbd) reads the cursor through this function, so the
+	// virtual position must take precedence over the stale physical mouse.
+	if (m_virtual_mouse_capture.load(std::memory_order_acquire))
+	{
+		std::shared_lock lock(m_virtual_mouse.m_mutex);
+		return m_virtual_mouse.position;
+	}
+
 	if (pad_window)
 	{
 		std::shared_lock lock(m_pad_mouse.m_mutex);

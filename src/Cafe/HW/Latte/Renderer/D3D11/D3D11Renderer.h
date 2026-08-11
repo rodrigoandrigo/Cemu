@@ -70,7 +70,6 @@ public:
 	void buffer_bindUniformBuffer(LatteConst::ShaderType, uint32, uint32, uint32) override;
 	RendererShader* shader_create(RendererShader::ShaderType, uint64, uint64,
 		const std::string&, bool, bool) override;
-	bool shader_creation_failed_temporary() const override;
 	void streamout_setupXfbBuffer(uint32, sint32, uint32, uint32) override;
 	void streamout_begin() override;
 	void streamout_rendererFinishDrawcall() override;
@@ -113,8 +112,9 @@ private:
 	void RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache);
 	void CheckMemoryPressure();
 	bool WaitForGpuIdle();
+	bool CheckDeviceHealth(const char* operation);
+	void RecordDeviceLost(HRESULT result, const char* operation);
 	uint64 QueryProcessCommitBytes() const;
-	uint64 BuildCurrentPipelineKey() const;
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
 	Microsoft::WRL::ComPtr<ID3D11Device1> m_device1;
@@ -170,19 +170,24 @@ private:
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11BlendState>> m_blendCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> m_depthStencilCache;
 	std::unordered_map<uint64, std::unique_ptr<RendererShader>> m_rectShaderCache;
-	std::unordered_set<uint64> m_warmedPipelineKeys;
-	std::unordered_set<uint64> m_deferredPipelineKeys;
 	std::unordered_set<uint32> m_reportedDebugWarnings;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> m_feedbackResources;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> m_feedbackViews;
 	uint64 m_inputLayoutKey{};
 	uint64 m_indexUploadCount{};
 	uint64 m_indexRingWrapCount{};
+	uint64 m_lastVertexShaderBase{};
+	uint64 m_lastVertexShaderAux{};
+	uint64 m_lastPixelShaderBase{};
+	uint64 m_lastPixelShaderAux{};
+	uint64 m_lastGeometryShaderBase{};
+	uint64 m_lastGeometryShaderAux{};
 	UINT m_indexRingCapacity{};
 	UINT m_indexRingOffset{};
 	UINT m_bufferCopyScratchCapacity{};
 	uint32 m_memoryCheckFrame{};
 	std::atomic<uint32> m_compiledShaderCount{};
+	std::atomic_bool m_deviceLost{};
 	bool m_memoryPressureActive{};
 	std::atomic_bool m_shaderCompilationBlocked{};
 	bool m_inputLayoutKeyValid{};

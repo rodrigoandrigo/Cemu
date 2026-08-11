@@ -134,10 +134,6 @@ public:
 
 	// shader
 	virtual RendererShader* shader_create(RendererShader::ShaderType type, uint64 baseHash, uint64 auxHash, const std::string& source, bool compileAsync, bool isGfxPackSource) = 0;
-	// A renderer can reject a shader temporarily (for example to preserve a
-	// constrained process-memory budget). The common shader cache must not turn
-	// that deferral into a permanent invalid-shader entry.
-	virtual bool shader_creation_failed_temporary() const { return false; }
 
 	// streamout
 	virtual void streamout_setupXfbBuffer(uint32 bufferIndex, sint32 ringBufferOffset, uint32 rangeAddr, uint32 rangeSize) = 0;

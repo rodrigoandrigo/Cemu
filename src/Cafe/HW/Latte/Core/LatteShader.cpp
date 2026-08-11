@@ -375,17 +375,7 @@ void LatteShader_CreateRendererShader(LatteDecompilerShader* shader, bool compil
 	// create shader
 	shader->shader = g_renderer->shader_create(shaderType, shader->baseHash, shader->auxHash, shaderSrc, true, shader->isCustomShader);
 	if (shader->shader == nullptr)
-	{
-		if (g_renderer->shader_creation_failed_temporary())
-		{
-			// Preserve the decompiler output so a memory-budget deferral can be
-			// retried. Marking it as an error here permanently poisons both the
-			// individual shader cache and every combined state that references it.
-			shader->hasError = false;
-			return;
-		}
 		shader->hasError = true;
-	}
 	// after renderer shader creation we can throw away any intermediate info
 	LatteShader_CleanupAfterCompile(shader);
 }
@@ -980,8 +970,6 @@ LatteDecompilerShader* LatteSHRC_GetOrCreateVertexShader(uint8* vertexShaderPtr,
 	}
 	if (!vertexShader)
 		vertexShader = LatteShader_CompileSeparableVertexShader(_shaderBaseHash_vs, vsAuxHash, vertexShaderPtr, vertexShaderSize, usesGeometryShader, fetchShader);
-	else if (!vertexShader->shader && !vertexShader->hasError)
-		LatteShader_CreateRendererShader(vertexShader, false);
 	if (vertexShader->hasError)
 		LatteGPUState.activeShaderHasError = true;
 	return vertexShader;
@@ -997,7 +985,6 @@ LatteDecompilerShader* LatteSHRC_GetOrCreateGeometryShader(bool usesGeometryShad
 	LatteSHRC_UpdateGSBaseHash(geometryShaderPtr, geometryShaderSize, geometryCopyShader, geometryCopyShaderSize);
 	auto itBaseShader = sGeometryShaders.find(_shaderBaseHash_gs);
 	LatteDecompilerShader* geometryShader;
-	const bool geometryShaderWasCached = itBaseShader != sGeometryShaders.end();
 	if (itBaseShader != sGeometryShaders.end())
 	{
 		// geometry shader already known
@@ -1009,8 +996,6 @@ LatteDecompilerShader* LatteSHRC_GetOrCreateGeometryShader(bool usesGeometryShad
 		// decompile geometry shader
 		geometryShader = LatteShader_CompileSeparableGeometryShader(_shaderBaseHash_gs, geometryShaderPtr, geometryShaderSize, geometryCopyShader, geometryCopyShaderSize, vertexShader);
 	}
-	if (geometryShaderWasCached && geometryShader && !geometryShader->shader && !geometryShader->hasError)
-		LatteShader_CreateRendererShader(geometryShader, false);
 	if (geometryShader->hasError)
 		LatteGPUState.activeShaderHasError = true;
 	return geometryShader;
@@ -1029,8 +1014,6 @@ LatteDecompilerShader* LatteSHRC_GetOrCreatePixelShader(uint8* pixelShaderPtr, u
 	}
 	if (!pixelShader)
 		pixelShader = LatteShader_CompileSeparablePixelShader(_shaderBaseHash_ps, psAuxHash, pixelShaderPtr, pixelShaderSize, usesGeometryShader);
-	else if (!pixelShader->shader && !pixelShader->hasError)
-		LatteShader_CreateRendererShader(pixelShader, false);
 	if (pixelShader->hasError)
 		LatteGPUState.activeShaderHasError = true;
 	return pixelShader;
@@ -1301,20 +1284,6 @@ void LatteSHRC_UpdateActiveShaders()
 		shaderError |= geometryShader->hasError;
 
 	uint64 combinedAuxHash = CalcCombinedAuxHash(fetchShader, vertexShader, pixelShader);
-	const bool shaderCreationDeferred =
-		(vertexShader && !vertexShader->shader && !vertexShader->hasError) ||
-		(pixelShader && !pixelShader->shader && !pixelShader->hasError) ||
-		(geometryShader && !geometryShader->shader && !geometryShader->hasError);
-	if (shaderCreationDeferred)
-	{
-		// Do not bake a temporary memory-budget deferral into the combined state
-		// cache. The next use will revisit the individual shader and retry it.
-		_activeFetchShader = fetchShader;
-		_activeVertexShader = vertexShader;
-		_activePixelShader = pixelShader;
-		_activeGeometryShader = geometryShader;
-		return;
-	}
 
 	if (!shaderStateInfo)
 	{

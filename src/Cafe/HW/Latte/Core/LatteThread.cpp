@@ -136,25 +136,7 @@ int Latte_ThreadEntryImpl()
 	LatteTiming_Init();
 	LatteTexture_init();
 	LatteTC_Init();
-	// D3D11 keeps both a native buffer and a CPU shadow of this cache. The
-	// desktop-sized 164 MiB cache therefore costs roughly 328 MiB in the Xbox
-	// shared CPU/GPU budget before a title creates any textures. A 96 MiB heap
-	// retains room for normal Wii U vertex traffic while returning about 136 MiB
-	// to the Series S process.
-#if defined(CEMU_UWP)
-	constexpr size_t bufferCacheSize = 96 * 1024 * 1024;
-#else
-	constexpr size_t bufferCacheSize = 164 * 1024 * 1024;
-#endif
-	LatteBufferCache_init(bufferCacheSize);
-	cemuLog_log(LogType::Force, "Latte buffer cache: {}MB{}",
-		bufferCacheSize / (1024 * 1024),
-#if defined(CEMU_UWP)
-		" (Series S memory profile)"
-#else
-		""
-#endif
-	);
+	LatteBufferCache_init(164 * 1024 * 1024);
 	LatteQuery_Init();
 	LatteSHRC_Init();
 	LatteStreamout_InitCache();
