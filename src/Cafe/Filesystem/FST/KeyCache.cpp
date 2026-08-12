@@ -127,3 +127,15 @@ void KeyCache_Prepare()
 	delete fs_keys;
 	mtxKeyCache.unlock();
 }
+
+uint32 KeyCache_Reload()
+{
+	{
+		std::lock_guard lock(mtxKeyCache);
+		sKeyCachePrepared = false;
+		g_keyCache.clear();
+	}
+	KeyCache_Prepare();
+	std::lock_guard lock(mtxKeyCache);
+	return static_cast<uint32>(g_keyCache.size());
+}

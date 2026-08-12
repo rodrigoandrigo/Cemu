@@ -9,6 +9,8 @@
 #include "Cafe/GraphicPack/GraphicPack2.h"
 #include "Cafe/HW/Latte/Core/LatteOverlay.h"
 #include "Cafe/TitleList/TitleList.h"
+#include "Cafe/OS/libs/nsyshid/Dimensions.h"
+#include "Cafe/Filesystem/FST/KeyCache.h"
 #include "Common/CemuRuntime.h"
 #include "input/InputManager.h"
 #include "input/ControllerFactory.h"
@@ -25,6 +27,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <sstream>
 #include <thread>
 #include <vector>
 
@@ -72,6 +75,7 @@ struct CemuEmbedInstance {
 	std::atomic_bool loggingCallbacksInstalled{false};
 	std::atomic_bool initialized{false};
 	std::atomic_bool surfaceConfigured{false};
+	std::atomic_bool dimensionsToypadEnabled{false};
 	CemuEmbedInstance(const CemuEmbedConfig& config, const CemuEmbedCallbacks& callbacks)
 		: executablePath(config.executable_path_utf8), userDataPath(config.user_data_path_utf8), configPath(config.config_path_utf8), cachePath(config.cache_path_utf8), dataPath(config.data_path_utf8), config(config), callbacks(callbacks), loggingCallbacks(callbacks) {
 		this->config.executable_path_utf8 = executablePath.c_str();
@@ -661,15 +665,55 @@ CemuEmbedResult InstallTitleFromStaging(CemuEmbedInstance* instance,
 }
 
 CemuEmbedResult LaunchGameFromPath(CemuEmbedInstance* instance, const fs::path& gamePath) {
-	TitleInfo title{ gamePath };
+	fs::path launchPath = gamePath;
+	std::error_code pathError;
+	// A brokered folder containing NUS content is represented by its title.tmd.
+	// Extracted code/content/meta folders continue to use the folder itself.
+	if (fs::is_directory(launchPath, pathError) &&
+		!fs::is_directory(launchPath / "code", pathError)) {
+		if (fs::is_regular_file(launchPath / "title.tmd", pathError)) {
+			launchPath /= "title.tmd";
+		} else {
+			// A selected standalone executable folder may include adjacent RPLs.
+			// Preserve the whole brokered folder and select its RPX/ELF locally.
+			pathError.clear();
+			for (const auto& entry : fs::directory_iterator(launchPath, pathError)) {
+				if (!entry.is_regular_file(pathError))
+					continue;
+				const auto extension = _pathToUtf8(entry.path().extension());
+				if (boost::iequals(extension, ".rpx") || boost::iequals(extension, ".elf")) {
+					launchPath = entry.path();
+					break;
+				}
+			}
+		}
+	}
+
+	TitleInfo title{ launchPath };
 	if (!title.IsValid()) {
-		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED, "The selected folder is not a valid Wii U title directory.");
+		const auto fileType = DetermineCafeSystemFileType(launchPath);
+		if (fileType == CafeTitleFileType::RPX || fileType == CafeTitleFileType::ELF) {
+			const auto result = CafeSystem::PrepareForegroundTitleFromStandaloneRPX(launchPath);
+			if (result != CafeSystem::PREPARE_STATUS_CODE::SUCCESS) {
+				ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
+					"Cemu could not prepare the selected standalone RPX/ELF executable.");
+				return CEMU_EMBED_LAUNCH_FAILED;
+			}
+			CafeSystem::LaunchForegroundTitle();
+			return CEMU_EMBED_OK;
+		}
+		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
+			"The selected item is not a supported Wii U title (.wud, .wux, .iso, .wua, .wuhb, .rpx, .elf, title.tmd, or extracted title folder).");
 		return CEMU_EMBED_LAUNCH_FAILED;
 	}
 
-	CafeTitleList::AddTitleFromPath(gamePath);
-	TitleId baseTitleId;
-	CafeTitleList::FindBaseTitleId(title.GetAppTitleId(), baseTitleId);
+	CafeTitleList::AddTitleFromPath(launchPath);
+	TitleId baseTitleId{};
+	if (!CafeTitleList::FindBaseTitleId(title.GetAppTitleId(), baseTitleId)) {
+		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
+			"Cemu found the title but could not resolve its runnable base title.");
+		return CEMU_EMBED_LAUNCH_FAILED;
+	}
 	auto prepareResult = CafeSystem::PrepareForegroundTitle(baseTitleId);
 
 	// Some extracted/merged titles keep an update (0005000E) app.xml even
@@ -688,7 +732,7 @@ CemuEmbedResult LaunchGameFromPath(CemuEmbedInstance* instance, const fs::path& 
 			while (!executableName.empty() &&
 				(executableName.front() == ' ' || executableName.front() == '\t' || executableName.front() == '"'))
 				executableName.erase(executableName.begin());
-			executable = gamePath / "code" / _utf8ToPath(executableName);
+			executable = launchPath / "code" / _utf8ToPath(executableName);
 		}
 		std::error_code executableError;
 		if (!executable.empty() && fs::is_regular_file(executable, executableError)) {
@@ -722,6 +766,10 @@ void Initialize(CemuEmbedInstance* instance) {
 		GetConfigHandle().SetFilename(ActiveSettings::GetConfigPath("settings.xml").generic_wstring());
 		NetworkConfig::LoadOnce();
 		ActiveSettings::Init();
+		// The embedded host chooses this before initialization. Apply it after
+		// settings.xml is loaded and before the emulated USB backend is attached.
+		GetConfig().emulated_usb_devices.emulate_dimensions_toypad =
+			instance->dimensionsToypadEnabled.load(std::memory_order_acquire);
 		cemuLog_setCallbacks(&instance->loggingCallbacks);
 		instance->loggingCallbacksInstalled.store(true, std::memory_order_release);
 		cemuLog_createLogFile(false);
@@ -1281,6 +1329,157 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetPerformanceMetrics(
 
 	LatteOverlay_setHostPerformanceMetrics(enabled != 0);
 	return CEMU_EMBED_OK;
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnableDimensionsToypad(
+	CemuEmbedInstance* instance, int32_t enabled) {
+	if (!instance)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_CREATED)
+		return CEMU_EMBED_INVALID_STATE;
+	instance->dimensionsToypadEnabled.store(enabled != 0, std::memory_order_release);
+	return CEMU_EMBED_OK;
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateDimensionsFigures(
+	CemuEmbedInstance* instance, CemuEmbedDimensionsFigureCallback callback,
+	void* user_data) {
+	if (!instance || !callback)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+
+	auto enumerate = [&](const auto& figures, CemuEmbedDimensionsFigureType type) {
+		for (const auto& [id, name] : figures) {
+			CemuEmbedDimensionsFigure figure{
+				sizeof(figure), CEMU_EMBED_DIMENSIONS_VERSION, id, type, name
+			};
+			const auto result = callback(user_data, &figure);
+			if (result != CEMU_EMBED_OK)
+				return result;
+		}
+		return CEMU_EMBED_OK;
+	};
+
+	if (const auto result = enumerate(nsyshid::DimensionsUSB::GetListMinifigs(),
+		CEMU_EMBED_DIMENSIONS_CHARACTER); result != CEMU_EMBED_OK)
+		return result;
+	return enumerate(nsyshid::DimensionsUSB::GetListTokens(),
+		CEMU_EMBED_DIMENSIONS_VEHICLE_OR_GADGET);
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_PlaceDimensionsFigure(
+	CemuEmbedInstance* instance, uint32_t figure_id, uint8_t slot) {
+	if (!instance || slot >= 7)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY ||
+		!instance->dimensionsToypadEnabled.load(std::memory_order_acquire))
+		return CEMU_EMBED_INVALID_STATE;
+
+	static constexpr std::array<uint8_t, 7> pads{2, 1, 3, 2, 2, 3, 3};
+	try {
+		const fs::path tagDirectory = _utf8ToPath(instance->userDataPath) / "dimensions";
+		std::error_code directoryError;
+		fs::create_directories(tagDirectory, directoryError);
+		if (directoryError)
+			return CEMU_EMBED_STORAGE_FAILED;
+		const fs::path tagPath = tagDirectory /
+			fmt::format("slot_{}_figure_{}.bin", slot + 1, figure_id);
+
+		std::error_code fileError;
+		if (!fs::is_regular_file(tagPath, fileError) &&
+			!nsyshid::g_dimensionstoypad.CreateFigure(tagPath, figure_id))
+			return CEMU_EMBED_STORAGE_FAILED;
+
+		std::unique_ptr<FileStream> tagFile(FileStream::openFile2(tagPath, true));
+		if (!tagFile)
+			return CEMU_EMBED_STORAGE_FAILED;
+		std::array<uint8, 0x2D * 0x04> tagData{};
+		if (tagFile->readData(tagData.data(), tagData.size()) != tagData.size())
+			return CEMU_EMBED_STORAGE_FAILED;
+
+		// Replacing a position must first notify the game that the old tag left.
+		nsyshid::g_dimensionstoypad.RemoveFigure(pads[slot], slot, true);
+		nsyshid::g_dimensionstoypad.LoadFigure(tagData, std::move(tagFile), pads[slot], slot);
+		return CEMU_EMBED_OK;
+	} catch (...) {
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RemoveDimensionsFigure(
+	CemuEmbedInstance* instance, uint8_t slot) {
+	if (!instance || slot >= 7)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY ||
+		!instance->dimensionsToypadEnabled.load(std::memory_order_acquire))
+		return CEMU_EMBED_INVALID_STATE;
+	static constexpr std::array<uint8_t, 7> pads{2, 1, 3, 2, 2, 3, 3};
+	return nsyshid::g_dimensionstoypad.RemoveFigure(pads[slot], slot, true)
+		? CEMU_EMBED_OK : CEMU_EMBED_INVALID_STATE;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_MoveDimensionsFigure(
+	CemuEmbedInstance* instance, uint8_t source_slot, uint8_t destination_slot) {
+	if (!instance || source_slot >= 7 || destination_slot >= 7)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY ||
+		!instance->dimensionsToypadEnabled.load(std::memory_order_acquire))
+		return CEMU_EMBED_INVALID_STATE;
+	if (source_slot == destination_slot)
+		return CEMU_EMBED_OK;
+	static constexpr std::array<uint8_t, 7> pads{2, 1, 3, 2, 2, 3, 3};
+	return nsyshid::g_dimensionstoypad.MoveFigure(
+		pads[destination_slot], destination_slot, pads[source_slot], source_slot)
+		? CEMU_EMBED_OK : CEMU_EMBED_INVALID_STATE;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ImportKeys(
+	CemuEmbedInstance* instance, const uint8_t* data, uint32_t data_size,
+	uint32_t* valid_key_count) {
+	if (!instance || !data || data_size == 0 || data_size > 4 * 1024 * 1024)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+	// Validate before replacing the existing file so a wrong selection cannot
+	// destroy a working keys.txt.
+	uint32_t parsedKeyCount{};
+	std::string keysText(reinterpret_cast<const char*>(data), data_size);
+	std::istringstream lines(keysText);
+	std::string line;
+	while (std::getline(lines, line)) {
+		if (const auto comment = line.find_first_of("#;"); comment != std::string::npos)
+			line.resize(comment);
+		line.erase(std::remove_if(line.begin(), line.end(), [](char c) {
+			return c == ' ' || c == '\t' || c == '\r' || c == '-' || c == '_';
+		}), line.end());
+		if (line.size() == 32 && std::all_of(line.begin(), line.end(), [](unsigned char c) {
+			return std::isxdigit(c) != 0;
+		}))
+			++parsedKeyCount;
+	}
+	if (parsedKeyCount == 0)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+
+	const fs::path keysPath = ActiveSettings::GetUserDataPath("keys.txt");
+	const fs::path temporaryPath = ActiveSettings::GetUserDataPath("keys.txt.importing");
+	std::unique_ptr<FileStream> output(FileStream::createFile2(temporaryPath));
+	if (!output || output->writeData(data, static_cast<sint32>(data_size)) !=
+		static_cast<sint32>(data_size))
+		return CEMU_EMBED_STORAGE_FAILED;
+	output.reset();
+
+	std::error_code copyError;
+	fs::copy_file(temporaryPath, keysPath, fs::copy_options::overwrite_existing, copyError);
+	std::error_code cleanupError;
+	fs::remove(temporaryPath, cleanupError);
+	if (copyError)
+		return CEMU_EMBED_STORAGE_FAILED;
+
+	const uint32_t count = KeyCache_Reload();
+	if (valid_key_count)
+		*valid_key_count = count;
+	return count != 0 ? CEMU_EMBED_OK : CEMU_EMBED_INVALID_ARGUMENT;
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance) {
 	if (!instance) return CEMU_EMBED_INVALID_ARGUMENT;

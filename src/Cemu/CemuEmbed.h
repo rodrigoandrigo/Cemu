@@ -26,6 +26,7 @@ extern "C" {
 #define CEMU_EMBED_LIBRARY_VERSION 2u
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
 #define CEMU_EMBED_GAMEPAD_VERSION 1u
+#define CEMU_EMBED_DIMENSIONS_VERSION 1u
 typedef struct CemuEmbedInstance CemuEmbedInstance;
 
 typedef enum CemuEmbedResult { CEMU_EMBED_OK, CEMU_EMBED_INVALID_ARGUMENT, CEMU_EMBED_INVALID_STATE, CEMU_EMBED_BUSY, CEMU_EMBED_INITIALIZATION_FAILED, CEMU_EMBED_LAUNCH_FAILED, CEMU_EMBED_STORAGE_FAILED } CemuEmbedResult;
@@ -180,6 +181,23 @@ typedef struct CemuEmbedActiveAccount {
 	char account_id_utf8[64];
 } CemuEmbedActiveAccount;
 
+typedef enum CemuEmbedDimensionsFigureType {
+	CEMU_EMBED_DIMENSIONS_CHARACTER = 0,
+	CEMU_EMBED_DIMENSIONS_VEHICLE_OR_GADGET = 1
+} CemuEmbedDimensionsFigureType;
+
+// Strings remain valid only for the duration of the enumeration callback.
+typedef struct CemuEmbedDimensionsFigure {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	uint32_t id;
+	CemuEmbedDimensionsFigureType type;
+	const char* name_utf8;
+} CemuEmbedDimensionsFigure;
+
+typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedDimensionsFigureCallback)(
+	void* user_data, const CemuEmbedDimensionsFigure* figure);
+
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Create(const CemuEmbedConfig* config, const CemuEmbedCallbacks* callbacks, CemuEmbedInstance** instance);
 // Call on the host UI thread before InitializeAsync and whenever the host
 // surface size changes while the instance is initializing or ready.
@@ -245,6 +263,27 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
 // the top-right corner and reports FPS, draw calls, CPU, RAM and VRAM.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetPerformanceMetrics(
 	CemuEmbedInstance* instance, int32_t enabled);
+// Enables the native LEGO Dimensions USB/HID Toy Pad before initialization.
+// Embedded hosts must call this while the instance is still in CREATED state.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnableDimensionsToypad(
+	CemuEmbedInstance* instance, int32_t enabled);
+// Enumerates Cemu's native character, vehicle and gadget catalog.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateDimensionsFigures(
+	CemuEmbedInstance* instance, CemuEmbedDimensionsFigureCallback callback,
+	void* user_data);
+// Creates (or reopens) a persistent native tag and places it in one of the
+// seven physical Toy Pad positions. slot is in the range 0..6.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_PlaceDimensionsFigure(
+	CemuEmbedInstance* instance, uint32_t figure_id, uint8_t slot);
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RemoveDimensionsFigure(
+	CemuEmbedInstance* instance, uint8_t slot);
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_MoveDimensionsFigure(
+	CemuEmbedInstance* instance, uint8_t source_slot, uint8_t destination_slot);
+// Replaces the user-data keys.txt and immediately reloads the decryption-key
+// cache. Call while no title is running. valid_key_count may be null.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ImportKeys(
+	CemuEmbedInstance* instance, const uint8_t* data, uint32_t data_size,
+	uint32_t* valid_key_count);
 // Non-blocking: call this from the host dispatcher. It never creates wxEntry.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance);
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_RequestStop(CemuEmbedInstance* instance);

@@ -716,10 +716,11 @@ namespace nsyshid
 
 		std::array<uint8, 7> uid = {fileData[0], fileData[1], fileData[2], fileData[4], fileData[5], fileData[6], fileData[7]};
 
-		// Only characters are created with their ID encrypted and stored in pages 36 and 37,
-		// as well as a password stored in page 43. Blank tags have their information populated
-		// by the game when it calls the write_block command.
-		if (id != 0)
+		// Characters store an encrypted ID in pages 36 and 37. Vehicles and
+		// gadgets use the raw little-endian model number in page 36. This also
+		// lets embedded hosts create usable vehicle tags without a separate web
+		// emulator. Blank tags are populated later by the game.
+		if (id != 0 && id < 1000)
 		{
 			const std::array<uint8, 16> figureKey = GenerateFigureKey(fileData);
 
@@ -732,6 +733,26 @@ namespace nsyshid
 			std::memcpy(&fileData[37 * 4], &encrypted[4], 4);
 
 			std::memcpy(&fileData[43 * 4], PWDGenerate(fileData).data(), 4);
+		}
+		else if (id >= 1000)
+		{
+			// New vehicle tags use the same empty-upgrade sentinel as the
+			// standalone LD Toy Pad emulator. The game replaces these pages as
+			// upgrades are purchased and DimensionsMini::Save persists them.
+			constexpr uint32 EMPTY_UPGRADES = 0xEFFFFFFF;
+			fileData[35 * 4] = uint8(EMPTY_UPGRADES & 0xFF);
+			fileData[(35 * 4) + 1] = uint8((EMPTY_UPGRADES >> 8) & 0xFF);
+			fileData[(35 * 4) + 2] = uint8((EMPTY_UPGRADES >> 16) & 0xFF);
+			fileData[(35 * 4) + 3] = uint8((EMPTY_UPGRADES >> 24) & 0xFF);
+			fileData[36 * 4] = uint8(id & 0xFF);
+			fileData[(36 * 4) + 1] = uint8((id >> 8) & 0xFF);
+			fileData[(36 * 4) + 2] = uint8((id >> 16) & 0xFF);
+			fileData[(36 * 4) + 3] = uint8((id >> 24) & 0xFF);
+			fileData[37 * 4] = uint8(EMPTY_UPGRADES & 0xFF);
+			fileData[(37 * 4) + 1] = uint8((EMPTY_UPGRADES >> 8) & 0xFF);
+			fileData[(37 * 4) + 2] = uint8((EMPTY_UPGRADES >> 16) & 0xFF);
+			fileData[(37 * 4) + 3] = uint8((EMPTY_UPGRADES >> 24) & 0xFF);
+			fileData[(38 * 4) + 1] = 1;
 		}
 		else
 		{
@@ -750,6 +771,12 @@ namespace nsyshid
 
 	bool DimensionsUSB::MoveFigure(uint8 pad, uint8 index, uint8 oldPad, uint8 oldIndex)
 	{
+		{
+			std::lock_guard lock(m_dimensionsMutex);
+			if (oldIndex >= m_figures.size() || index >= m_figures.size() ||
+				m_figures[oldIndex].index == 255)
+				return false;
+		}
 		if (oldIndex == index)
 		{
 			// Don't bother removing and loading again, just send response to the game
