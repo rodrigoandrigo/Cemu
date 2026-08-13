@@ -437,14 +437,67 @@ public:
 		fflush(file);
 		fclose(file);
 
-		fs::rename(tmp_name, filename, err);
-		if(err)
+		if (!success)
 		{
-			cemuLog_log(LogType::Force, "Unable to save settings to file: {}", err.message().c_str());
 			fs::remove(tmp_name, err);
+			return false;
 		}
 
-		return success;
+		// std::filesystem::rename does not replace an existing destination on
+		// Windows. The old implementation therefore discarded every update after
+		// the first settings.xml was created, while still reporting success. Move
+		// the current file aside first so the operation remains recoverable if the
+		// second rename fails.
+		const fs::path target(filename);
+		const fs::path backup = target.wstring() + L".replacing";
+		const bool hadTarget = fs::exists(target, err);
+		if (err)
+		{
+			cemuLog_log(LogType::Force, "Unable to inspect settings file before replacement: {}", err.message().c_str());
+			fs::remove(tmp_name, err);
+			return false;
+		}
+		if (hadTarget)
+		{
+			fs::remove(backup, err);
+			if (err)
+			{
+				cemuLog_log(LogType::Force, "Unable to clear the previous settings backup: {}", err.message().c_str());
+				fs::remove(tmp_name, err);
+				return false;
+			}
+			fs::rename(target, backup, err);
+			if (err)
+			{
+				cemuLog_log(LogType::Force, "Unable to prepare settings file replacement: {}", err.message().c_str());
+				fs::remove(tmp_name, err);
+				return false;
+			}
+		}
+
+		fs::rename(tmp_name, target, err);
+		if (err)
+		{
+			const auto replaceError = err.message();
+			if (hadTarget)
+			{
+				std::error_code restoreError;
+				fs::rename(backup, target, restoreError);
+				if (restoreError)
+					cemuLog_log(LogType::Force, "Unable to restore settings after a failed replacement: {}", restoreError.message().c_str());
+			}
+			fs::remove(tmp_name, err);
+			cemuLog_log(LogType::Force, "Unable to replace settings file: {}", replaceError.c_str());
+			return false;
+		}
+		if (hadTarget)
+		{
+			fs::remove(backup, err);
+			if (err)
+				cemuLog_log(LogType::Force, "Unable to remove the completed settings backup: {}", err.message().c_str());
+		}
+
+		return true;
 	}
 
 	[[nodiscard]] const std::wstring& GetFilename() const { return m_filename; }

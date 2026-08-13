@@ -1331,6 +1331,113 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetPerformanceMetrics(
 	return CEMU_EMBED_OK;
 }
 
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetSettings(
+	CemuEmbedInstance* instance, CemuEmbedSettings* settings) {
+	if (!instance || !settings || settings->struct_size < sizeof(CemuEmbedSettings) ||
+		settings->abi_version != CEMU_EMBED_SETTINGS_VERSION)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	const auto& c = GetConfig();
+	settings->cpu_mode = static_cast<int32_t>(c.cpu_mode.GetValue());
+	settings->console_language = static_cast<int32_t>(c.console_language.GetValue());
+	settings->vsync = c.vsync.GetValue();
+	settings->gx2drawdone_sync = c.gx2drawdone_sync.GetValue();
+	settings->async_compile = c.async_compile.GetValue();
+	settings->render_upside_down = c.render_upside_down.GetValue();
+	settings->play_boot_sound = c.play_boot_sound.GetValue();
+	settings->disable_screensaver = c.disable_screensaver.GetValue();
+	settings->override_gamma = c.overrideAppGammaPreference.GetValue();
+	settings->override_gamma_value = c.overrideGammaValue.GetValue();
+	settings->display_gamma = c.userDisplayGamma.GetValue();
+	settings->upscale_filter = c.upscale_filter.GetValue();
+	settings->downscale_filter = c.downscale_filter.GetValue();
+	settings->fullscreen_scaling = c.fullscreen_scaling.GetValue();
+	settings->overlay_position = static_cast<int32_t>(c.overlay.position);
+	settings->overlay_text_scale = c.overlay.text_scale;
+	settings->overlay_fps = c.overlay.fps;
+	settings->overlay_drawcalls = c.overlay.drawcalls;
+	settings->overlay_cpu_usage = c.overlay.cpu_usage;
+	settings->overlay_cpu_per_core = c.overlay.cpu_per_core_usage;
+	settings->overlay_ram_usage = c.overlay.ram_usage;
+	settings->overlay_vram_usage = c.overlay.vram_usage;
+	settings->notification_position = static_cast<int32_t>(c.notification.position);
+	settings->notification_text_scale = c.notification.text_scale;
+	settings->notification_controller_profiles = c.notification.controller_profiles;
+	settings->notification_controller_battery = c.notification.controller_battery;
+	settings->notification_shader_compiling = c.notification.shader_compiling;
+	settings->notification_friends = c.notification.friends;
+	settings->audio_api = c.audio_api;
+	settings->audio_delay = c.audio_delay;
+	settings->tv_channels = static_cast<int32_t>(c.tv_channels);
+	settings->pad_channels = static_cast<int32_t>(c.pad_channels);
+	settings->input_channels = static_cast<int32_t>(c.input_channels);
+	settings->tv_volume = c.tv_volume;
+	settings->pad_volume = c.pad_volume;
+	settings->input_volume = c.input_volume;
+	settings->portal_volume = c.portal_volume;
+	settings->emulate_skylander_portal = c.emulated_usb_devices.emulate_skylander_portal.GetValue();
+	settings->emulate_infinity_base = c.emulated_usb_devices.emulate_infinity_base.GetValue();
+	settings->emulate_dimensions_toypad = c.emulated_usb_devices.emulate_dimensions_toypad.GetValue();
+	return CEMU_EMBED_OK;
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetSettings(
+	CemuEmbedInstance* instance, const CemuEmbedSettings* settings) {
+	if (!instance || !settings || settings->struct_size < sizeof(CemuEmbedSettings) ||
+		settings->abi_version != CEMU_EMBED_SETTINGS_VERSION)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	auto& c = GetConfig();
+	c.cpu_mode.SetValue(static_cast<CPUMode>((std::clamp)(settings->cpu_mode, 0, 4)));
+	c.console_language.SetValue(static_cast<CafeConsoleLanguage>((std::clamp)(settings->console_language, 0, 11)));
+	c.vsync.SetValue((std::clamp)(settings->vsync, 0, 4));
+	c.gx2drawdone_sync.SetValue(settings->gx2drawdone_sync != 0);
+	c.async_compile.SetValue(settings->async_compile != 0);
+	c.render_upside_down.SetValue(settings->render_upside_down != 0);
+	c.play_boot_sound.SetValue(settings->play_boot_sound != 0);
+	c.disable_screensaver.SetValue(settings->disable_screensaver != 0);
+	c.overrideAppGammaPreference.SetValue(settings->override_gamma != 0);
+	c.overrideGammaValue.SetValue((std::clamp)(settings->override_gamma_value, 1.0f, 3.0f));
+	c.userDisplayGamma.SetValue((std::clamp)(settings->display_gamma, 0.0f, 3.0f));
+	c.upscale_filter.SetValue((std::clamp)(settings->upscale_filter, 0, 3));
+	c.downscale_filter.SetValue((std::clamp)(settings->downscale_filter, 0, 3));
+	c.fullscreen_scaling.SetValue((std::clamp)(settings->fullscreen_scaling, 0, 1));
+	c.overlay.position = static_cast<ScreenPosition>((std::clamp)(settings->overlay_position, 0, 6));
+	c.overlay.text_scale = (std::clamp)(settings->overlay_text_scale, 50, 300);
+	c.overlay.fps = settings->overlay_fps != 0;
+	c.overlay.drawcalls = settings->overlay_drawcalls != 0;
+	c.overlay.cpu_usage = settings->overlay_cpu_usage != 0;
+	c.overlay.cpu_per_core_usage = settings->overlay_cpu_per_core != 0;
+	c.overlay.ram_usage = settings->overlay_ram_usage != 0;
+	c.overlay.vram_usage = settings->overlay_vram_usage != 0;
+	c.notification.position = static_cast<ScreenPosition>((std::clamp)(settings->notification_position, 0, 6));
+	c.notification.text_scale = (std::clamp)(settings->notification_text_scale, 50, 300);
+	c.notification.controller_profiles = settings->notification_controller_profiles != 0;
+	c.notification.controller_battery = settings->notification_controller_battery != 0;
+	c.notification.shader_compiling = settings->notification_shader_compiling != 0;
+	c.notification.friends = settings->notification_friends != 0;
+	c.audio_api = (std::clamp)(settings->audio_api, 0, 4);
+	c.audio_delay = (std::clamp)(settings->audio_delay, 0, 10);
+	c.tv_channels = static_cast<AudioChannels>((std::clamp)(settings->tv_channels, 0, 2));
+	c.pad_channels = static_cast<AudioChannels>((std::clamp)(settings->pad_channels, 0, 2));
+	c.input_channels = static_cast<AudioChannels>((std::clamp)(settings->input_channels, 0, 2));
+	c.tv_volume = (std::clamp)(settings->tv_volume, 0, 100);
+	c.pad_volume = (std::clamp)(settings->pad_volume, 0, 100);
+	c.input_volume = (std::clamp)(settings->input_volume, 0, 100);
+	c.portal_volume = (std::clamp)(settings->portal_volume, 0, 100);
+	c.emulated_usb_devices.emulate_skylander_portal.SetValue(settings->emulate_skylander_portal != 0);
+	c.emulated_usb_devices.emulate_infinity_base.SetValue(settings->emulate_infinity_base != 0);
+	c.emulated_usb_devices.emulate_dimensions_toypad.SetValue(settings->emulate_dimensions_toypad != 0);
+	if (!GetConfigHandle().Save()) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not persist settings.xml in the application data folder.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	return CEMU_EMBED_OK;
+}
+
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnableDimensionsToypad(
 	CemuEmbedInstance* instance, int32_t enabled) {
 	if (!instance)

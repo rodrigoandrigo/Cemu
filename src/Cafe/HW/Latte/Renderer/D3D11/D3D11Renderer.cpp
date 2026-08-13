@@ -48,6 +48,11 @@ void LatteDraw_handleSpecialState8_clearAsDepth();
 
 namespace
 {
+// OM UAV registers share the output-merger namespace with render targets.
+// Keeping stream-out after all eight RTV slots permits rasterization and
+// transform feedback in the same draw without an overlap at u0.
+constexpr UINT StreamoutUavSlot = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
+
 #if defined(CEMU_UWP)
 // Serialize Cemu shader translation with the first draw that makes D3D11On12
 // compile a native Xbox pipeline. Both paths have large transient footprints.
@@ -165,6 +170,40 @@ uint64 HashBytes(const void* data, size_t size, uint64 hash = 146959810393466560
 	return hash;
 }
 
+// Persistent driver-cache budget. This is disk-backed and does not reserve the
+// same amount in the Series S process address space.
+constexpr uint64 D3D11ShaderCacheBudgetBytes = 512ull * 1024 * 1024;
+
+bool ValidateDxbcContainer(const void* data, size_t size)
+{
+	if (!data || size < 32 || size > D3D11ShaderCacheBudgetBytes)
+		return false;
+	const auto* bytes = static_cast<const uint8*>(data);
+	if (std::memcmp(bytes, "DXBC", 4) != 0)
+		return false;
+	auto readU32 = [bytes](size_t offset)
+	{
+		uint32 value{};
+		std::memcpy(&value, bytes + offset, sizeof(value));
+		return value;
+	};
+	const uint32 declaredSize = readU32(24);
+	const uint32 chunkCount = readU32(28);
+	if (declaredSize != size || chunkCount == 0 || chunkCount > 64 ||
+		32ull + static_cast<uint64>(chunkCount) * sizeof(uint32) > size)
+		return false;
+	for (uint32 index = 0; index < chunkCount; ++index)
+	{
+		const uint32 chunkOffset = readU32(32 + index * sizeof(uint32));
+		if (static_cast<uint64>(chunkOffset) + 8 > size)
+			return false;
+		const uint32 chunkSize = readU32(static_cast<size_t>(chunkOffset) + 4);
+		if (static_cast<uint64>(chunkOffset) + 8 + chunkSize > size)
+			return false;
+	}
+	return true;
+}
+
 #if defined(CEMU_UWP)
 fs::path GetD3D11SpirvCachePath(const std::string& source, uint32 shaderType)
 {
@@ -184,13 +223,18 @@ bool LoadD3D11SpirvCache(const fs::path& path, std::vector<uint32>& spirv)
 		return false;
 	const std::streamoff length = static_cast<std::streamoff>(input.tellg());
 	if (length < 5 * static_cast<std::streamoff>(sizeof(uint32)) ||
-		length > 64 * 1024 * 1024 || (length % sizeof(uint32)) != 0)
+		length > static_cast<std::streamoff>(D3D11ShaderCacheBudgetBytes) ||
+		(length % sizeof(uint32)) != 0)
 		return false;
 	spirv.resize(static_cast<size_t>(length) / sizeof(uint32));
 	input.seekg(0);
 	input.read(reinterpret_cast<char*>(spirv.data()), static_cast<std::streamsize>(length));
 	bool valid = input && spirv.size() > 5 && spirv[0] == 0x07230203u &&
 		spirv[3] != 0 && spirv[4] == 0;
+	bool hasMemoryModel = false;
+	bool hasEntryPoint = false;
+	uint32 functionCount = 0;
+	uint32 functionEndCount = 0;
 	// A truncated SPIR-V file often retains a valid header. Walk every
 	// instruction so SPIRV-Cross never receives a partial cached module and turns
 	// a recoverable cache-write interruption into a permanent missing shader.
@@ -202,10 +246,17 @@ bool LoadD3D11SpirvCache(const fs::path& path, std::vector<uint32>& spirv)
 			valid = false;
 			break;
 		}
+		const uint32 opcode = spirv[word] & 0xFFFFu;
+		hasMemoryModel |= opcode == 14; // OpMemoryModel
+		hasEntryPoint |= opcode == 15; // OpEntryPoint
+		functionCount += opcode == 54; // OpFunction
+		functionEndCount += opcode == 56; // OpFunctionEnd
 		word += instructionWords;
 		if (word == spirv.size())
 			break;
 	}
+	valid = valid && hasMemoryModel && hasEntryPoint && functionCount != 0 &&
+		functionCount == functionEndCount;
 	if (!valid)
 	{
 		std::vector<uint32>().swap(spirv);
@@ -222,10 +273,37 @@ void StoreD3D11SpirvCache(const fs::path& path, const std::vector<uint32>& spirv
 	fs::create_directories(path.parent_path(), error);
 	if (error)
 		return;
-	std::ofstream output(path, std::ios::binary | std::ios::trunc);
-	if (output)
+	const fs::path temporaryPath = path.string() + ".tmp";
+	{
+		std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+		if (!output)
+			return;
 		output.write(reinterpret_cast<const char*>(spirv.data()),
 			static_cast<std::streamsize>(spirv.size() * sizeof(uint32)));
+		output.flush();
+		if (!output)
+		{
+			output.close();
+			fs::remove(temporaryPath, error);
+			return;
+		}
+	}
+	// Never expose a partially written module to the next run. Windows does not
+	// replace an existing destination with rename(), so remove the old cache entry
+	// only after the complete temporary file has been closed.
+	fs::rename(temporaryPath, path, error);
+	if (error)
+	{
+		error.clear();
+		fs::remove(path, error);
+		error.clear();
+		fs::rename(temporaryPath, path, error);
+		if (error)
+		{
+			error.clear();
+			fs::remove(temporaryPath, error);
+		}
+	}
 }
 #endif
 
@@ -255,7 +333,8 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 		if (input)
 		{
 			const std::streamoff length = static_cast<std::streamoff>(input.tellg());
-			if (length >= 4 && length <= 64 * 1024 * 1024)
+			if (length >= 32 &&
+				length <= static_cast<std::streamoff>(D3D11ShaderCacheBudgetBytes))
 			{
 				ComPtr<ID3DBlob> cached;
 				if (SUCCEEDED(D3DCreateBlob(static_cast<SIZE_T>(length), &cached)))
@@ -263,11 +342,8 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 					input.seekg(0);
 					input.read(static_cast<char*>(cached->GetBufferPointer()),
 						static_cast<std::streamsize>(length));
-					ComPtr<ID3D11ShaderReflection> reflection;
-					const bool validDxbc = input &&
-						std::memcmp(cached->GetBufferPointer(), "DXBC", 4) == 0 &&
-						SUCCEEDED(D3DReflect(cached->GetBufferPointer(), cached->GetBufferSize(),
-							IID_PPV_ARGS(&reflection)));
+					const bool validDxbc = input && ValidateDxbcContainer(
+						cached->GetBufferPointer(), cached->GetBufferSize());
 					if (validDxbc)
 					{
 						*bytecode = cached.Detach();
@@ -286,7 +362,15 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 	// memory only after acquiring ownership.
 	static std::mutex xboxCompilerMutex;
 	std::lock_guard compilerLock(xboxCompilerMutex);
-	HeapCompact(GetProcessHeap(), 0);
+	static uint32 xboxCacheMissCount{};
+	const uint64 preCompileCommitBytes = QueryProcessPrivateCommitBytes();
+	// HeapCompact is itself a global stop-the-world operation. At low pressure,
+	// running it for every newly encountered shader makes scene transitions much
+	// slower than the compilation. Keep periodic compaction and immediately use it
+	// whenever commitment approaches the compiler's transient-risk range.
+	if (((++xboxCacheMissCount & 15u) == 1u) ||
+		preCompileCommitBytes >= 3072ull * 1024 * 1024)
+		HeapCompact(GetProcessHeap(), 0);
 	// A cache hit above remains safe and avoids invoking the Xbox compiler. For
 	// a cache miss, reserve ample space below the title cap for xbsc_xs.dll's
 	// transient working set. Series S traces showed one compilation interval grow
@@ -343,10 +427,34 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 		fs::create_directories(directory, error);
 		if (!error)
 		{
-			std::ofstream output(path, std::ios::binary | std::ios::trunc);
-			if (output)
-				output.write(static_cast<const char*>(compiled->GetBufferPointer()),
-					static_cast<std::streamsize>(compiled->GetBufferSize()));
+			const fs::path temporaryPath = path.string() + ".tmp";
+			bool cacheWritten = false;
+			{
+				std::ofstream output(temporaryPath, std::ios::binary | std::ios::trunc);
+				if (output)
+				{
+					output.write(static_cast<const char*>(compiled->GetBufferPointer()),
+						static_cast<std::streamsize>(compiled->GetBufferSize()));
+					output.flush();
+					cacheWritten = output.good();
+				}
+			}
+			if (cacheWritten)
+			{
+				fs::rename(temporaryPath, path, error);
+				if (error)
+				{
+					error.clear();
+					fs::remove(path, error);
+					error.clear();
+					fs::rename(temporaryPath, path, error);
+				}
+			}
+			else
+			{
+				error.clear();
+				fs::remove(temporaryPath, error);
+			}
 		}
 	}
 	*bytecode = compiled.Detach();
@@ -700,6 +808,7 @@ public:
 	ID3D11PixelShader* Pixel() const { return m_ps.Get(); }
 	ID3D11GeometryShader* Geometry() const { return m_gs.Get(); }
 	ID3D11GeometryShader* StreamoutGeometry() const { return m_streamoutGs.Get(); }
+	bool UsesStreamoutStorage() const { return m_usesStreamoutStorage; }
 	ID3DBlob* Bytecode() const { return m_bytecode.Get(); }
 	uint64 BaseHash() const { return m_baseHash; }
 	uint64 AuxHash() const { return m_auxHash; }
@@ -892,11 +1001,10 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 
 	bool CompileGeneratedGeometryShader(ID3D11Device* device, const std::string& source)
 	{
-		// The text translator does not model Cemu's macro-based streamout blocks.
-		// Leaving those declarations in the generated HLSL makes an otherwise
-		// recoverable shader fail before the reflected compatibility path runs.
-		if (source.find("XFB_BLOCK_LAYOUT(") != std::string::npos)
-			return false;
+		// XFB declarations live outside main() and do not participate in the raster
+		// geometry program translated below. Older code rejected the complete shader
+		// when it saw one, unnecessarily replacing valid GS logic with a topology-only
+		// compatibility shader. Streamout itself is handled independently.
 		const size_t inputMarker = source.find("V2G_LAYOUT in ");
 		const size_t inputOpen = inputMarker == std::string::npos ? std::string::npos :
 			source.find('{', inputMarker);
@@ -1123,6 +1231,30 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 			body.replace(scan, 13, "outputStream.Append(cemuOutput);");
 		while ((scan = body.find("EndPrimitive();")) != std::string::npos)
 			body.replace(scan, 15, "outputStream.RestartStrip();");
+		bool translatedStreamoutWrites = false;
+		size_t storageWrite{};
+		while ((storageWrite = body.find("sb_buffer[", storageWrite)) != std::string::npos)
+		{
+			const size_t addressBegin = storageWrite + 10;
+			const size_t addressEnd = body.find(']', addressBegin);
+			const size_t equals = addressEnd == std::string::npos ? std::string::npos :
+				body.find('=', addressEnd);
+			const size_t semicolon = equals == std::string::npos ? std::string::npos :
+				body.find(';', equals);
+			if (addressEnd == std::string::npos || equals == std::string::npos ||
+				semicolon == std::string::npos)
+				break;
+			const std::string address = body.substr(addressBegin, addressEnd - addressBegin);
+			const size_t valueBegin = body.find_first_not_of(" \t\r\n", equals + 1);
+			if (valueBegin == std::string::npos || valueBegin >= semicolon)
+				break;
+			const std::string value = body.substr(valueBegin, semicolon - valueBegin);
+			const std::string replacement = fmt::format(
+				"cemuStreamout.Store(({}) * 4, asuint({}));", address, value);
+			body.replace(storageWrite, semicolon - storageWrite + 1, replacement);
+			storageWrite += replacement.size();
+			translatedStreamoutWrites = true;
+		}
 		const std::string signature = fmt::format(
 			"[maxvertexcount({})]\nvoid main({} GeometryInput inputVertices[{}], inout {}<GeometryOutput> outputStream)",
 			maxVertices, inputPrimitive,
@@ -1132,6 +1264,12 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 		body.replace(body.find("void main()"), 11, signature);
 		const size_t mainBrace = body.find('{', body.find(signature));
 		body.insert(mainBrace + 1, "\nGeometryOutput cemuOutput = (GeometryOutput)0;");
+		if (translatedStreamoutWrites)
+		{
+			hlsl = fmt::format("RWByteAddressBuffer cemuStreamout : register(u{});\n",
+				StreamoutUavSlot) + hlsl;
+			m_usesStreamoutStorage = true;
+		}
 		hlsl += body;
 		UINT samplerSwizzleSlot{};
 		for (UINT slot : m_uniformSlots)
@@ -1617,6 +1755,7 @@ void main(point GeometryInput inputVertices[1],
 		}
 		catch (const std::exception& ex)
 		{
+			m_compiled = false;
 			cemuLog_log(LogType::Force, "D3D11 HLSL shader {:016x}_{:016x} failed: {}",
 				m_baseHash, m_auxHash, ex.what());
 		}
@@ -1680,8 +1819,7 @@ void main(point GeometryInput inputVertices[1],
 			auto resources = compiler.get_shader_resources();
 			const auto executionModel = compiler.get_execution_model();
 #if defined(CEMU_UWP)
-			// Native transform feedback is disabled on Series S below, but the SPIR-V
-			// still contains its extra stage outputs. Leaving those exports in the
+			// The SPIR-V contains extra transform-feedback stage outputs. Leaving them in the
 			// ordinary raster HLSL is enough for xbsc to reject the native function.
 			// XFB locations are allocated after all regular stage outputs by the
 			// decompiler, so filter only that trailing interface range. Position and
@@ -1756,6 +1894,21 @@ void main(point GeometryInput inputVertices[1],
 					m_uniformSlots[originalBinding] = uniformSlot;
 				uniformSlot += count;
 			}
+			UINT uavSlot{ StreamoutUavSlot };
+			for (const auto& resource : resources.storage_buffers)
+			{
+				const UINT count = descriptorCount(resource);
+				if (count > D3D11_1_UAV_SLOT_COUNT - uavSlot)
+					throw std::runtime_error("shader requires more D3D11.1 UAV slots than available");
+				spirv_cross::HLSLResourceBinding binding{};
+				binding.stage = executionModel;
+				binding.desc_set = compiler.get_decoration(resource.id, spv::DecorationDescriptorSet);
+				binding.binding = compiler.get_decoration(resource.id, spv::DecorationBinding);
+				binding.uav.register_binding = uavSlot;
+				compiler.add_hlsl_resource_binding(binding);
+				uavSlot += count;
+				m_usesStreamoutStorage = true;
+			}
 			// SPIRV-Cross' HLSL backend recognizes geometry-stage reflection but
 			// cannot emit its entry point or stream operations. Calling compile()
 			// therefore throws CompilerError("Unsupported shader stage"). Keep the
@@ -1763,6 +1916,11 @@ void main(point GeometryInput inputVertices[1],
 			// shader instead of losing the stage (or stopping in the debugger).
 			if (executionModel == spv::ExecutionModelGeometry)
 			{
+				// The generic HLSL backend cannot emit a geometry entry point. Reset the
+				// reflected storage flag here; the syntax translator enables it again only
+				// after it has successfully lowered the sb_buffer writes to ByteAddressBuffer
+				// stores in the generated geometry shader.
+				m_usesStreamoutStorage = false;
 				DumpUnsupportedGeometrySource(source, spirv);
 				if (CompileKnownGeometryShader(device))
 				{
@@ -1811,13 +1969,6 @@ void main(point GeometryInput inputVertices[1],
 				m_samplerSwizzleSlot = uniformSlot;
 			}
 			std::vector<uint32>().swap(spirv);
-
-#if defined(CEMU_UWP)
-			// The translation scope above has released glslang/SPIRV-Cross. Give the
-			// allocator a chance to return their transient regions before xbsc_xs.dll
-			// begins its own large allocation phase.
-			HeapCompact(GetProcessHeap(), 0);
-#endif
 			ComPtr<ID3DBlob> errors;
 			HRESULT hr = CompileHLSLCached(hlsl.data(), hlsl.size(), profile,
 				RuntimeShaderCompileFlags(),
@@ -1868,6 +2019,7 @@ void main(point GeometryInput inputVertices[1],
 		}
 		catch (const std::exception& ex)
 		{
+			m_compiled = false;
 			cemuLog_log(LogType::Force, "D3D11 shader {:016x}_{:016x} failed: {}", m_baseHash, m_auxHash, ex.what());
 		}
 	}
@@ -1899,14 +2051,13 @@ void main(point GeometryInput inputVertices[1],
 			return false;
 
 #if defined(CEMU_UWP)
-		// newbe_xs/xbsc accepts the D3D11 stream-output object but aborts while
-		// materializing its native function on Series S, which irreversibly removes
-		// the D3D11On12 device. Keep the ordinary raster shader compiled and let the
-		// renderer skip only native transform feedback. streamout_begin() clears all
-		// pending SO ranges when this object is absent, preventing stale GPU data from
-		// being copied into a later vertex range.
+		// Series S D3D11On12 validates this object but xbsc_xs aborts later while
+		// materializing its native function ("Broken function found"), removing the
+		// complete D3D12 device with DXGI_ERROR_DEVICE_REMOVED. Do not call the API
+		// on UWP. The renderer's unavailable-source fallback clears the destination
+		// range, so stale transform-feedback vertices cannot become giant triangles.
 		cemuLog_logOnce(LogType::Force,
-			"D3D11 Series S stream-output compatibility: native transform feedback disabled");
+			"D3D11 Series S stream-output compatibility fallback active");
 		return true;
 #endif
 
@@ -1988,6 +2139,7 @@ void main(point GeometryInput inputVertices[1],
 	std::array<UINT, 256> m_uniformSlots{};
 	UINT m_samplerSwizzleSlot{ InvalidSlot };
 	bool m_usesRuntimeSwizzle{};
+	bool m_usesStreamoutStorage{};
 };
 
 class D3D11Query final : public LatteQueryObject
@@ -2029,6 +2181,11 @@ public:
 	void CopyAliasToBase();
 	bool IsIncompatibleAlias() const { return m_incompatibleAlias; }
 private:
+	struct AliasStagingResource
+	{
+		D3D11_TEXTURE2D_DESC desc{};
+		ComPtr<ID3D11Texture2D> texture;
+	};
 	bool CreateIncompatibleAlias(const FormatInfo& requested);
 	bool CopySubresourcesRaw(ID3D11Resource* source, DXGI_FORMAT sourceFormat,
 		UINT sourceFirstMip, UINT sourceFirstSlice, UINT sourceMipLevels,
@@ -2039,6 +2196,7 @@ private:
 	ComPtr<ID3D11DepthStencilView> m_dsv;
 	DXGI_FORMAT m_rtvFormat{ DXGI_FORMAT_UNKNOWN };
 	ComPtr<ID3D11Resource> m_aliasResource;
+	std::vector<AliasStagingResource> m_aliasStagingResources;
 	bool m_incompatibleAlias{};
 	UINT m_aliasSliceCount{ 1 };
 	uint64 m_syncedVersion{ (std::numeric_limits<uint64>::max)() };
@@ -2531,19 +2689,33 @@ bool D3D11TextureView::CopySubresourcesRaw(ID3D11Resource* source, DXGI_FORMAT s
 			stagingDesc.SampleDesc.Count = 1;
 			stagingDesc.Usage = D3D11_USAGE_STAGING;
 			stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-			ComPtr<ID3D11Texture2D> staging;
-			if (FAILED(texture->Owner()->GetDevice()->CreateTexture2D(&stagingDesc, nullptr, &staging)))
-				return false;
-			context->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, source,
+			ID3D11Texture2D* staging{};
+			auto stagingIt = std::find_if(m_aliasStagingResources.begin(),
+				m_aliasStagingResources.end(), [&stagingDesc](const auto& candidate) {
+					return std::memcmp(&candidate.desc, &stagingDesc, sizeof(stagingDesc)) == 0;
+				});
+			if (stagingIt == m_aliasStagingResources.end())
+			{
+				AliasStagingResource candidate{};
+				candidate.desc = stagingDesc;
+				if (FAILED(texture->Owner()->GetDevice()->CreateTexture2D(
+					&candidate.desc, nullptr, &candidate.texture)))
+					return false;
+				m_aliasStagingResources.emplace_back(std::move(candidate));
+				staging = m_aliasStagingResources.back().texture.Get();
+			}
+			else
+				staging = stagingIt->texture.Get();
+			context->CopySubresourceRegion(staging, 0, 0, 0, 0, source,
 				D3D11CalcSubresource(sourceFirstMip + mip, sourceFirstSlice + slice,
 					sourceMipLevels), nullptr);
 			D3D11_MAPPED_SUBRESOURCE mapped{};
-			if (FAILED(context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped)))
+			if (FAILED(context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped)))
 				return false;
 			context->UpdateSubresource(destination,
 				D3D11CalcSubresource(destinationFirstMip + mip, destinationFirstSlice + slice,
 					destinationMipLevels), nullptr, mapped.pData, mapped.RowPitch, mapped.DepthPitch);
-			context->Unmap(staging.Get(), 0);
+			context->Unmap(staging, 0);
 		}
 	}
 	return true;
@@ -2592,6 +2764,18 @@ void D3D11TextureView::CopyAliasToBase()
 		texture->Resource(), firstMip, firstSlice,
 		texture->EffectiveMipLevels());
 }
+
+class D3D11CachedFBO final : public LatteCachedFBO
+{
+public:
+	explicit D3D11CachedFBO(uint64 key) : LatteCachedFBO(key) {}
+
+	std::array<ID3D11RenderTargetView*, 8> targets{};
+	ID3D11DepthStencilView* depth{};
+	std::array<bool, 8> blendable{ true, true, true, true, true, true, true, true };
+	UINT targetCount{};
+	bool nativeViewsCached{};
+};
 
 class D3D11Readback final : public LatteTextureReadbackInfo
 {
@@ -2783,6 +2967,10 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 	RefreshBackBuffer();
 	cemuLog_log(LogType::Force, "------- Init Direct3D 11 graphics backend -------");
 	cemuLog_log(LogType::Force, "Direct3D 11 backend: native GX2 resources, shaders, draw calls and SwapChainPanel presentation.");
+	cemuLog_log(LogType::Force,
+		"Direct3D 11 feature level 0x{:04X}; transform feedback path: {}",
+		static_cast<uint32>(m_device->GetFeatureLevel()),
+		UseTFViaSSBO() ? "shader storage" : "native compatibility");
 }
 
 D3D11Renderer::~D3D11Renderer() = default;
@@ -3099,6 +3287,9 @@ void D3D11Renderer::DrawBackbufferQuad(LatteTextureView* textureView, RendererOu
 	m_context->Draw(3, 0);
 	ID3D11ShaderResourceView* nullView = nullptr;
 	m_context->PSSetShaderResources(0, 1, &nullView);
+	// The presentation pass owns the immediate context temporarily. Force the
+	// next GX2 draw to restore only the native states it displaced.
+	InvalidateNativePipelineState();
 }
 
 void D3D11Renderer::Flush(bool waitIdle)
@@ -3203,6 +3394,38 @@ uint64 D3D11Renderer::QueryProcessCommitBytes() const
 	return QueryProcessPrivateCommitBytes();
 }
 
+uint64 D3D11Renderer::ShaderFailureKey(RendererShader::ShaderType type, uint64 baseHash,
+	uint64 auxHash) const
+{
+	uint64 key = HashBytes(&type, sizeof(type));
+	key = HashBytes(&baseHash, sizeof(baseHash), key);
+	return HashBytes(&auxHash, sizeof(auxHash), key);
+}
+
+uint64 D3D11Renderer::CurrentLogicalPipelineKey() const
+{
+	uint64 key = HashBytes(&m_inputLayoutKey, sizeof(m_inputLayoutKey));
+	const auto appendShader = [&key](LatteDecompilerShader* context)
+	{
+		auto* shader = context ? static_cast<D3D11Shader*>(context->shader) : nullptr;
+		const uint64 base = shader ? shader->BaseHash() : 0;
+		const uint64 aux = shader ? shader->AuxHash() : 0;
+		key = HashBytes(&base, sizeof(base), key);
+		key = HashBytes(&aux, sizeof(aux), key);
+	};
+	appendShader(LatteSHRC_GetActiveVertexShader());
+	appendShader(LatteSHRC_GetActivePixelShader());
+	appendShader(LatteSHRC_GetActiveGeometryShader());
+	const auto rasterizer = reinterpret_cast<uintptr_t>(m_appliedRasterizerState.Get());
+	const auto blend = reinterpret_cast<uintptr_t>(m_appliedBlendState.Get());
+	const auto depth = reinterpret_cast<uintptr_t>(m_appliedDepthStencilState.Get());
+	key = HashBytes(&rasterizer, sizeof(rasterizer), key);
+	key = HashBytes(&blend, sizeof(blend), key);
+	key = HashBytes(&depth, sizeof(depth), key);
+	key = HashBytes(&m_appliedPrimitiveTopology, sizeof(m_appliedPrimitiveTopology), key);
+	return key;
+}
+
 void D3D11Renderer::CheckMemoryPressure()
 {
 #if defined(CEMU_UWP)
@@ -3212,9 +3435,9 @@ void D3D11Renderer::CheckMemoryPressure()
 	// driver-backed commitment. Adding DXGI CurrentUsage double-counts a large
 	// portion of graphics memory, so use it only as diagnostic information.
 	// Ten-frame sampling is sufficient in the normal state. Once the soft limit
-	// has been crossed, enforce retirement every frame until hysteresis clears;
-	// the Series S log showed in-flight commitment grow from 2817 to 5099 MiB
-	// while the old guard waited between effective reclamation opportunities.
+	// has been crossed, continue observing every frame, while the heavy recovery
+	// below is separately rate-limited to avoid turning memory hysteresis into a
+	// recurring GPU stall.
 	if ((++m_memoryCheckFrame % 10) != 0 && !m_memoryPressureActive)
 		return;
 	const uint64 processCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
@@ -3230,9 +3453,27 @@ void D3D11Renderer::CheckMemoryPressure()
 			cemuLog_log(LogType::Force,
 				"D3D11 Series S memory pressure cleared (process commit {} MB)", processCommitMB);
 			m_memoryPressureActive = false;
+			m_lastHeavyMemoryRecoveryFrame = 0;
+			m_lastHeavyMemoryRecoveryCommitMB = 0;
 		}
 		return;
 	}
+
+	// Waiting for GPU retirement, trimming the driver and compacting the process
+	// heap are deliberately expensive. Repeating that sequence every present
+	// while usage remains inside the hysteresis band causes periodic frame stalls.
+	// Keep the 4096 MiB trigger, but repeat a heavy recovery only after meaningful
+	// growth, at a slow maintenance interval, or at a guarded emergency cadence.
+	const uint32 framesSinceHeavyRecovery =
+		m_memoryCheckFrame - m_lastHeavyMemoryRecoveryFrame;
+	const bool commitGrewMaterially = m_lastHeavyMemoryRecoveryCommitMB == 0 ||
+		processCommitMB >= m_lastHeavyMemoryRecoveryCommitMB + 128;
+	const bool emergencyPressure = processCommitMB >= 4608;
+	const bool shouldRunHeavyRecovery = !m_memoryPressureActive ||
+		(framesSinceHeavyRecovery >= 10 && (commitGrewMaterially || emergencyPressure)) ||
+		framesSinceHeavyRecovery >= 300;
+	if (!shouldRunHeavyRecovery)
+		return;
 
 	ClearShaderResources();
 	m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
@@ -3248,11 +3489,16 @@ void D3D11Renderer::CheckMemoryPressure()
 	// retired so it cannot permanently consume Series S headroom.
 	m_bufferCopyScratch.Reset();
 	m_bufferCopyScratchCapacity = 0;
+	m_feedbackViews.clear();
+	m_feedbackResources.clear();
+	m_feedbackSnapshots.clear();
 	ComPtr<IDXGIDevice3> dxgiDevice3;
 	if (SUCCEEDED(m_device.As(&dxgiDevice3)))
 		dxgiDevice3->Trim();
 	HeapCompact(GetProcessHeap(), 0);
 	const uint64 postTrimCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	m_lastHeavyMemoryRecoveryFrame = m_memoryCheckFrame;
+	m_lastHeavyMemoryRecoveryCommitMB = postTrimCommitMB;
 	if (!m_memoryPressureActive || evictedTextures != 0 || (m_memoryCheckFrame % 60) == 0)
 	{
 		cemuLog_log(LogType::Force,
@@ -3423,22 +3669,37 @@ void D3D11Renderer::AppendOverlayDebugInfo()
 void D3D11Renderer::renderTarget_setViewport(float x, float y, float width, float height, float nearZ, float farZ, bool)
 {
 	const D3D11_VIEWPORT viewport{ x, y, (std::max)(width, 1.0f), (std::max)(height, 1.0f), nearZ, farZ };
-	m_context->RSSetViewports(1, &viewport);
+	if (!m_appliedViewportValid || std::memcmp(&m_appliedViewport, &viewport, sizeof(viewport)) != 0)
+	{
+		m_context->RSSetViewports(1, &viewport);
+		m_appliedViewport = viewport;
+		m_appliedViewportValid = true;
+	}
 }
 
 void D3D11Renderer::renderTarget_setScissor(sint32 x, sint32 y, sint32 width, sint32 height)
 {
 	const D3D11_RECT rect{ x, y, x + (std::max)(width, 1), y + (std::max)(height, 1) };
-	m_context->RSSetScissorRects(1, &rect);
+	if (!m_appliedScissorValid || std::memcmp(&m_appliedScissor, &rect, sizeof(rect)) != 0)
+	{
+		m_context->RSSetScissorRects(1, &rect);
+		m_appliedScissor = rect;
+		m_appliedScissorValid = true;
+	}
 }
 
-LatteCachedFBO* D3D11Renderer::rendertarget_createCachedFBO(uint64 key) { return new LatteCachedFBO(key); }
-void D3D11Renderer::rendertarget_deleteCachedFBO(LatteCachedFBO*)
+LatteCachedFBO* D3D11Renderer::rendertarget_createCachedFBO(uint64 key) { return new D3D11CachedFBO(key); }
+void D3D11Renderer::rendertarget_deleteCachedFBO(LatteCachedFBO* fbo)
 {
 	// LatteMRT::DeleteCachedFBO owns the common object and deletes it after this
 	// renderer hook returns. D3D11 has no separate framebuffer object to free;
 	// deleting here as well caused a double-free during the post-Present texture
 	// cleanup, commonly surfacing as a read from 0xFFFFFFFFFFFFFFFF.
+	if (m_activeFbo == fbo)
+	{
+		m_activeFbo = nullptr;
+		m_activeFeedbackLoop = false;
+	}
 }
 
 void D3D11Renderer::UnbindTextureHazards()
@@ -3452,15 +3713,46 @@ void D3D11Renderer::UnbindTextureHazards()
 void D3D11Renderer::ClearShaderResources()
 {
 	std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> empty{};
-	m_context->VSSetShaderResources(0, static_cast<UINT>(empty.size()), empty.data());
-	m_context->PSSetShaderResources(0, static_cast<UINT>(empty.size()), empty.data());
-	m_context->GSSetShaderResources(0, static_cast<UINT>(empty.size()), empty.data());
+	const auto clearStage = [&](auto& stage, auto setResources)
+	{
+		UINT usedSlots{};
+		for (UINT slot = 0; slot < stage.size(); ++slot)
+			if (stage[slot])
+				usedSlots = slot + 1;
+		if (usedSlots)
+			setResources(usedSlots, empty.data());
+		stage.fill(nullptr);
+	};
+	clearStage(m_boundShaderResources[static_cast<uint32>(LatteConst::ShaderType::Vertex)],
+		[this](UINT count, ID3D11ShaderResourceView** values) {
+			m_context->VSSetShaderResources(0, count, values);
+		});
+	clearStage(m_boundShaderResources[static_cast<uint32>(LatteConst::ShaderType::Pixel)],
+		[this](UINT count, ID3D11ShaderResourceView** values) {
+			m_context->PSSetShaderResources(0, count, values);
+		});
+	clearStage(m_boundShaderResources[static_cast<uint32>(LatteConst::ShaderType::Geometry)],
+		[this](UINT count, ID3D11ShaderResourceView** values) {
+			m_context->GSSetShaderResources(0, count, values);
+		});
+	for (auto& stage : m_logicalShaderResources)
+		stage.fill(nullptr);
 	m_boundTextures.fill(nullptr);
 	m_feedbackViews.clear();
 	m_feedbackResources.clear();
 }
 
-void D3D11Renderer::ResolveTextureFeedbackLoops(
+void D3D11Renderer::InvalidateNativePipelineState()
+{
+	m_appliedRasterizerState.Reset();
+	m_appliedBlendState.Reset();
+	m_appliedDepthStencilState.Reset();
+	m_appliedBlendStateValid = false;
+	m_appliedDepthStencilStateValid = false;
+	m_appliedPrimitiveTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+}
+
+bool D3D11Renderer::ResolveTextureFeedbackLoops(
 	const std::array<ID3D11RenderTargetView*, 8>& targets, ID3D11DepthStencilView* depth)
 {
 	// These holders only need to bridge the current feedback resolution. The
@@ -3486,46 +3778,158 @@ void D3D11Renderer::ResolveTextureFeedbackLoops(
 		outputResources.emplace_back(std::move(resource));
 	}
 	if (outputResources.empty())
-		return;
+		return false;
 #if defined(CEMU_UWP)
 	// A feedback snapshot duplicates the complete native texture. Under pressure,
 	// let D3D11 null the conflicting SRV when the output merger is rebound. A
 	// localized missing sample is preferable to crossing the Series S title cap.
 	constexpr uint64 feedbackSnapshotStopBytes = 4096ull * 1024 * 1024;
 	if (QueryProcessPrivateCommitBytes() >= feedbackSnapshotStopBytes)
-		return;
-#endif
-	std::unordered_map<ID3D11Resource*, ComPtr<ID3D11Resource>> snapshotsBySource;
-
-	auto replaceConflicts = [&](auto getResources, auto setResources)
 	{
-		std::array<ComPtr<ID3D11ShaderResourceView>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> current;
-		std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> raw{};
-		getResources(raw.data());
-		for (UINT slot = 0; slot < raw.size(); ++slot)
-			current[slot].Attach(raw[slot]);
-
-		for (UINT slot = 0; slot < current.size(); ++slot)
+		m_feedbackSnapshots.clear();
+		return false;
+	}
+#endif
+	struct SubresourceRange
+	{
+		UINT firstMip{};
+		UINT mipCount{ 1 };
+		UINT firstSlice{};
+		UINT sliceCount{ 1 };
+		bool volume{};
+	};
+	const auto rangesOverlap = [](const SubresourceRange& left, const SubresourceRange& right)
+	{
+		const bool mipOverlap = left.firstMip < right.firstMip + right.mipCount &&
+			right.firstMip < left.firstMip + left.mipCount;
+		if (!mipOverlap)
+			return false;
+		if (left.volume || right.volume)
+			return true;
+		return left.firstSlice < right.firstSlice + right.sliceCount &&
+			right.firstSlice < left.firstSlice + left.sliceCount;
+	};
+	const auto srvRange = [](const D3D11_SHADER_RESOURCE_VIEW_DESC& desc)
+	{
+		SubresourceRange range{};
+		switch (desc.ViewDimension)
 		{
-			if (!current[slot])
+		case D3D11_SRV_DIMENSION_TEXTURE1D:
+			range.firstMip = desc.Texture1D.MostDetailedMip; range.mipCount = desc.Texture1D.MipLevels; break;
+		case D3D11_SRV_DIMENSION_TEXTURE1DARRAY:
+			range.firstMip = desc.Texture1DArray.MostDetailedMip; range.mipCount = desc.Texture1DArray.MipLevels;
+			range.firstSlice = desc.Texture1DArray.FirstArraySlice; range.sliceCount = desc.Texture1DArray.ArraySize; break;
+		case D3D11_SRV_DIMENSION_TEXTURE2D:
+			range.firstMip = desc.Texture2D.MostDetailedMip; range.mipCount = desc.Texture2D.MipLevels; break;
+		case D3D11_SRV_DIMENSION_TEXTURE2DARRAY:
+			range.firstMip = desc.Texture2DArray.MostDetailedMip; range.mipCount = desc.Texture2DArray.MipLevels;
+			range.firstSlice = desc.Texture2DArray.FirstArraySlice; range.sliceCount = desc.Texture2DArray.ArraySize; break;
+		case D3D11_SRV_DIMENSION_TEXTURE2DMSARRAY:
+			range.firstSlice = desc.Texture2DMSArray.FirstArraySlice; range.sliceCount = desc.Texture2DMSArray.ArraySize; break;
+		case D3D11_SRV_DIMENSION_TEXTURE3D:
+			range.firstMip = desc.Texture3D.MostDetailedMip; range.mipCount = desc.Texture3D.MipLevels; range.volume = true; break;
+		case D3D11_SRV_DIMENSION_TEXTURECUBE:
+			range.firstMip = desc.TextureCube.MostDetailedMip; range.mipCount = desc.TextureCube.MipLevels; range.sliceCount = 6; break;
+		case D3D11_SRV_DIMENSION_TEXTURECUBEARRAY:
+			range.firstMip = desc.TextureCubeArray.MostDetailedMip; range.mipCount = desc.TextureCubeArray.MipLevels;
+			range.firstSlice = desc.TextureCubeArray.First2DArrayFace; range.sliceCount = desc.TextureCubeArray.NumCubes * 6; break;
+		default: break;
+		}
+		if (range.mipCount == UINT_MAX) range.mipCount = UINT_MAX - range.firstMip;
+		return range;
+	};
+	const auto rtvRange = [](ID3D11View* view)
+	{
+		SubresourceRange range{};
+		ComPtr<ID3D11RenderTargetView> rtv;
+		if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&rtv))))
+		{
+			D3D11_RENDER_TARGET_VIEW_DESC desc{}; rtv->GetDesc(&desc);
+			switch (desc.ViewDimension)
+			{
+			case D3D11_RTV_DIMENSION_TEXTURE1D: range.firstMip = desc.Texture1D.MipSlice; break;
+			case D3D11_RTV_DIMENSION_TEXTURE1DARRAY: range.firstMip = desc.Texture1DArray.MipSlice; range.firstSlice = desc.Texture1DArray.FirstArraySlice; range.sliceCount = desc.Texture1DArray.ArraySize; break;
+			case D3D11_RTV_DIMENSION_TEXTURE2D: range.firstMip = desc.Texture2D.MipSlice; break;
+			case D3D11_RTV_DIMENSION_TEXTURE2DARRAY: range.firstMip = desc.Texture2DArray.MipSlice; range.firstSlice = desc.Texture2DArray.FirstArraySlice; range.sliceCount = desc.Texture2DArray.ArraySize; break;
+			case D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY: range.firstSlice = desc.Texture2DMSArray.FirstArraySlice; range.sliceCount = desc.Texture2DMSArray.ArraySize; break;
+			case D3D11_RTV_DIMENSION_TEXTURE3D: range.firstMip = desc.Texture3D.MipSlice; range.firstSlice = desc.Texture3D.FirstWSlice; range.sliceCount = desc.Texture3D.WSize; range.volume = true; break;
+			default: break;
+			}
+			return range;
+		}
+		ComPtr<ID3D11DepthStencilView> dsv;
+		if (SUCCEEDED(view->QueryInterface(IID_PPV_ARGS(&dsv))))
+		{
+			D3D11_DEPTH_STENCIL_VIEW_DESC desc{}; dsv->GetDesc(&desc);
+			switch (desc.ViewDimension)
+			{
+			case D3D11_DSV_DIMENSION_TEXTURE1D: range.firstMip = desc.Texture1D.MipSlice; break;
+			case D3D11_DSV_DIMENSION_TEXTURE1DARRAY: range.firstMip = desc.Texture1DArray.MipSlice; range.firstSlice = desc.Texture1DArray.FirstArraySlice; range.sliceCount = desc.Texture1DArray.ArraySize; break;
+			case D3D11_DSV_DIMENSION_TEXTURE2D: range.firstMip = desc.Texture2D.MipSlice; break;
+			case D3D11_DSV_DIMENSION_TEXTURE2DARRAY: range.firstMip = desc.Texture2DArray.MipSlice; range.firstSlice = desc.Texture2DArray.FirstArraySlice; range.sliceCount = desc.Texture2DArray.ArraySize; break;
+			case D3D11_DSV_DIMENSION_TEXTURE2DMSARRAY: range.firstSlice = desc.Texture2DMSArray.FirstArraySlice; range.sliceCount = desc.Texture2DMSArray.ArraySize; break;
+			default: break;
+			}
+		}
+		return range;
+	};
+	struct OutputView { ID3D11Resource* resource{}; SubresourceRange range{}; };
+	std::vector<OutputView> outputViews;
+	for (auto* target : targets)
+	{
+		if (!target) continue;
+		ComPtr<ID3D11Resource> resource; target->GetResource(&resource);
+		outputViews.push_back({ resource.Get(), rtvRange(target) });
+	}
+	if (depth)
+	{
+		ComPtr<ID3D11Resource> resource; depth->GetResource(&resource);
+		outputViews.push_back({ resource.Get(), rtvRange(depth) });
+	}
+	bool feedbackResolved = false;
+	bool outputsUnbound = false;
+	auto replaceConflicts = [&](auto& logicalStage, auto& physicalStage, auto setResources)
+	{
+		for (UINT slot = 0; slot < logicalStage.size(); ++slot)
+		{
+			auto& logical = logicalStage[slot];
+			if (!logical)
 				continue;
 			ComPtr<ID3D11Resource> source;
-			current[slot]->GetResource(&source);
-			const bool conflict = std::any_of(outputResources.begin(), outputResources.end(),
-				[&](const auto& output) { return output.Get() == source.Get(); });
+			logical->GetResource(&source);
+			D3D11_SHADER_RESOURCE_VIEW_DESC logicalDesc{};
+			logical->GetDesc(&logicalDesc);
+			const auto inputRange = srvRange(logicalDesc);
+			const bool conflict = std::any_of(outputViews.begin(), outputViews.end(),
+				[&](const auto& output) { return output.resource == source.Get() && rangesOverlap(inputRange, output.range); });
 			if (!conflict)
+			{
+				ID3D11ShaderResourceView* original = logical.Get();
+				setResources(slot, &original);
+				physicalStage[slot] = logical;
 				continue;
+			}
+			feedbackResolved = true;
+			if (!outputsUnbound)
+			{
+				m_context->OMSetRenderTargets(0, nullptr, nullptr);
+				outputsUnbound = true;
+			}
+			// From this point on the original SRV must not remain physically bound: if
+			// snapshot allocation or view creation fails, rebinding the output would
+			// make D3D11 silently null it while our binding cache still claimed it was
+			// active. Keep the logical binding for a later retry, but make the physical
+			// state explicit now.
+			ID3D11ShaderResourceView* nullView{};
+			setResources(slot, &nullView);
+			physicalStage[slot].Reset();
 
 			ComPtr<ID3D11Resource> snapshot;
-			if (const auto existing = snapshotsBySource.find(source.Get());
-				existing != snapshotsBySource.end())
-			{
-				snapshot = existing->second;
-			}
-			else
 			{
 				D3D11_RESOURCE_DIMENSION dimension{};
 				source->GetType(&dimension);
+				uint64 descriptorKey = HashBytes(&dimension, sizeof(dimension));
+				auto cached = m_feedbackSnapshots.end();
 				if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D)
 				{
 					ComPtr<ID3D11Texture1D> sourceTexture;
@@ -3535,10 +3939,10 @@ void D3D11Renderer::ResolveTextureFeedbackLoops(
 					desc.Usage = D3D11_USAGE_DEFAULT;
 					desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 					desc.CPUAccessFlags = 0;
-					ComPtr<ID3D11Texture1D> copy;
-					if (FAILED(m_device->CreateTexture1D(&desc, nullptr, &copy)))
-						continue;
-					snapshot = copy;
+					descriptorKey = HashBytes(&desc, sizeof(desc), descriptorKey);
+					cached = std::find_if(m_feedbackSnapshots.begin(), m_feedbackSnapshots.end(), [&](const auto& item) { return item.source.Get() == source.Get() && item.descriptorKey == descriptorKey; });
+					if (cached != m_feedbackSnapshots.end()) snapshot = cached->copy;
+					else { ComPtr<ID3D11Texture1D> copy; if (FAILED(m_device->CreateTexture1D(&desc, nullptr, &copy))) continue; snapshot = copy; }
 				}
 				else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D)
 				{
@@ -3549,10 +3953,10 @@ void D3D11Renderer::ResolveTextureFeedbackLoops(
 					desc.Usage = D3D11_USAGE_DEFAULT;
 					desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 					desc.CPUAccessFlags = 0;
-					ComPtr<ID3D11Texture2D> copy;
-					if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &copy)))
-						continue;
-					snapshot = copy;
+					descriptorKey = HashBytes(&desc, sizeof(desc), descriptorKey);
+					cached = std::find_if(m_feedbackSnapshots.begin(), m_feedbackSnapshots.end(), [&](const auto& item) { return item.source.Get() == source.Get() && item.descriptorKey == descriptorKey; });
+					if (cached != m_feedbackSnapshots.end()) snapshot = cached->copy;
+					else { ComPtr<ID3D11Texture2D> copy; if (FAILED(m_device->CreateTexture2D(&desc, nullptr, &copy))) continue; snapshot = copy; }
 				}
 				else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
 				{
@@ -3563,50 +3967,75 @@ void D3D11Renderer::ResolveTextureFeedbackLoops(
 					desc.Usage = D3D11_USAGE_DEFAULT;
 					desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
 					desc.CPUAccessFlags = 0;
-					ComPtr<ID3D11Texture3D> copy;
-					if (FAILED(m_device->CreateTexture3D(&desc, nullptr, &copy)))
-						continue;
-					snapshot = copy;
+					descriptorKey = HashBytes(&desc, sizeof(desc), descriptorKey);
+					cached = std::find_if(m_feedbackSnapshots.begin(), m_feedbackSnapshots.end(), [&](const auto& item) { return item.source.Get() == source.Get() && item.descriptorKey == descriptorKey; });
+					if (cached != m_feedbackSnapshots.end()) snapshot = cached->copy;
+					else { ComPtr<ID3D11Texture3D> copy; if (FAILED(m_device->CreateTexture3D(&desc, nullptr, &copy))) continue; snapshot = copy; }
 				}
 				if (!snapshot)
 					continue;
-				m_context->CopyResource(snapshot.Get(), source.Get());
-				snapshotsBySource.emplace(source.Get(), snapshot);
-				m_feedbackResources.emplace_back(snapshot);
+				if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D)
+				{
+					ComPtr<ID3D11Texture3D> texture; source.As(&texture);
+					D3D11_TEXTURE3D_DESC desc{}; texture->GetDesc(&desc);
+					const UINT mipCount = (std::min)(inputRange.mipCount,
+						desc.MipLevels - (std::min)(inputRange.firstMip, desc.MipLevels));
+					for (UINT mip = 0; mip < mipCount; ++mip)
+						m_context->CopySubresourceRegion(snapshot.Get(), inputRange.firstMip + mip, 0, 0, 0,
+							source.Get(), inputRange.firstMip + mip, nullptr);
+				}
+				else
+				{
+					UINT resourceMipLevels = 1;
+					if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D) { ComPtr<ID3D11Texture1D> texture; source.As(&texture); D3D11_TEXTURE1D_DESC desc{}; texture->GetDesc(&desc); resourceMipLevels = desc.MipLevels; }
+					else { ComPtr<ID3D11Texture2D> texture; source.As(&texture); D3D11_TEXTURE2D_DESC desc{}; texture->GetDesc(&desc); resourceMipLevels = desc.MipLevels; }
+					const UINT mipCount = (std::min)(inputRange.mipCount, resourceMipLevels - (std::min)(inputRange.firstMip, resourceMipLevels));
+					for (UINT slice = 0; slice < inputRange.sliceCount; ++slice)
+						for (UINT mip = 0; mip < mipCount; ++mip)
+						{
+							const UINT subresource = D3D11CalcSubresource(inputRange.firstMip + mip, inputRange.firstSlice + slice, resourceMipLevels);
+							m_context->CopySubresourceRegion(snapshot.Get(), subresource, 0, 0, 0, source.Get(), subresource, nullptr);
+						}
+				}
+				if (cached == m_feedbackSnapshots.end())
+				{
+					if (m_feedbackSnapshots.size() >= 4)
+						m_feedbackSnapshots.erase(std::min_element(m_feedbackSnapshots.begin(), m_feedbackSnapshots.end(), [](const auto& a, const auto& b) { return a.lastUsedFrame < b.lastUsedFrame; }));
+					m_feedbackSnapshots.push_back({ source, snapshot, descriptorKey, LatteGPUState.frameCounter });
+				}
+				else
+					cached->lastUsedFrame = LatteGPUState.frameCounter;
 			}
 
-			D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
-			current[slot]->GetDesc(&viewDesc);
 			ComPtr<ID3D11ShaderResourceView> snapshotView;
-			if (FAILED(m_device->CreateShaderResourceView(snapshot.Get(), &viewDesc, &snapshotView)))
+			if (FAILED(m_device->CreateShaderResourceView(snapshot.Get(), &logicalDesc, &snapshotView)))
 				continue;
 			ID3D11ShaderResourceView* replacement = snapshotView.Get();
 			setResources(slot, &replacement);
+			physicalStage[slot] = snapshotView;
 			m_feedbackViews.emplace_back(std::move(snapshotView));
 		}
 	};
 
 	replaceConflicts(
-		[this](ID3D11ShaderResourceView** values) {
-			m_context->VSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, values);
-		},
+		m_logicalShaderResources[static_cast<uint32>(LatteConst::ShaderType::Vertex)],
+		m_boundShaderResources[static_cast<uint32>(LatteConst::ShaderType::Vertex)],
 		[this](UINT slot, ID3D11ShaderResourceView** value) {
 			m_context->VSSetShaderResources(slot, 1, value);
 		});
 	replaceConflicts(
-		[this](ID3D11ShaderResourceView** values) {
-			m_context->PSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, values);
-		},
+		m_logicalShaderResources[static_cast<uint32>(LatteConst::ShaderType::Pixel)],
+		m_boundShaderResources[static_cast<uint32>(LatteConst::ShaderType::Pixel)],
 		[this](UINT slot, ID3D11ShaderResourceView** value) {
 			m_context->PSSetShaderResources(slot, 1, value);
 		});
 	replaceConflicts(
-		[this](ID3D11ShaderResourceView** values) {
-			m_context->GSGetShaderResources(0, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT, values);
-		},
+		m_logicalShaderResources[static_cast<uint32>(LatteConst::ShaderType::Geometry)],
+		m_boundShaderResources[static_cast<uint32>(LatteConst::ShaderType::Geometry)],
 		[this](UINT slot, ID3D11ShaderResourceView** value) {
 			m_context->GSSetShaderResources(slot, 1, value);
 		});
+	return feedbackResolved;
 }
 
 void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
@@ -3614,26 +4043,29 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 	m_boundColorBlendable.fill(true);
 	if (!fbo)
 	{
+		m_activeFbo = nullptr;
+		m_activeFeedbackLoop = false;
 		m_context->OMSetRenderTargets(0, nullptr, nullptr);
 		return;
 	}
-	std::array<ID3D11RenderTargetView*, 8> targets{};
-	UINT count{};
-	for (UINT i = 0; i < targets.size(); ++i)
+	m_activeFbo = fbo;
+	auto* nativeFbo = static_cast<D3D11CachedFBO*>(fbo);
+	if (!nativeFbo->nativeViewsCached)
 	{
-		if (fbo->colorBuffer[i].texture)
+		for (UINT i = 0; i < nativeFbo->targets.size(); ++i)
 		{
+			if (!fbo->colorBuffer[i].texture)
+				continue;
 			auto* textureView = static_cast<D3D11TextureView*>(fbo->colorBuffer[i].texture);
-			textureView->PrepareForRenderTarget();
-			targets[i] = textureView->RTV();
-			if (targets[i])
+			nativeFbo->targets[i] = textureView->RTV();
+			if (nativeFbo->targets[i])
 			{
-				count = i + 1;
+				nativeFbo->targetCount = i + 1;
 				UINT formatSupport{};
 				// The view may reinterpret a typeless GX2 allocation. Pipeline
 				// state must follow the bound RTV, not the base texture format.
 				const auto format = textureView->RTVFormat();
-				m_boundColorBlendable[i] =
+				nativeFbo->blendable[i] =
 					SUCCEEDED(m_device->CheckFormatSupport(format, &formatSupport)) &&
 					(formatSupport & D3D11_FORMAT_SUPPORT_BLENDABLE) != 0;
 			}
@@ -3642,18 +4074,23 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 					"D3D11 color attachment {} has no render-target view (format 0x{:x})",
 					i, static_cast<uint32>(fbo->colorBuffer[i].texture->format));
 		}
+		nativeFbo->depth = fbo->depthBuffer.texture ?
+			static_cast<D3D11TextureView*>(fbo->depthBuffer.texture)->DSV() : nullptr;
+		nativeFbo->nativeViewsCached = true;
 	}
-	ID3D11DepthStencilView* depth = fbo->depthBuffer.texture ?
-		static_cast<D3D11TextureView*>(fbo->depthBuffer.texture)->DSV() : nullptr;
+	for (UINT i = 0; i < nativeFbo->targets.size(); ++i)
+		if (fbo->colorBuffer[i].texture)
+			static_cast<D3D11TextureView*>(fbo->colorBuffer[i].texture)->PrepareForRenderTarget();
 	if (fbo->depthBuffer.texture)
 		static_cast<D3D11TextureView*>(fbo->depthBuffer.texture)->PrepareForRenderTarget();
+	m_boundColorBlendable = nativeFbo->blendable;
 	// Vulkan uses VK_EXT_attachment_feedback_loop_layout when a title samples
 	// an attachment that it is also updating. D3D11 forbids simultaneous SRV
 	// and RTV/DSV bindings, so snapshot only the conflicting inputs before the
 	// output merger is rebound. This preserves the pre-draw contents instead
 	// of letting the runtime silently replace the SRV with null.
-	ResolveTextureFeedbackLoops(targets, depth);
-	m_context->OMSetRenderTargets(count, targets.data(), depth);
+	m_activeFeedbackLoop = ResolveTextureFeedbackLoops(nativeFbo->targets, nativeFbo->depth);
+	m_context->OMSetRenderTargets(nativeFbo->targetCount, nativeFbo->targets.data(), nativeFbo->depth);
 }
 
 void* D3D11Renderer::texture_acquireTextureUploadBuffer(uint32 size)
@@ -3973,7 +4410,7 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 		view->PrepareForSampling();
 	m_boundTextures[unit] = view ? view->SRV() : nullptr;
 	ID3D11ShaderResourceView* srv = view ? view->SRV() : nullptr;
-	auto bindTexture = [&](LatteDecompilerShader* shader, uint32 textureIndex,
+	auto bindTexture = [&](LatteDecompilerShader* shader, uint32 textureIndex, uint32 stageIndex,
 		auto setResources, auto setSamplers)
 	{
 		auto* nativeShader = shader ? static_cast<D3D11Shader*>(shader->shader) : nullptr;
@@ -4017,13 +4454,18 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 		ID3D11SamplerState* sampler = textureView ?
 			GetSamplerState(shader, textureIndex, textureView->baseTexture) : nullptr;
 		setResources(binding, &srv);
+		if (binding < m_boundShaderResources[stageIndex].size())
+		{
+			m_boundShaderResources[stageIndex][binding] = srv;
+			m_logicalShaderResources[stageIndex][binding] = srv;
+		}
 		setSamplers(binding, &sampler);
 	};
 	if (unit < LATTE_CEMU_VS_TEX_UNIT_BASE)
 	{
 		const uint32 textureIndex = unit - LATTE_CEMU_PS_TEX_UNIT_BASE;
 		auto* shader = LatteSHRC_GetActivePixelShader();
-		bindTexture(shader, textureIndex,
+		bindTexture(shader, textureIndex, static_cast<uint32>(LatteConst::ShaderType::Pixel),
 			[this](UINT binding, ID3D11ShaderResourceView** value) { m_context->PSSetShaderResources(binding, 1, value); },
 			[this](UINT binding, ID3D11SamplerState** value) { m_context->PSSetSamplers(binding, 1, value); });
 	}
@@ -4031,7 +4473,7 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 	{
 		const uint32 textureIndex = unit - LATTE_CEMU_VS_TEX_UNIT_BASE;
 		auto* shader = LatteSHRC_GetActiveVertexShader();
-		bindTexture(shader, textureIndex,
+		bindTexture(shader, textureIndex, static_cast<uint32>(LatteConst::ShaderType::Vertex),
 			[this](UINT binding, ID3D11ShaderResourceView** value) { m_context->VSSetShaderResources(binding, 1, value); },
 			[this](UINT binding, ID3D11SamplerState** value) { m_context->VSSetSamplers(binding, 1, value); });
 	}
@@ -4039,7 +4481,7 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 	{
 		const uint32 textureIndex = unit - LATTE_CEMU_GS_TEX_UNIT_BASE;
 		auto* shader = LatteSHRC_GetActiveGeometryShader();
-		bindTexture(shader, textureIndex,
+		bindTexture(shader, textureIndex, static_cast<uint32>(LatteConst::ShaderType::Geometry),
 			[this](UINT binding, ID3D11ShaderResourceView** value) { m_context->GSSetShaderResources(binding, 1, value); },
 			[this](UINT binding, ID3D11SamplerState** value) { m_context->GSSetSamplers(binding, 1, value); });
 	}
@@ -4206,6 +4648,7 @@ void D3D11Renderer::surfaceCopy_copySurfaceWithFormatConversion(LatteTexture* so
 	ID3D11ShaderResourceView* nullResource = nullptr;
 	m_context->PSSetShaderResources(0, 1, &nullResource);
 	m_context->OMSetRenderTargets(0, nullptr, nullptr);
+	InvalidateNativePipelineState();
 	m_graphicsStateInvalid = true;
 	LatteGPUState.repeatTextureInitialization = true;
 }
@@ -4219,9 +4662,28 @@ void D3D11Renderer::bufferCache_init(const sint32 size)
 	desc.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
 	ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &m_bufferCache), "Create buffer cache");
 	desc.ByteWidth = LatteStreamout_GetRingBufferSize();
-	desc.BindFlags = D3D11_BIND_STREAM_OUTPUT;
-	for (auto& streamoutBuffer : m_streamoutBuffers)
-		ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &streamoutBuffer), "Create stream-output ring buffer");
+	if (UseTFViaSSBO())
+	{
+		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+		desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+		ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &m_streamoutStorageBuffer),
+			"Create shader stream-output ring buffer");
+		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+		uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+		uavDesc.Buffer.NumElements = desc.ByteWidth / sizeof(uint32);
+		uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+		ThrowIfFailed(m_device->CreateUnorderedAccessView(m_streamoutStorageBuffer.Get(),
+			&uavDesc, &m_streamoutStorageUav), "Create shader stream-output UAV");
+	}
+	else
+	{
+		desc.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+		desc.MiscFlags = 0;
+		for (auto& streamoutBuffer : m_streamoutBuffers)
+			ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &streamoutBuffer),
+				"Create stream-output ring buffer");
+	}
 	for (auto& buffer : m_vertexBuffers)
 		buffer = m_bufferCache;
 }
@@ -4296,13 +4758,23 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 		return;
 	if (m_streamoutActive)
 	{
-		std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
-		std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
-		m_context->SOSetTargets(static_cast<UINT>(empty.size()), empty.data(), offsets.data());
+		if (m_streamoutUsesStorage)
+		{
+			ID3D11UnorderedAccessView* empty{};
+			m_context->OMSetRenderTargetsAndUnorderedAccessViews(
+				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
+				StreamoutUavSlot, 1, &empty, nullptr);
+		}
+		else
+		{
+			std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
+			std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
+			m_context->SOSetTargets(static_cast<UINT>(empty.size()), empty.data(), offsets.data());
+		}
 		m_streamoutActive = false;
 	}
-	ID3D11Buffer* sourceBuffer{};
-	for (UINT i = 0; i < m_streamoutBuffers.size(); ++i)
+	ID3D11Buffer* sourceBuffer = m_streamoutUsesStorage ? m_streamoutStorageBuffer.Get() : nullptr;
+	for (UINT i = 0; !sourceBuffer && i < m_streamoutBuffers.size(); ++i)
 	{
 		if (m_streamoutEnabled[i] && m_streamoutOffsets[i] == src)
 		{
@@ -4313,8 +4785,25 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 	if (!sourceBuffer)
 	{
 		cemuLog_logOnce(LogType::Force,
-			"D3D11 stream-output copy skipped: no completed source for offset {} size {}",
+			"D3D11 stream-output source unavailable; clearing destination offset {} size {}",
 			src, size);
+		// Never leave an older transform-feedback result in the vertex cache. A
+		// later draw interprets those stale bytes as positions and produces the
+		// characteristic screen-spanning triangles. Zeroing is a deterministic
+		// degradation if the Xbox driver rejects an individual SO signature.
+		static constexpr size_t zeroChunkSize = 64 * 1024;
+		static const std::array<uint8, zeroChunkSize> zeroChunk{};
+		uint32 cleared{};
+		while (cleared < size)
+		{
+			const uint32 chunk = (std::min)(size - cleared,
+				static_cast<uint32>(zeroChunk.size()));
+			D3D11_BOX destinationBox{ dst + cleared, 0, 0, dst + cleared + chunk, 1, 1 };
+			m_context->UpdateSubresource(m_bufferCache.Get(), 0, &destinationBox,
+				zeroChunk.data(), 0, 0);
+			cleared += chunk;
+		}
+		std::memset(m_bufferCacheShadow.data() + dst, 0, size);
 		return;
 	}
 	D3D11_BOX box{ src, 0, 0, src + size, 1, 1 };
@@ -4420,6 +4909,12 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 {
 	if (m_deviceLost.load(std::memory_order_relaxed))
 		return nullptr;
+	const uint64 failureKey = ShaderFailureKey(type, baseHash, auxHash);
+	{
+		std::lock_guard lock(m_failedShaderMutex);
+		if (m_failedShaderKeys.contains(failureKey))
+			return nullptr;
+	}
 #if defined(CEMU_UWP)
 	// The desktop cache benefits from parallel compilation, but Xbox compiler and
 	// translation workers share one strict process budget. Serialize the complete
@@ -4429,9 +4924,6 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 		return nullptr;
 	constexpr uint64 resumeCompileMB = 3840;
 	constexpr uint64 stopCompileMB = 4096;
-	// Return fragmented process-heap regions before deciding whether enough
-	// headroom remains for the Xbox shader compiler's next transient peak.
-	HeapCompact(GetProcessHeap(), 0);
 	uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
 	if (m_shaderCompilationBlocked.load(std::memory_order_relaxed))
 	{
@@ -4458,15 +4950,22 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 	{
 		auto shader = std::make_unique<D3D11Shader>(m_device.Get(), type, baseHash,
 			auxHash, isGfxPackSource, source);
-#if defined(CEMU_UWP)
-		// glslang, SPIRV-Cross and the Xbox shader compiler create many short-lived
-		// allocations. Compact between synchronous compilations so free process
-		// heap regions can be returned before the next shader raises the high-water
-		// mark of the 5 GiB title budget.
-		HeapCompact(GetProcessHeap(), 0);
-#endif
-		if (!shader->IsCompiled())
+		// Xbox may report a shader creation failure as a native xbsc exception and
+		// remove the underlying D3D12 device before the D3D11 call returns. Latch
+		// that state immediately on the compilation thread so no other worker keeps
+		// feeding the removed device until the next Present/GPU-idle check.
+		if (!CheckDeviceHealth("shader creation"))
+		{
+			std::lock_guard lock(m_failedShaderMutex);
+			m_failedShaderKeys.insert(failureKey);
 			return nullptr;
+		}
+		if (!shader->IsCompiled())
+		{
+			std::lock_guard lock(m_failedShaderMutex);
+			m_failedShaderKeys.insert(failureKey);
+			return nullptr;
+		}
 		m_compiledShaderCount.fetch_add(1, std::memory_order_relaxed);
 		return shader.release();
 	}
@@ -4477,6 +4976,28 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 		m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
 #endif
 		OutputDebugStringA("[Cemu/D3D11] Shader creation skipped: out of memory\n");
+		return nullptr;
+	}
+	catch (const std::exception& ex)
+	{
+		{
+			std::lock_guard lock(m_failedShaderMutex);
+			m_failedShaderKeys.insert(failureKey);
+		}
+		cemuLog_log(LogType::Force,
+			"D3D11 shader {:016x}_{:016x} quarantined after creation failure: {}",
+			baseHash, auxHash, ex.what());
+		CheckDeviceHealth("shader exception");
+		return nullptr;
+	}
+	catch (...)
+	{
+		{
+			std::lock_guard lock(m_failedShaderMutex);
+			m_failedShaderKeys.insert(failureKey);
+		}
+		OutputDebugStringA("[Cemu/D3D11] Shader quarantined after Xbox compiler exception\n");
+		CheckDeviceHealth("Xbox shader compiler exception");
 		return nullptr;
 	}
 }
@@ -4526,10 +5047,23 @@ void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffs
 
 void D3D11Renderer::streamout_begin()
 {
+	m_streamoutUsesStorage = false;
 	auto* gsContext = LatteSHRC_GetActiveGeometryShader();
 	auto* vsContext = LatteSHRC_GetActiveVertexShader();
 	auto* shader = gsContext ? static_cast<D3D11Shader*>(gsContext->shader) :
 		(vsContext ? static_cast<D3D11Shader*>(vsContext->shader) : nullptr);
+	const bool hasOutputBuffer = std::any_of(m_streamoutEnabled.begin(),
+		m_streamoutEnabled.end(), [](bool enabled) { return enabled; });
+	if (shader && shader->UsesStreamoutStorage() && hasOutputBuffer && m_streamoutStorageUav)
+	{
+		ID3D11UnorderedAccessView* uav = m_streamoutStorageUav.Get();
+		m_context->OMSetRenderTargetsAndUnorderedAccessViews(
+			D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
+			StreamoutUavSlot, 1, &uav, nullptr);
+		m_streamoutUsesStorage = true;
+		m_streamoutActive = true;
+		return;
+	}
 	if (!shader || !shader->StreamoutGeometry())
 	{
 		cemuLog_logOnce(LogType::Force,
@@ -4542,13 +5076,13 @@ void D3D11Renderer::streamout_begin()
 		return;
 	}
 	std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> buffers{};
-	bool hasOutputBuffer = false;
+	bool hasNativeOutputBuffer = false;
 	for (UINT i = 0; i < buffers.size(); ++i)
 	{
 		buffers[i] = m_streamoutEnabled[i] ? m_streamoutBuffers[i].Get() : nullptr;
-		hasOutputBuffer |= buffers[i] != nullptr;
+		hasNativeOutputBuffer |= buffers[i] != nullptr;
 	}
-	if (!hasOutputBuffer)
+	if (!hasNativeOutputBuffer)
 	{
 		m_streamoutEnabled.fill(false);
 		m_streamoutActive = false;
@@ -4563,11 +5097,22 @@ void D3D11Renderer::streamout_rendererFinishDrawcall()
 {
 	if (m_streamoutActive)
 	{
-		std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
-		std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
-		m_context->SOSetTargets(static_cast<UINT>(empty.size()), empty.data(), offsets.data());
+		if (m_streamoutUsesStorage)
+		{
+			ID3D11UnorderedAccessView* empty{};
+			m_context->OMSetRenderTargetsAndUnorderedAccessViews(
+				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
+				StreamoutUavSlot, 1, &empty, nullptr);
+		}
+		else
+		{
+			std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
+			std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
+			m_context->SOSetTargets(static_cast<UINT>(empty.size()), empty.data(), offsets.data());
+		}
 		m_streamoutActive = false;
 	}
+	m_streamoutUsesStorage = false;
 	m_streamoutEnabled.fill(false);
 	// Restore the title's GS or the RECT emulation GS. Merely restoring the
 	// title GS loses rectangle emulation on subsequent draws in the sequence.
@@ -4777,7 +5322,8 @@ bool D3D11Renderer::UpdateDynamicConstantBuffer(ComPtr<ID3D11Buffer>& buffer,
 	return true;
 }
 
-void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 verticesPerInstance)
+void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 verticesPerInstance,
+	bool fullUpdate, bool aluConstantsDirty, uint32 uniformBufferDirtyMask)
 {
 	if (!shader || shader->resourceMapping.uniformVarsBufferBindingPoint < 0 ||
 		shader->uniform.uniformRangeSize == 0)
@@ -4785,50 +5331,82 @@ void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 vert
 	const uint32 stage = static_cast<uint32>(shader->shaderType);
 	if (stage >= m_uniformScratch.size())
 		return;
+	auto* nativeShader = static_cast<D3D11Shader*>(shader->shader);
+	if (!nativeShader)
+		return;
+	uint64 shaderKey = HashBytes(&shader->shaderType, sizeof(shader->shaderType));
+	const uint64 baseHash = nativeShader->BaseHash();
+	const uint64 auxHash = nativeShader->AuxHash();
+	shaderKey = HashBytes(&baseHash, sizeof(baseHash), shaderKey);
+	shaderKey = HashBytes(&auxHash, sizeof(auxHash), shaderKey);
 	auto& bytes = m_uniformScratch[stage];
-	bytes.assign(Align16(shader->uniform.uniformRangeSize), 0);
+	const uint32 alignedSize = Align16(shader->uniform.uniformRangeSize);
+	fullUpdate |= bytes.size() != alignedSize || m_uniformShaderKeys[stage] != shaderKey;
+	if (fullUpdate)
+	{
+		bytes.assign(alignedSize, 0);
+		m_uniformShaderKeys[stage] = shaderKey;
+	}
 	auto dataAt = [&bytes](sint32 offset) { return bytes.data() + offset; };
-	for (auto& entry : shader->uniform.list_ufTexRescale)
+	bool valuesChanged = fullUpdate;
+	const auto updateValue = [&](sint32 offset, const void* value, size_t size)
 	{
-		float* scale = LatteTexture_getEffectiveTextureScale(shader->shaderType, entry.texUnit);
-		std::memcpy(entry.currentValue, scale, sizeof(float) * 2);
-		std::memcpy(dataAt(entry.uniformLocation), scale, sizeof(float) * 2);
-	}
-	if (shader->uniform.loc_alphaTestRef >= 0)
-		*reinterpret_cast<float*>(dataAt(shader->uniform.loc_alphaTestRef)) =
-			LatteGPUState.contextNew.SX_ALPHA_REF.get_ALPHA_TEST_REF();
-	if (shader->uniform.loc_pointSize >= 0)
+		if (offset < 0 || std::memcmp(dataAt(offset), value, size) == 0)
+			return;
+		std::memcpy(dataAt(offset), value, size);
+		valuesChanged = true;
+	};
+	// Texture bindings, fixed-function state and viewport changes terminate a
+	// fast-draw sequence in the common renderer. Populate those values only when
+	// rebuilding the sequence; walking every texture-scale entry on thousands of
+	// repeated Wind Waker draws was pure CPU overhead.
+	if (fullUpdate)
 	{
-		float pointSize = static_cast<float>(LatteGPUState.contextNew.PA_SU_POINT_SIZE.get_WIDTH()) / 8.0f;
-		*reinterpret_cast<float*>(dataAt(shader->uniform.loc_pointSize)) =
-			pointSize == 0.0f ? 1.0f / 8.0f : pointSize;
+		for (auto& entry : shader->uniform.list_ufTexRescale)
+		{
+			float* scale = LatteTexture_getEffectiveTextureScale(shader->shaderType, entry.texUnit);
+			std::memcpy(entry.currentValue, scale, sizeof(float) * 2);
+			updateValue(entry.uniformLocation, scale, sizeof(float) * 2);
+		}
+		const float alphaTestRef = LatteGPUState.contextNew.SX_ALPHA_REF.get_ALPHA_TEST_REF();
+		updateValue(shader->uniform.loc_alphaTestRef, &alphaTestRef, sizeof(alphaTestRef));
+		const float rawPointSize = static_cast<float>(LatteGPUState.contextNew.PA_SU_POINT_SIZE.get_WIDTH()) / 8.0f;
+		const float pointSize = rawPointSize == 0.0f ? 1.0f / 8.0f : rawPointSize;
+		updateValue(shader->uniform.loc_pointSize, &pointSize, sizeof(pointSize));
+		if (shader->uniform.loc_windowSpaceToClipSpaceTransform >= 0)
+		{
+			sint32 width{}, height{};
+			LatteRenderTarget_GetCurrentVirtualViewportSize(&width, &height);
+			const float value[] = { 2.0f / (std::max)(width, 1), 2.0f / (std::max)(height, 1) };
+			updateValue(shader->uniform.loc_windowSpaceToClipSpaceTransform, value, sizeof(value));
+		}
+		if (shader->uniform.loc_fragCoordScale >= 0)
+		{
+			float value[4]{};
+			LatteMRT::GetCurrentFragCoordScale(value);
+			updateValue(shader->uniform.loc_fragCoordScale, value, sizeof(value));
+		}
 	}
+	updateValue(shader->uniform.loc_verticesPerInstance, &verticesPerInstance,
+		sizeof(verticesPerInstance));
+	for (UINT buffer = 0; buffer < LATTE_NUM_STREAMOUT_BUFFER; ++buffer)
+		updateValue(shader->uniform.loc_streamoutBufferBase[buffer],
+			&m_streamoutOffsets[buffer], sizeof(m_streamoutOffsets[buffer]));
 	if (shader->uniform.loc_remapped >= 0)
-		LatteBufferCache_LoadRemappedUniforms(shader,
-			reinterpret_cast<float*>(dataAt(shader->uniform.loc_remapped)), true,
-			(1u << LATTE_NUM_MAX_UNIFORM_BUFFERS) - 1);
-	if (shader->uniform.loc_uniformRegister >= 0)
+		valuesChanged |= LatteBufferCache_LoadRemappedUniforms(shader,
+			reinterpret_cast<float*>(dataAt(shader->uniform.loc_remapped)),
+			fullUpdate || aluConstantsDirty,
+			fullUpdate ? (1u << LATTE_NUM_MAX_UNIFORM_BUFFERS) - 1 : uniformBufferDirtyMask);
+	if (shader->uniform.loc_uniformRegister >= 0 && (fullUpdate || aluConstantsDirty))
 	{
 		const sint32 registerOffset = shader->shaderType == LatteConst::ShaderType::Vertex ? 0x400 : 0;
 		const uint32* registers = LatteGPUState.contextRegister + mmSQ_ALU_CONSTANT0_0 + registerOffset;
-		std::memcpy(dataAt(shader->uniform.loc_uniformRegister), registers,
-			shader->uniform.count_uniformRegister * 16);
+		std::memcpy(dataAt(shader->uniform.loc_uniformRegister), registers, shader->uniform.count_uniformRegister * 16);
+		valuesChanged = true;
 	}
-	if (shader->uniform.loc_windowSpaceToClipSpaceTransform >= 0)
-	{
-		sint32 width{}, height{};
-		LatteRenderTarget_GetCurrentVirtualViewportSize(&width, &height);
-		float* value = reinterpret_cast<float*>(dataAt(shader->uniform.loc_windowSpaceToClipSpaceTransform));
-		value[0] = 2.0f / (std::max)(width, 1);
-		value[1] = 2.0f / (std::max)(height, 1);
-	}
-	if (shader->uniform.loc_fragCoordScale >= 0)
-		LatteMRT::GetCurrentFragCoordScale(reinterpret_cast<float*>(dataAt(shader->uniform.loc_fragCoordScale)));
-	if (shader->uniform.loc_verticesPerInstance >= 0)
-		*reinterpret_cast<uint32*>(dataAt(shader->uniform.loc_verticesPerInstance)) = verticesPerInstance;
 
-	if (!m_uniformVarsBuffers[stage] || !m_uniformScratchUploaded[stage] ||
-		m_uploadedUniformScratch[stage] != bytes)
+	if (valuesChanged && (!m_uniformVarsBuffers[stage] || !m_uniformScratchUploaded[stage] ||
+		m_uploadedUniformScratch[stage] != bytes))
 	{
 		if (!UpdateDynamicConstantBuffer(m_uniformVarsBuffers[stage],
 			m_uniformVarsBufferCapacity[stage], bytes.data(), static_cast<UINT>(bytes.size())))
@@ -4836,10 +5414,13 @@ void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 vert
 		m_uploadedUniformScratch[stage] = bytes;
 		m_uniformScratchUploaded[stage] = true;
 	}
-	ID3D11Buffer* buffer = m_uniformVarsBuffers[stage].Get();
-	auto* nativeShader = static_cast<D3D11Shader*>(shader->shader);
-	if (!nativeShader)
+	// Map/Unmap updates the storage already bound to the stage. Fast draws keep
+	// the same shader and resource layout, so rebinding the same constant buffer
+	// here would add up to three D3D11On12 calls per draw (over twenty thousand
+	// calls per Wind Waker frame) without changing GPU state.
+	if (!fullUpdate)
 		return;
+	ID3D11Buffer* buffer = m_uniformVarsBuffers[stage].Get();
 	const sint32 originalBinding = shader->resourceMapping.uniformVarsBufferBindingPoint;
 	const UINT binding = originalBinding >= 0 ?
 		nativeShader->UniformSlot(static_cast<UINT>(originalBinding)) : D3D11Shader::InvalidSlot;
@@ -4991,6 +5572,10 @@ void D3D11Renderer::ApplyPipelineState()
 	rasterizer.FrontCounterClockwise =
 		registers.PA_SU_SC_MODE_CNTL.get_FRONT_FACE() ==
 		Latte::LATTE_PA_SU_SC_MODE_CNTL::E_FRONTFACE::CCW;
+	if (rasterizer.CullMode == D3D11_CULL_NONE)
+		// Winding has no effect without culling. Canonicalizing it avoids a second
+		// D3D11On12 pipeline for an otherwise identical rasterizer state.
+		rasterizer.FrontCounterClockwise = FALSE;
 	const bool nearClipDisabled = registers.PA_CL_CLIP_CNTL.get_ZCLIP_NEAR_DISABLE();
 	const bool farClipDisabled = registers.PA_CL_CLIP_CNTL.get_ZCLIP_FAR_DISABLE();
 	// D3D11 exposes a single depth-clipping switch whereas GX2 can disable the
@@ -5022,7 +5607,11 @@ void D3D11Renderer::ApplyPipelineState()
 		ThrowIfFailed(m_device->CreateRasterizerState(&rasterizer, &state), "Create GX2 rasterizer state");
 		rasterizerIt = m_rasterizerCache.emplace(rasterizerKey, std::move(state)).first;
 	}
-	m_context->RSSetState(rasterizerIt->second.Get());
+	if (m_appliedRasterizerState.Get() != rasterizerIt->second.Get())
+	{
+		m_context->RSSetState(rasterizerIt->second.Get());
+		m_appliedRasterizerState = rasterizerIt->second;
+	}
 
 	D3D11_BLEND_DESC1 blend{};
 	blend.AlphaToCoverageEnable = FALSE;
@@ -5060,12 +5649,33 @@ void D3D11Renderer::ApplyPipelineState()
 	{
 		target.LogicOpEnable = logicOpEnabled;
 		target.LogicOp = LogicOp(gx2LogicOp);
+		if (target.RenderTargetWriteMask == 0)
+		{
+			// All blend/logic fields are ignored when no component can be written.
+			// Normalize them before hashing to keep register noise out of the native
+			// D3D12 shader/pipeline cache used underneath D3D11On12.
+			target.BlendEnable = FALSE;
+			target.LogicOpEnable = FALSE;
+			target.LogicOp = D3D11_LOGIC_OP_COPY;
+		}
 		// D3D11.1 requires logic operations and fixed-function blending to be
 		// mutually exclusive for a render target. GX2's ROP selects the logic
 		// result, so disabling blending here preserves the effective operation and
 		// avoids an invalid CreateBlendState1 descriptor.
 		if (logicOpEnabled)
 			target.BlendEnable = FALSE;
+		// These fields are ignored when fixed-function blending is disabled. GX2
+		// titles still vary their registers, which otherwise creates distinct
+		// D3D11 state objects and D3D11On12 PSOs with identical behavior.
+		if (!target.BlendEnable)
+		{
+			target.SrcBlend = D3D11_BLEND_ONE;
+			target.DestBlend = D3D11_BLEND_ZERO;
+			target.BlendOp = D3D11_BLEND_OP_ADD;
+			target.SrcBlendAlpha = D3D11_BLEND_ONE;
+			target.DestBlendAlpha = D3D11_BLEND_ZERO;
+			target.BlendOpAlpha = D3D11_BLEND_OP_ADD;
+		}
 	}
 	const uint64 blendKey = HashBytes(&blend, sizeof(blend));
 	auto blendIt = m_blendCache.find(blendKey);
@@ -5106,11 +5716,37 @@ void D3D11Renderer::ApplyPipelineState()
 		}
 		blendIt = m_blendCache.emplace(blendKey, std::move(state)).first;
 	}
-	const float blendConstant[] = {
+	float blendConstant[] = {
 		registers.CB_BLEND_RED.get_RED(), registers.CB_BLEND_GREEN.get_GREEN(),
 		registers.CB_BLEND_BLUE.get_BLUE(), registers.CB_BLEND_ALPHA.get_ALPHA()
 	};
-	m_context->OMSetBlendState(blendIt->second.Get(), blendConstant, 0xFFFFFFFF);
+	const bool usesBlendConstant = std::any_of(std::begin(blend.RenderTarget),
+		std::end(blend.RenderTarget), [](const auto& target)
+		{
+			if (!target.BlendEnable)
+				return false;
+			return target.SrcBlend == D3D11_BLEND_BLEND_FACTOR ||
+				target.SrcBlend == D3D11_BLEND_INV_BLEND_FACTOR ||
+				target.DestBlend == D3D11_BLEND_BLEND_FACTOR ||
+				target.DestBlend == D3D11_BLEND_INV_BLEND_FACTOR ||
+				target.SrcBlendAlpha == D3D11_BLEND_BLEND_FACTOR ||
+				target.SrcBlendAlpha == D3D11_BLEND_INV_BLEND_FACTOR ||
+				target.DestBlendAlpha == D3D11_BLEND_BLEND_FACTOR ||
+				target.DestBlendAlpha == D3D11_BLEND_INV_BLEND_FACTOR;
+		});
+	if (!usesBlendConstant)
+		std::fill(std::begin(blendConstant), std::end(blendConstant), 0.0f);
+	const bool blendConstantChanged = !m_appliedBlendStateValid ||
+		!std::equal(std::begin(blendConstant), std::end(blendConstant),
+			m_appliedBlendConstant.begin());
+	if (m_appliedBlendState.Get() != blendIt->second.Get() || blendConstantChanged)
+	{
+		m_context->OMSetBlendState(blendIt->second.Get(), blendConstant, 0xFFFFFFFF);
+		m_appliedBlendState = blendIt->second;
+		std::copy(std::begin(blendConstant), std::end(blendConstant),
+			m_appliedBlendConstant.begin());
+		m_appliedBlendStateValid = true;
+	}
 
 	const auto& depthControl = registers.DB_DEPTH_CONTROL;
 	D3D11_DEPTH_STENCIL_DESC depth{};
@@ -5134,6 +5770,21 @@ void D3D11Renderer::ApplyPipelineState()
 	}
 	else
 		depth.BackFace = depth.FrontFace;
+	// Canonicalize fields that D3D11 ignores. This prevents register noise from
+	// multiplying native D3D12 pipeline variants without changing GX2 results.
+	if (!depth.DepthEnable)
+	{
+		depth.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+		depth.DepthFunc = D3D11_COMPARISON_ALWAYS;
+	}
+	if (!depth.StencilEnable)
+	{
+		depth.StencilReadMask = D3D11_DEFAULT_STENCIL_READ_MASK;
+		depth.StencilWriteMask = D3D11_DEFAULT_STENCIL_WRITE_MASK;
+		depth.FrontFace = { D3D11_STENCIL_OP_KEEP, D3D11_STENCIL_OP_KEEP,
+			D3D11_STENCIL_OP_KEEP, D3D11_COMPARISON_ALWAYS };
+		depth.BackFace = depth.FrontFace;
+	}
 	const uint64 depthKey = HashBytes(&depth, sizeof(depth));
 	auto depthIt = m_depthStencilCache.find(depthKey);
 	if (depthIt == m_depthStencilCache.end())
@@ -5142,8 +5793,16 @@ void D3D11Renderer::ApplyPipelineState()
 		ThrowIfFailed(m_device->CreateDepthStencilState(&depth, &state), "Create GX2 depth/stencil state");
 		depthIt = m_depthStencilCache.emplace(depthKey, std::move(state)).first;
 	}
-	m_context->OMSetDepthStencilState(depthIt->second.Get(),
-		registers.DB_STENCILREFMASK.get_STENCILREF_F());
+	const UINT stencilRef = depth.StencilEnable ?
+		registers.DB_STENCILREFMASK.get_STENCILREF_F() : 0;
+	if (m_appliedDepthStencilState.Get() != depthIt->second.Get() ||
+		!m_appliedDepthStencilStateValid || m_appliedStencilRef != stencilRef)
+	{
+		m_context->OMSetDepthStencilState(depthIt->second.Get(), stencilRef);
+		m_appliedDepthStencilState = depthIt->second;
+		m_appliedStencilRef = stencilRef;
+		m_appliedDepthStencilStateValid = true;
+	}
 }
 
 void D3D11Renderer::HandleSpecialState5()
@@ -5174,7 +5833,8 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 {
 	if (m_deviceLost.load(std::memory_order_relaxed))
 		return;
-	if (drawcallContext.isFirst || m_graphicsStateInvalid)
+	const bool rebuildGraphicsState = drawcallContext.isFirst || m_graphicsStateInvalid;
+	if (rebuildGraphicsState)
 	{
 		m_graphicsStateInvalid = false;
 		LatteSHRC_UpdateActiveShaders();
@@ -5215,6 +5875,23 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 			LatteGPUState.activeShaderHasError = true;
 			return;
 		}
+#if defined(CEMU_UWP)
+		// Active shaders only change when the GX2 graphics state is rebuilt. Keep
+		// their hashes for device-loss diagnostics without walking all three shader
+		// contexts on every draw in the sequence.
+		const auto captureShaderHash = [](LatteDecompilerShader* context, uint64& base, uint64& aux)
+		{
+			auto* shader = context ? static_cast<D3D11Shader*>(context->shader) : nullptr;
+			base = shader ? shader->BaseHash() : 0;
+			aux = shader ? shader->AuxHash() : 0;
+		};
+		captureShaderHash(LatteSHRC_GetActiveVertexShader(),
+			m_lastVertexShaderBase, m_lastVertexShaderAux);
+		captureShaderHash(LatteSHRC_GetActivePixelShader(),
+			m_lastPixelShaderBase, m_lastPixelShaderAux);
+		captureShaderHash(LatteSHRC_GetActiveGeometryShader(),
+			m_lastGeometryShaderBase, m_lastGeometryShaderAux);
+#endif
 		if (!UpdateInputLayout())
 		{
 			// A later draw in the same GX2 sequence must retry the layout instead
@@ -5254,29 +5931,41 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		stageUniformModifiedMask, !drawcallContext.isFirst);
 	LatteRenderTarget_updateViewport();
 	LatteRenderTarget_updateScissorBox();
-	UpdateUniformVars(LatteSHRC_GetActiveVertexShader(), count);
-	UpdateUniformVars(LatteSHRC_GetActivePixelShader(), count);
-	UpdateUniformVars(LatteSHRC_GetActiveGeometryShader(), count);
-	UpdateSamplerSwizzleBuffer(LatteSHRC_GetActiveVertexShader());
-	UpdateSamplerSwizzleBuffer(LatteSHRC_GetActivePixelShader());
-	UpdateSamplerSwizzleBuffer(LatteSHRC_GetActiveGeometryShader());
-#if defined(CEMU_UWP)
-	const auto captureShaderHash = [](LatteDecompilerShader* context, uint64& base, uint64& aux)
+	if (!rebuildGraphicsState && m_activeFbo && m_activeFeedbackLoop)
 	{
-		auto* shader = context ? static_cast<D3D11Shader*>(context->shader) : nullptr;
-		base = shader ? shader->BaseHash() : 0;
-		aux = shader ? shader->AuxHash() : 0;
-	};
-	captureShaderHash(LatteSHRC_GetActiveVertexShader(),
-		m_lastVertexShaderBase, m_lastVertexShaderAux);
-	captureShaderHash(LatteSHRC_GetActivePixelShader(),
-		m_lastPixelShaderBase, m_lastPixelShaderAux);
-	captureShaderHash(LatteSHRC_GetActiveGeometryShader(),
-		m_lastGeometryShaderBase, m_lastGeometryShaderAux);
-#endif
-	ApplyPipelineState();
-	m_context->IASetPrimitiveTopology(PrimitiveTopology(primitive));
+		auto* nativeFbo = static_cast<D3D11CachedFBO*>(m_activeFbo);
+		m_activeFeedbackLoop = ResolveTextureFeedbackLoops(nativeFbo->targets, nativeFbo->depth);
+		if (m_activeFeedbackLoop)
+			m_context->OMSetRenderTargets(nativeFbo->targetCount,
+				nativeFbo->targets.data(), nativeFbo->depth);
+	}
 	LatteStreamout_PrepareDrawcall(count, instanceCount);
+	UpdateUniformVars(LatteSHRC_GetActiveVertexShader(), count, rebuildGraphicsState,
+		drawcallContext.aluConstVSDirty, drawcallContext.vsUniformBufferDirtyMask);
+	UpdateUniformVars(LatteSHRC_GetActivePixelShader(), count, rebuildGraphicsState,
+		drawcallContext.aluConstPSDirty, drawcallContext.psUniformBufferDirtyMask);
+	UpdateUniformVars(LatteSHRC_GetActiveGeometryShader(), count, rebuildGraphicsState,
+		false, drawcallContext.gsUniformBufferDirtyMask);
+	if (rebuildGraphicsState)
+	{
+		UpdateSamplerSwizzleBuffer(LatteSHRC_GetActiveVertexShader());
+		UpdateSamplerSwizzleBuffer(LatteSHRC_GetActivePixelShader());
+		UpdateSamplerSwizzleBuffer(LatteSHRC_GetActiveGeometryShader());
+		ApplyPipelineState();
+	}
+	const auto topology = PrimitiveTopology(primitive);
+	if (m_appliedPrimitiveTopology != topology)
+	{
+		m_context->IASetPrimitiveTopology(topology);
+		m_appliedPrimitiveTopology = topology;
+	}
+	// D3D11On12 materializes native D3D12 pipelines from the complete logical
+	// combination. Keep the same combined identity used by explicit backends so
+	// diagnostics and failure admission operate on canonical states rather than
+	// on a stream of redundant component binds. The component objects themselves
+	// remain cached by their normalized descriptors in ApplyPipelineState().
+	if (rebuildGraphicsState && m_seenLogicalPipelines.size() < 8192)
+		m_seenLogicalPipelines.insert(CurrentLogicalPipelineKey());
 	bool drawIssued = false;
 
 	const bool rasterizerKilled =
@@ -5287,6 +5976,17 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		LatteGPUState.contextNew.PA_SU_SC_MODE_CNTL.get_CULL_BACK();
 	const bool skipRasterDraw =
 		(rasterizerKilled || bothFacesCulled) && !m_streamoutActive;
+	const bool suppressStorageRaster =
+		(rasterizerKilled || bothFacesCulled) && m_streamoutActive && m_streamoutUsesStorage;
+	if (suppressStorageRaster)
+	{
+		// The UAV shader must still execute to produce transform feedback, but GX2
+		// requested no raster output. Remove RTV/DSV bindings for this draw while
+		// retaining the stream-out UAV; the active cached FBO is restored below.
+		ID3D11UnorderedAccessView* uav = m_streamoutStorageUav.Get();
+		m_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr,
+			StreamoutUavSlot, 1, &uav, nullptr);
+	}
 
 	if (skipRasterDraw)
 	{
@@ -5333,8 +6033,23 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		D3D11_DEBUG_CHECK("non-indexed GX2 draw");
 	}
 
-	const bool streamoutDrawIssued = drawIssued && m_streamoutActive;
-	if (drawIssued && !CheckDeviceHealth("GX2 draw"))
+	// Native D3D11 stream output uses a geometry shader created with
+	// D3D11_SO_NO_RASTERIZED_STREAM and therefore needs a raster replay. The
+	// D3D11.1 UAV path writes feedback from the ordinary raster shader, so replaying
+	// it would draw every primitive twice and waste nearly half the available GPU
+	// time in stream-out-heavy scenes.
+	const bool needsRasterReplay = drawIssued && m_streamoutActive && !m_streamoutUsesStorage;
+	// Present reports removal every frame. On Xbox, sample at the first draw of
+	// each frame as well, retaining early diagnostics without calling through
+	// D3D11On12 after every individual draw. Keep desktop behavior unchanged.
+#if defined(CEMU_UWP)
+	const bool sampleDeviceHealth = drawIssued && m_deviceHealthFrame != m_memoryCheckFrame;
+	if (sampleDeviceHealth)
+		m_deviceHealthFrame = m_memoryCheckFrame;
+#else
+	const bool sampleDeviceHealth = drawIssued;
+#endif
+	if (sampleDeviceHealth && !CheckDeviceHealth("GX2 draw"))
 	{
 		// Do not unbind SO or restore shaders after removal; either operation would
 		// enter D3D11On12 again and amplify the driver's exception cascade.
@@ -5348,10 +6063,16 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		m_streamoutEnabled.fill(false);
 	// This also unbinds SO and restores the title/rectangle geometry shader.
 	LatteStreamout_FinishDrawcall(false);
+	if (suppressStorageRaster && m_activeFbo)
+	{
+		auto* nativeFbo = static_cast<D3D11CachedFBO*>(m_activeFbo);
+		m_context->OMSetRenderTargets(nativeFbo->targetCount,
+			nativeFbo->targets.data(), nativeFbo->depth);
+	}
 	// Stream-output shaders use D3D11_SO_NO_RASTERIZED_STREAM, so a GX2 operation
 	// requesting feedback and rasterization needs an ordinary second draw.
-	bool rasterDrawIssued = drawIssued && !streamoutDrawIssued;
-	if (streamoutDrawIssued && !rasterizerKilled && !bothFacesCulled)
+	bool rasterDrawIssued = drawIssued && !needsRasterReplay;
+	if (needsRasterReplay && !rasterizerKilled && !bothFacesCulled)
 	{
 		if (hostIndexType != INDEX_TYPE::NONE)
 		{
@@ -5374,16 +6095,6 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 			D3D11_DEBUG_CHECK("non-indexed GX2 raster draw after stream output");
 		}
 	}
-
-#if defined(CEMU_UWP)
-	// The common index LRU was designed for allocations with independent immutable
-	// storage. This backend uses offsets into a transient DISCARD/NO_OVERWRITE
-	// ring, so retaining those offsets across draws can reuse data after the Xbox
-	// D3D11On12 driver has renamed the backing allocation. Decode again on the next
-	// indexed draw; the ring itself remains persistent and memory-stable.
-	if (hostIndexType != INDEX_TYPE::NONE)
-		LatteIndices_invalidateAll();
-#endif
 
 	if (rasterDrawIssued && LatteSHRC_GetActivePixelShader())
 		LatteRenderTarget_trackUpdates();

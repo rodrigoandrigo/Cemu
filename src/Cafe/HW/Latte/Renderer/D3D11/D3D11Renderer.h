@@ -8,8 +8,10 @@
 #include <atomic>
 #include <array>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 class D3D11Renderer final : public Renderer
 {
@@ -30,6 +32,10 @@ public:
 	void DrawBackbufferQuad(LatteTextureView*, RendererOutputShader*, bool,
 		sint32, sint32, sint32, sint32, bool, bool) override;
 	bool BeginFrame(bool mainWindow) override;
+	bool UseTFViaSSBO() const override
+	{
+		return m_device && m_device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1;
+	}
 	void Flush(bool waitIdle) override;
 	void NotifyLatteCommandProcessorIdle() override;
 	bool ImguiBegin(bool mainWindow) override;
@@ -96,7 +102,8 @@ private:
 	RendererShader* GetRectEmulationShader(class LatteDecompilerShader* vertexShader);
 	bool HasRequiredShaders() const;
 	bool UpdateInputLayout();
-	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance);
+	void UpdateUniformVars(class LatteDecompilerShader* shader, uint32 verticesPerInstance,
+		bool fullUpdate, bool aluConstantsDirty, uint32 uniformBufferDirtyMask);
 	void UpdateSamplerSwizzleBuffer(class LatteDecompilerShader* shader);
 	bool UpdateDynamicConstantBuffer(Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
 		UINT& capacity, const void* data, UINT size);
@@ -107,14 +114,25 @@ private:
 		class LatteTexture* texture);
 	void UnbindTextureHazards();
 	void ClearShaderResources();
-	void ResolveTextureFeedbackLoops(const std::array<ID3D11RenderTargetView*, 8>& targets,
+	bool ResolveTextureFeedbackLoops(const std::array<ID3D11RenderTargetView*, 8>& targets,
 		ID3D11DepthStencilView* depth);
+	void InvalidateNativePipelineState();
 	void RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache);
 	void CheckMemoryPressure();
 	bool WaitForGpuIdle();
 	bool CheckDeviceHealth(const char* operation);
 	void RecordDeviceLost(HRESULT result, const char* operation);
 	uint64 QueryProcessCommitBytes() const;
+	uint64 CurrentLogicalPipelineKey() const;
+	uint64 ShaderFailureKey(RendererShader::ShaderType type, uint64 baseHash, uint64 auxHash) const;
+
+	struct FeedbackSnapshot
+	{
+		Microsoft::WRL::ComPtr<ID3D11Resource> source;
+		Microsoft::WRL::ComPtr<ID3D11Resource> copy;
+		uint64 descriptorKey{};
+		uint32 lastUsedFrame{};
+	};
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
 	Microsoft::WRL::ComPtr<ID3D11Device1> m_device1;
@@ -128,9 +146,18 @@ private:
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCopyScratch;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_indexRingBuffer;
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutBuffers{};
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_streamoutStorageBuffer;
+	Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_streamoutStorageUav;
 	std::vector<uint8> m_bufferCacheShadow;
 	std::vector<uint8> m_uploadBuffer;
 	std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, Latte::GPU_LIMITS::NUM_TEXTURES_PER_STAGE * 3> m_boundTextures{};
+	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+		D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3> m_boundShaderResources{};
+	// Keep the emulated binding separate from the physical SRV installed on the
+	// immediate context. Feedback-loop resolution may temporarily bind a snapshot;
+	// overwriting the logical entry made subsequent draws keep sampling stale data.
+	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
+		D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3> m_logicalShaderResources{};
 	std::array<UINT, 16> m_vertexOffsets{};
 	std::array<UINT, 16> m_vertexStrides{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 16> m_vertexBuffers{};
@@ -143,6 +170,7 @@ private:
 	std::array<std::vector<uint8>, 3> m_uniformScratch{};
 	std::array<std::vector<uint8>, 3> m_uploadedUniformScratch{};
 	std::array<bool, 3> m_uniformScratchUploaded{};
+	std::array<uint64, 3> m_uniformShaderKeys{};
 	std::array<std::array<std::array<uint32, 4>, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3>
 		m_samplerSwizzles{};
 	decltype(m_samplerSwizzles) m_uploadedSamplerSwizzles{};
@@ -151,6 +179,7 @@ private:
 	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
 	std::array<bool, 8> m_boundColorBlendable{ true, true, true, true, true, true, true, true };
 	bool m_streamoutActive{};
+	bool m_streamoutUsesStorage{};
 
 	Microsoft::WRL::ComPtr<ID3D11VertexShader> m_presentVS;
 	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_presentPS;
@@ -170,12 +199,31 @@ private:
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11BlendState>> m_blendCache;
 	std::unordered_map<uint64, Microsoft::WRL::ComPtr<ID3D11DepthStencilState>> m_depthStencilCache;
 	std::unordered_map<uint64, std::unique_ptr<RendererShader>> m_rectShaderCache;
+	std::unordered_set<uint64> m_seenLogicalPipelines;
+	std::unordered_set<uint64> m_failedShaderKeys;
+	std::mutex m_failedShaderMutex;
 	std::unordered_set<uint32> m_reportedDebugWarnings;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11Resource>> m_feedbackResources;
 	std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> m_feedbackViews;
+	std::vector<FeedbackSnapshot> m_feedbackSnapshots;
+	LatteCachedFBO* m_activeFbo{};
+	bool m_activeFeedbackLoop{};
 	uint64 m_inputLayoutKey{};
+	Microsoft::WRL::ComPtr<ID3D11RasterizerState> m_appliedRasterizerState;
+	Microsoft::WRL::ComPtr<ID3D11BlendState> m_appliedBlendState;
+	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_appliedDepthStencilState;
+	std::array<float, 4> m_appliedBlendConstant{};
+	UINT m_appliedStencilRef{};
+	D3D11_PRIMITIVE_TOPOLOGY m_appliedPrimitiveTopology{ D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED };
+	D3D11_VIEWPORT m_appliedViewport{};
+	D3D11_RECT m_appliedScissor{};
+	bool m_appliedBlendStateValid{};
+	bool m_appliedDepthStencilStateValid{};
+	bool m_appliedViewportValid{};
+	bool m_appliedScissorValid{};
 	uint64 m_indexUploadCount{};
 	uint64 m_indexRingWrapCount{};
+	uint32 m_deviceHealthFrame{ 0xFFFFFFFFu };
 	uint64 m_lastVertexShaderBase{};
 	uint64 m_lastVertexShaderAux{};
 	uint64 m_lastPixelShaderBase{};
@@ -186,6 +234,8 @@ private:
 	UINT m_indexRingOffset{};
 	UINT m_bufferCopyScratchCapacity{};
 	uint32 m_memoryCheckFrame{};
+	uint32 m_lastHeavyMemoryRecoveryFrame{};
+	uint64 m_lastHeavyMemoryRecoveryCommitMB{};
 	std::atomic<uint32> m_compiledShaderCount{};
 	std::atomic_bool m_deviceLost{};
 	bool m_memoryPressureActive{};

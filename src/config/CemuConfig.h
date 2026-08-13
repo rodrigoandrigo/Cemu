@@ -492,7 +492,12 @@ struct CemuConfig
 	ConfigValue<sint32> fullscreen_scaling{kKeepAspectRatio};
 
 	// audio
+#ifdef CEMU_UWP
+	// XAudio 2.8 is the native AppContainer-compatible backend (enum value 2).
+	sint32 audio_api = 2;
+#else
 	sint32 audio_api = 0;
+#endif
 	sint32 audio_delay = 2;
 	AudioChannels tv_channels = kStereo, pad_channels = kStereo, input_channels = kMono;
 	sint32 tv_volume = 50, pad_volume = 0, input_volume = 50, portal_volume = 50;

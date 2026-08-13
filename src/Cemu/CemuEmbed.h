@@ -27,6 +27,7 @@ extern "C" {
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
 #define CEMU_EMBED_GAMEPAD_VERSION 1u
 #define CEMU_EMBED_DIMENSIONS_VERSION 1u
+#define CEMU_EMBED_SETTINGS_VERSION 1u
 typedef struct CemuEmbedInstance CemuEmbedInstance;
 
 typedef enum CemuEmbedResult { CEMU_EMBED_OK, CEMU_EMBED_INVALID_ARGUMENT, CEMU_EMBED_INVALID_STATE, CEMU_EMBED_BUSY, CEMU_EMBED_INITIALIZATION_FAILED, CEMU_EMBED_LAUNCH_FAILED, CEMU_EMBED_STORAGE_FAILED } CemuEmbedResult;
@@ -181,6 +182,54 @@ typedef struct CemuEmbedActiveAccount {
 	char account_id_utf8[64];
 } CemuEmbedActiveAccount;
 
+// User-facing global settings supported by embedded hosts. Integer enum values
+// match Cemu's settings.xml representation. Paths, accounts, graphic packs and
+// controller profiles have dedicated host APIs and are intentionally excluded.
+typedef struct CemuEmbedSettings {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	int32_t cpu_mode;
+	int32_t console_language;
+	int32_t vsync;
+	int32_t gx2drawdone_sync;
+	int32_t async_compile;
+	int32_t render_upside_down;
+	int32_t play_boot_sound;
+	int32_t disable_screensaver;
+	int32_t override_gamma;
+	float override_gamma_value;
+	float display_gamma;
+	int32_t upscale_filter;
+	int32_t downscale_filter;
+	int32_t fullscreen_scaling;
+	int32_t overlay_position;
+	int32_t overlay_text_scale;
+	int32_t overlay_fps;
+	int32_t overlay_drawcalls;
+	int32_t overlay_cpu_usage;
+	int32_t overlay_cpu_per_core;
+	int32_t overlay_ram_usage;
+	int32_t overlay_vram_usage;
+	int32_t notification_position;
+	int32_t notification_text_scale;
+	int32_t notification_controller_profiles;
+	int32_t notification_controller_battery;
+	int32_t notification_shader_compiling;
+	int32_t notification_friends;
+	int32_t audio_api;
+	int32_t audio_delay;
+	int32_t tv_channels;
+	int32_t pad_channels;
+	int32_t input_channels;
+	int32_t tv_volume;
+	int32_t pad_volume;
+	int32_t input_volume;
+	int32_t portal_volume;
+	int32_t emulate_skylander_portal;
+	int32_t emulate_infinity_base;
+	int32_t emulate_dimensions_toypad;
+} CemuEmbedSettings;
+
 typedef enum CemuEmbedDimensionsFigureType {
 	CEMU_EMBED_DIMENSIONS_CHARACTER = 0,
 	CEMU_EMBED_DIMENSIONS_VEHICLE_OR_GADGET = 1
@@ -263,6 +312,12 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetVirtualMouse(
 // the top-right corner and reports FPS, draw calls, CPU, RAM and VRAM.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetPerformanceMetrics(
 	CemuEmbedInstance* instance, int32_t enabled);
+// Reads or persists every scalar, user-facing global setting exposed to an
+// embedded host. Renderer/backend selection remains host-owned on Xbox.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetSettings(
+	CemuEmbedInstance* instance, CemuEmbedSettings* settings);
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetSettings(
+	CemuEmbedInstance* instance, const CemuEmbedSettings* settings);
 // Enables the native LEGO Dimensions USB/HID Toy Pad before initialization.
 // Embedded hosts must call this while the instance is still in CREATED state.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnableDimensionsToypad(

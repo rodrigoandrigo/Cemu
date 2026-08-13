@@ -42,9 +42,20 @@ void LatteIndices_invalidate(const void* memPtr, uint32 size)
 		return;
 	for(auto& entry : LatteIndexCache.entry)
 	{
-		const uintptr_t entryAddress = reinterpret_cast<uintptr_t>(entry.lastPtr);
-		if (entry.valid && entry.lastPtr != nullptr &&
-			entryAddress >= rangeBegin && entryAddress < rangeEnd)
+		if (!entry.valid || entry.lastPtr == nullptr || entry.lastIndexType == LatteIndexType::AUTO)
+			continue;
+		const size_t indexSize =
+			(entry.lastIndexType == LatteIndexType::U16_BE ||
+				entry.lastIndexType == LatteIndexType::U16_LE) ? sizeof(uint16) : sizeof(uint32);
+		const uintptr_t entryBegin = reinterpret_cast<uintptr_t>(entry.lastPtr);
+		const uint64 entryBytes = static_cast<uint64>(entry.lastCount) * indexSize;
+		const uintptr_t entryEnd = entryBytes <= (std::numeric_limits<uintptr_t>::max)() - entryBegin
+			? entryBegin + static_cast<uintptr_t>(entryBytes)
+			: (std::numeric_limits<uintptr_t>::max)();
+		// Guest writes can begin in the middle of a cached index range. Checking
+		// only the cached range's first address leaves partially overwritten data
+		// alive and can later produce stale indices or long triangle artifacts.
+		if (entryBegin < rangeEnd && rangeBegin < entryEnd)
 		{
 			g_renderer->indexData_releaseIndexMemory(entry.indexAllocation);
 			entry.valid = false;

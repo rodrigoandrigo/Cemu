@@ -66,7 +66,11 @@ bool ActiveSettings::DisplayDRCEnabled()
 
 CPUMode ActiveSettings::GetCPUMode()
 {
-	auto mode = g_current_game_profile->GetCPUMode().value_or(CPUMode::Auto);
+	// A per-title profile still has priority, but embedded frontends can also
+	// select a global mode through CemuEmbedSettings. Previously the fallback
+	// was hard-coded to Auto, so changing CemuConfig::cpu_mode had no effect.
+	auto mode = g_current_game_profile->GetCPUMode().value_or(
+		GetConfig().cpu_mode.GetValue());
 
 	if (mode == CPUMode::Auto)
 	{

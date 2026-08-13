@@ -30,6 +30,7 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	proxy_server = parser.get("proxy_server", "");
 	disable_screensaver = parser.get("disable_screensaver", disable_screensaver);
 	play_boot_sound = parser.get("play_boot_sound", play_boot_sound);
+	cpu_mode = parser.get("cpu_mode", cpu_mode.GetInitValue());
 	console_language = parser.get("console_language", console_language.GetInitValue());
 
 	game_paths.clear();
@@ -139,6 +140,7 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 	if(userDisplayGamma < 0)
 		userDisplayGamma = 2.2f;
 	gx2drawdone_sync = graphic.get("GX2DrawdoneSync", true);
+	render_upside_down = graphic.get("RenderUpsideDown", false);
 	upscale_filter = graphic.get("UpscaleFilter", kBicubicHermiteFilter);
 	downscale_filter = graphic.get("DownscaleFilter", kLinearFilter);
 	fullscreen_scaling = graphic.get("FullscreenScaling", kKeepAspectRatio);
@@ -196,7 +198,9 @@ XMLConfigParser CemuConfig::Load(XMLConfigParser& parser)
 
 	// audio
 	auto audio = parser.get("Audio");
-	audio_api = audio.get("api", 0);
+	// Preserve the platform-specific initial value when settings.xml has no
+	// explicit backend. UWP defaults to XAudio 2.8; desktop remains unchanged.
+	audio_api = audio.get("api", audio_api);
 	audio_delay = audio.get("delay", 2);
 	tv_channels = audio.get("TVChannels", kStereo);
 	pad_channels = audio.get("PadChannels", kStereo);
@@ -303,8 +307,9 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	config.set<bool>("permanent_storage", permanent_storage);
 	config.set("proxy_server", proxy_server.GetValue().c_str());
 	config.set<bool>("play_boot_sound", play_boot_sound);
+	config.set<bool>("disable_screensaver", disable_screensaver);
 
-	// config.set("cpu_mode", cpu_mode.GetValue());
+	config.set("cpu_mode", cpu_mode.GetValue());
 	//config.set("console_region", console_region.GetValue());
 	config.set("console_language", console_language.GetValue());
 
@@ -368,6 +373,7 @@ XMLConfigParser CemuConfig::Save(XMLConfigParser& parser)
 	graphic.set("OverrideGammaValue", overrideGammaValue);
 	graphic.set("UserDisplayGamma", userDisplayGamma);
 	graphic.set("GX2DrawdoneSync", gx2drawdone_sync);
+	graphic.set("RenderUpsideDown", render_upside_down);
 #ifdef ENABLE_METAL
 	graphic.set("ForceMeshShaders", force_mesh_shaders);
 #endif
