@@ -170,6 +170,52 @@ uint64 HashBytes(const void* data, size_t size, uint64 hash = 146959810393466560
 	return hash;
 }
 
+std::string ForceDynamicHlslLoops(const std::string& source)
+{
+	// FXC requires dynamic flow control when implicit texture gradients occur in
+	// a loop whose trip count varies per pixel. Without [loop], it tries to
+	// unroll the loop and can reject otherwise valid Wii U shaders with X3511.
+	// SPIRV-Cross emits control-flow statements at the start of a line, which
+	// lets us annotate them without touching expressions, comments or macros.
+	std::string result;
+	result.reserve(source.size() + 256);
+	size_t cursor{};
+	bool previousLineIsLoopAttribute{};
+	while (cursor < source.size())
+	{
+		const size_t lineEnd = source.find('\n', cursor);
+		const size_t length = (lineEnd == std::string::npos ? source.size() : lineEnd) - cursor;
+		const std::string_view line(source.data() + cursor, length);
+		const size_t first = line.find_first_not_of(" \t\r");
+		const std::string_view trimmed = first == std::string_view::npos ?
+			std::string_view{} : line.substr(first);
+		const bool isUnrollAttribute = trimmed.starts_with("[unroll") && trimmed.ends_with(']');
+		const bool isLoop = trimmed.starts_with("for (") ||
+			trimmed.starts_with("while (") || trimmed == "do";
+		if (isLoop && !previousLineIsLoopAttribute)
+		{
+			result.append(line.data(), first);
+			result += "[loop]\n";
+		}
+		if (isUnrollAttribute)
+		{
+			result.append(line.data(), first);
+			result += "[loop]";
+		}
+		else
+		{
+			result.append(line.data(), line.size());
+		}
+		if (!trimmed.empty())
+			previousLineIsLoopAttribute = isUnrollAttribute || trimmed == "[loop]";
+		if (lineEnd == std::string::npos)
+			break;
+		result.push_back('\n');
+		cursor = lineEnd + 1;
+	}
+	return result;
+}
+
 // Persistent driver-cache budget. This is disk-backed and does not reserve the
 // same amount in the Series S process address space.
 constexpr uint64 D3D11ShaderCacheBudgetBytes = 512ull * 1024 * 1024;
@@ -1973,6 +2019,26 @@ void main(point GeometryInput inputVertices[1],
 			HRESULT hr = CompileHLSLCached(hlsl.data(), hlsl.size(), profile,
 				RuntimeShaderCompileFlags(),
 				&m_bytecode, &errors);
+			if (FAILED(hr) && GetType() == ShaderType::kFragment && errors)
+			{
+				const std::string_view message(
+					static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
+				if (message.find("X3570") != std::string_view::npos &&
+					message.find("X3511") != std::string_view::npos)
+				{
+					std::string dynamicLoopHlsl = ForceDynamicHlslLoops(hlsl);
+					errors.Reset();
+					hr = CompileHLSLCached(dynamicLoopHlsl.data(), dynamicLoopHlsl.size(), profile,
+						RuntimeShaderCompileFlags(), &m_bytecode, &errors);
+					if (SUCCEEDED(hr))
+					{
+						hlsl = std::move(dynamicLoopHlsl);
+						cemuLog_logOnce(LogType::Force,
+							"D3D11 fragment shader {:016x}_{:016x} recovered with dynamic gradient loops",
+							m_baseHash, m_auxHash);
+					}
+				}
+			}
 			if (FAILED(hr))
 			{
 				const char* message = errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
@@ -2178,6 +2244,8 @@ public:
 	DXGI_FORMAT RTVFormat() const { return m_rtvFormat; }
 	void PrepareForSampling();
 	void PrepareForRenderTarget();
+	void PrepareForRenderTarget(UINT framebufferWidth, UINT framebufferHeight);
+	ID3D11RenderTargetView* FramebufferRTV(UINT framebufferWidth, UINT framebufferHeight);
 	void CopyAliasToBase();
 	bool IsIncompatibleAlias() const { return m_incompatibleAlias; }
 private:
@@ -2186,7 +2254,21 @@ private:
 		D3D11_TEXTURE2D_DESC desc{};
 		ComPtr<ID3D11Texture2D> texture;
 	};
+	struct AttachmentAlias
+	{
+		UINT width{};
+		UINT height{};
+		ComPtr<ID3D11Texture2D> texture;
+		ComPtr<ID3D11RenderTargetView> rtv;
+		uint64 syncedVersion{ (std::numeric_limits<uint64>::max)() };
+	};
 	bool CreateIncompatibleAlias(const FormatInfo& requested);
+	AttachmentAlias* GetOrCreateAttachmentAlias(UINT framebufferWidth, UINT framebufferHeight);
+	AttachmentAlias* FindAttachmentAlias(UINT framebufferWidth, UINT framebufferHeight);
+	ID3D11Resource* RenderBackingResource() const;
+	UINT RenderBackingSubresource() const;
+	void CopyRenderBackingToAttachment(AttachmentAlias& alias);
+	void CopyAttachmentToRenderBacking(AttachmentAlias& alias);
 	bool CopySubresourcesRaw(ID3D11Resource* source, DXGI_FORMAT sourceFormat,
 		UINT sourceFirstMip, UINT sourceFirstSlice, UINT sourceMipLevels,
 		ID3D11Resource* destination,
@@ -2197,8 +2279,11 @@ private:
 	DXGI_FORMAT m_rtvFormat{ DXGI_FORMAT_UNKNOWN };
 	ComPtr<ID3D11Resource> m_aliasResource;
 	std::vector<AliasStagingResource> m_aliasStagingResources;
+	std::vector<AttachmentAlias> m_attachmentAliases;
 	bool m_incompatibleAlias{};
 	UINT m_aliasSliceCount{ 1 };
+	UINT m_attachmentWriterWidth{};
+	UINT m_attachmentWriterHeight{};
 	uint64 m_syncedVersion{ (std::numeric_limits<uint64>::max)() };
 };
 
@@ -2351,6 +2436,7 @@ public:
 		if (m_aliasWriter == view)
 			CommitAliasWriter();
 	}
+	bool IsAliasWriter(const D3D11TextureView* view) const { return m_aliasWriter == view; }
 	uint64 ContentVersion() const { return m_contentVersion; }
 
 protected:
@@ -2652,6 +2738,128 @@ bool D3D11TextureView::CreateIncompatibleAlias(const FormatInfo& requested)
 	return true;
 }
 
+ID3D11Resource* D3D11TextureView::RenderBackingResource() const
+{
+	return m_incompatibleAlias ? m_aliasResource.Get() :
+		static_cast<D3D11Texture*>(baseTexture)->Resource();
+}
+
+UINT D3D11TextureView::RenderBackingSubresource() const
+{
+	if (m_incompatibleAlias)
+		return 0;
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	return D3D11CalcSubresource(static_cast<UINT>((std::max)(firstMip, 0)),
+		static_cast<UINT>((std::max)(firstSlice, 0)), texture->EffectiveMipLevels());
+}
+
+D3D11TextureView::AttachmentAlias* D3D11TextureView::FindAttachmentAlias(
+	UINT framebufferWidth, UINT framebufferHeight)
+{
+	auto it = std::find_if(m_attachmentAliases.begin(), m_attachmentAliases.end(),
+		[framebufferWidth, framebufferHeight](const AttachmentAlias& alias) {
+			return alias.width == framebufferWidth && alias.height == framebufferHeight;
+		});
+	return it == m_attachmentAliases.end() ? nullptr : &*it;
+}
+
+D3D11TextureView::AttachmentAlias* D3D11TextureView::GetOrCreateAttachmentAlias(
+	UINT framebufferWidth, UINT framebufferHeight)
+{
+	if (!m_rtv || framebufferWidth == 0 || framebufferHeight == 0)
+		return nullptr;
+	if (auto* existing = FindAttachmentAlias(framebufferWidth, framebufferHeight))
+		return existing;
+
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	const UINT viewWidth = (std::max)(texture->EffectiveWidth() >>
+		static_cast<UINT>((std::max)(firstMip, 0)), 1u);
+	const UINT viewHeight = (std::max)(texture->EffectiveHeight() >>
+		static_cast<UINT>((std::max)(firstMip, 0)), 1u);
+	if (framebufferWidth == viewWidth && framebufferHeight == viewHeight)
+		return nullptr;
+	if (framebufferWidth > viewWidth || framebufferHeight > viewHeight)
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 cannot expand color attachment {}x{} to framebuffer {}x{}",
+			viewWidth, viewHeight, framebufferWidth, framebufferHeight);
+		return nullptr;
+	}
+
+	ComPtr<ID3D11Texture2D> backingTexture;
+	if (FAILED(RenderBackingResource()->QueryInterface(IID_PPV_ARGS(&backingTexture))))
+		return nullptr;
+	D3D11_TEXTURE2D_DESC backingDesc{};
+	backingTexture->GetDesc(&backingDesc);
+	if (backingDesc.SampleDesc.Count != 1)
+		return nullptr;
+
+	D3D11_RENDER_TARGET_VIEW_DESC sourceViewDesc{};
+	m_rtv->GetDesc(&sourceViewDesc);
+	if (sourceViewDesc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2D &&
+		sourceViewDesc.ViewDimension != D3D11_RTV_DIMENSION_TEXTURE2DARRAY)
+		return nullptr;
+
+	D3D11_TEXTURE2D_DESC aliasDesc{};
+	aliasDesc.Width = framebufferWidth;
+	aliasDesc.Height = framebufferHeight;
+	aliasDesc.MipLevels = 1;
+	aliasDesc.ArraySize = sourceViewDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY ?
+		(std::max)(sourceViewDesc.Texture2DArray.ArraySize, 1u) : 1u;
+	aliasDesc.Format = backingDesc.Format;
+	aliasDesc.SampleDesc = backingDesc.SampleDesc;
+	aliasDesc.Usage = D3D11_USAGE_DEFAULT;
+	aliasDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+
+	AttachmentAlias alias{};
+	alias.width = framebufferWidth;
+	alias.height = framebufferHeight;
+	if (FAILED(texture->Owner()->GetDevice()->CreateTexture2D(
+		&aliasDesc, nullptr, &alias.texture)))
+		return nullptr;
+
+	D3D11_RENDER_TARGET_VIEW_DESC aliasViewDesc{};
+	aliasViewDesc.Format = m_rtvFormat;
+	aliasViewDesc.ViewDimension = sourceViewDesc.ViewDimension;
+	if (aliasViewDesc.ViewDimension == D3D11_RTV_DIMENSION_TEXTURE2DARRAY)
+	{
+		aliasViewDesc.Texture2DArray.MipSlice = 0;
+		aliasViewDesc.Texture2DArray.FirstArraySlice = 0;
+		aliasViewDesc.Texture2DArray.ArraySize = aliasDesc.ArraySize;
+	}
+	else
+		aliasViewDesc.Texture2D.MipSlice = 0;
+	if (FAILED(texture->Owner()->GetDevice()->CreateRenderTargetView(
+		alias.texture.Get(), &aliasViewDesc, &alias.rtv)))
+		return nullptr;
+
+	m_attachmentAliases.emplace_back(std::move(alias));
+	cemuLog_logOnce(LogType::Force,
+		"D3D11 color attachment {}x{} uses synchronized framebuffer alias {}x{}",
+		viewWidth, viewHeight, framebufferWidth, framebufferHeight);
+	return &m_attachmentAliases.back();
+}
+
+void D3D11TextureView::CopyRenderBackingToAttachment(AttachmentAlias& alias)
+{
+	D3D11_BOX box{ 0, 0, 0, alias.width, alias.height, 1 };
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	texture->Owner()->GetContext()->CopySubresourceRegion(alias.texture.Get(), 0,
+		0, 0, 0, RenderBackingResource(), RenderBackingSubresource(), &box);
+	alias.syncedVersion = texture->ContentVersion();
+}
+
+void D3D11TextureView::CopyAttachmentToRenderBacking(AttachmentAlias& alias)
+{
+	D3D11_BOX box{ 0, 0, 0, alias.width, alias.height, 1 };
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	texture->Owner()->GetContext()->CopySubresourceRegion(RenderBackingResource(),
+		RenderBackingSubresource(), 0, 0, 0, alias.texture.Get(), 0, &box);
+	// CommitAliasWriter increments the content version immediately after this
+	// copy, so the alias already represents that next version.
+	alias.syncedVersion = texture->ContentVersion() + 1;
+}
+
 bool D3D11TextureView::CopySubresourcesRaw(ID3D11Resource* source, DXGI_FORMAT sourceFormat,
 	UINT sourceFirstMip, UINT sourceFirstSlice, UINT sourceMipLevels,
 	ID3D11Resource* destination,
@@ -2750,11 +2958,70 @@ void D3D11TextureView::PrepareForRenderTarget()
 	texture->BeginAliasWrite(this);
 }
 
+ID3D11RenderTargetView* D3D11TextureView::FramebufferRTV(
+	UINT framebufferWidth, UINT framebufferHeight)
+{
+	if (auto* alias = GetOrCreateAttachmentAlias(framebufferWidth, framebufferHeight))
+		return alias->rtv.Get();
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	const UINT viewWidth = (std::max)(texture->EffectiveWidth() >>
+		static_cast<UINT>((std::max)(firstMip, 0)), 1u);
+	const UINT viewHeight = (std::max)(texture->EffectiveHeight() >>
+		static_cast<UINT>((std::max)(firstMip, 0)), 1u);
+	if (viewWidth != framebufferWidth || viewHeight != framebufferHeight)
+	{
+		// A null hole preserves the remaining MRTs. Falling back to the oversized
+		// native RTV would make D3D11 reject the complete output-merger set.
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 omitted incompatible color attachment {}x{} for framebuffer {}x{} because its alias could not be created",
+			viewWidth, viewHeight, framebufferWidth, framebufferHeight);
+		return nullptr;
+	}
+	return m_rtv.Get();
+}
+
+void D3D11TextureView::PrepareForRenderTarget(
+	UINT framebufferWidth, UINT framebufferHeight)
+{
+	auto* alias = FindAttachmentAlias(framebufferWidth, framebufferHeight);
+	if (!alias)
+	{
+		PrepareForRenderTarget();
+		return;
+	}
+
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	if (texture->IsAliasWriter(this) &&
+		m_attachmentWriterWidth == framebufferWidth &&
+		m_attachmentWriterHeight == framebufferHeight)
+		return;
+
+	// This commits a different writer (or a differently-sized alias owned by
+	// this view) and refreshes a mutable-format backing resource when required.
+	PrepareForSampling();
+	alias = FindAttachmentAlias(framebufferWidth, framebufferHeight);
+	if (!alias)
+		return;
+	if (alias->syncedVersion != texture->ContentVersion())
+		CopyRenderBackingToAttachment(*alias);
+	m_attachmentWriterWidth = framebufferWidth;
+	m_attachmentWriterHeight = framebufferHeight;
+	texture->BeginAliasWrite(this);
+}
+
 void D3D11TextureView::CopyAliasToBase()
 {
+	auto* texture = static_cast<D3D11Texture*>(baseTexture);
+	if (m_attachmentWriterWidth != 0 && m_attachmentWriterHeight != 0)
+	{
+		if (auto* alias = FindAttachmentAlias(
+			m_attachmentWriterWidth, m_attachmentWriterHeight))
+			CopyAttachmentToRenderBacking(*alias);
+		m_attachmentWriterWidth = 0;
+		m_attachmentWriterHeight = 0;
+	}
 	if (!m_incompatibleAlias)
 		return;
-	auto* texture = static_cast<D3D11Texture*>(baseTexture);
 	ComPtr<ID3D11Texture2D> aliasTexture;
 	if (FAILED(m_aliasResource.As(&aliasTexture)))
 		return;
@@ -2763,6 +3030,7 @@ void D3D11TextureView::CopyAliasToBase()
 	CopySubresourcesRaw(m_aliasResource.Get(), aliasDesc.Format, 0, 0, aliasDesc.MipLevels,
 		texture->Resource(), firstMip, firstSlice,
 		texture->EffectiveMipLevels());
+	m_syncedVersion = texture->ContentVersion() + 1;
 }
 
 class D3D11CachedFBO final : public LatteCachedFBO
@@ -2988,7 +3256,18 @@ void D3D11Renderer::InitializePresentationPipeline()
 		"o.uv=p;o.p=float4(p*float2(2,-2)+float2(-1,1),0,1);return o;}";
 	static constexpr char ps[] =
 		"Texture2D t0:register(t0);SamplerState s0:register(s0);"
-		"float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{return t0.Sample(s0,uv);}";
+		"cbuffer Presentation:register(b0){"
+		"float2 textureSrcResolution;float2 nativeResolution;"
+		"float2 outputResolution;uint applySRGBEncoding;float targetGamma;"
+		"float displayGamma;};"
+		"float encodeSRGB(float v){return v<=0.0031308?12.92*v:1.055*pow(v,1.0/2.4)-0.055;}"
+		"float3 encodeSRGB(float3 v){return float3(encodeSRGB(v.r),encodeSRGB(v.g),encodeSRGB(v.b));}"
+		"float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{"
+		"float3 color=t0.Sample(s0,uv).rgb;"
+		"if(applySRGBEncoding!=0)color=encodeSRGB(color);"
+		"if(displayGamma>0.0)color=pow(max(color,0.0),targetGamma/displayGamma);"
+		"else color=encodeSRGB(pow(max(color,0.0),targetGamma));"
+		"return float4(color,1.0);}";
 	static constexpr char surfaceCopyColorPs[] =
 		"Texture2D<float4> t0:register(t0);SamplerState s0:register(s0);"
 		"float4 main(float4 p:SV_Position,float2 uv:TEXCOORD0):SV_Target{"
@@ -3239,7 +3518,7 @@ void D3D11Renderer::HandleScreenshotRequest(LatteTextureView* textureView, bool 
 	SaveScreenshot(rgb, width, height, true);
 }
 
-void D3D11Renderer::DrawBackbufferQuad(LatteTextureView* textureView, RendererOutputShader*, bool useLinear,
+void D3D11Renderer::DrawBackbufferQuad(LatteTextureView* textureView, RendererOutputShader* shader, bool useLinear,
 	sint32 imageX, sint32 imageY, sint32 imageWidth, sint32 imageHeight, bool padView, bool clearBackground)
 {
 	if (textureView)
@@ -3271,12 +3550,25 @@ void D3D11Renderer::DrawBackbufferQuad(LatteTextureView* textureView, RendererOu
 	auto* view = static_cast<D3D11TextureView*>(textureView);
 	ID3D11ShaderResourceView* srv = view->SRV();
 	ID3D11SamplerState* sampler = useLinear ? m_presentSampler.Get() : m_presentPointSampler.Get();
+	const auto outputUniforms = shader->FillUniformBlockBuffer(
+		*textureView, { imageWidth, imageHeight }, false);
+	if (!UpdateDynamicConstantBuffer(m_presentUniformBuffer,
+		m_presentUniformBufferCapacity, &outputUniforms, sizeof(outputUniforms)))
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 could not update presentation color-space parameters");
+		return;
+	}
+	ID3D11Buffer* presentationConstants = m_presentUniformBuffer.Get();
+	ComPtr<ID3D11Buffer> previousPixelConstants;
+	m_context->PSGetConstantBuffers(0, 1, previousPixelConstants.GetAddressOf());
 	const float blendFactor[4]{};
 	m_context->RSSetState(m_rasterizerState.Get());
 	m_context->OMSetBlendState(m_blendState.Get(), blendFactor, 0xFFFFFFFF);
 	m_context->OMSetDepthStencilState(m_depthStencilState.Get(), 0);
 	m_context->VSSetShader(m_presentVS.Get(), nullptr, 0);
 	m_context->PSSetShader(m_presentPS.Get(), nullptr, 0);
+	m_context->PSSetConstantBuffers(0, 1, &presentationConstants);
 	m_context->GSSetShader(nullptr, nullptr, 0);
 	m_context->IASetInputLayout(nullptr);
 	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -3287,6 +3579,8 @@ void D3D11Renderer::DrawBackbufferQuad(LatteTextureView* textureView, RendererOu
 	m_context->Draw(3, 0);
 	ID3D11ShaderResourceView* nullView = nullptr;
 	m_context->PSSetShaderResources(0, 1, &nullView);
+	ID3D11Buffer* previousConstants = previousPixelConstants.Get();
+	m_context->PSSetConstantBuffers(0, 1, &previousConstants);
 	// The presentation pass owns the immediate context temporarily. Force the
 	// next GX2 draw to restore only the native states it displaced.
 	InvalidateNativePipelineState();
@@ -4050,6 +4344,8 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 	}
 	m_activeFbo = fbo;
 	auto* nativeFbo = static_cast<D3D11CachedFBO*>(fbo);
+	const UINT framebufferWidth = static_cast<UINT>((std::max)(fbo->m_size.x, 1));
+	const UINT framebufferHeight = static_cast<UINT>((std::max)(fbo->m_size.y, 1));
 	if (!nativeFbo->nativeViewsCached)
 	{
 		for (UINT i = 0; i < nativeFbo->targets.size(); ++i)
@@ -4057,7 +4353,12 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 			if (!fbo->colorBuffer[i].texture)
 				continue;
 			auto* textureView = static_cast<D3D11TextureView*>(fbo->colorBuffer[i].texture);
-			nativeFbo->targets[i] = textureView->RTV();
+			// D3D11 requires every simultaneously bound MRT to have identical
+			// dimensions. GX2/Vulkan permit an attachment whose allocation is wider
+			// than the effective framebuffer area, so use a synchronized per-size
+			// alias only for that attachment.
+			nativeFbo->targets[i] = textureView->FramebufferRTV(
+				framebufferWidth, framebufferHeight);
 			if (nativeFbo->targets[i])
 			{
 				nativeFbo->targetCount = i + 1;
@@ -4079,8 +4380,9 @@ void D3D11Renderer::rendertarget_bindFramebufferObject(LatteCachedFBO* fbo)
 		nativeFbo->nativeViewsCached = true;
 	}
 	for (UINT i = 0; i < nativeFbo->targets.size(); ++i)
-		if (fbo->colorBuffer[i].texture)
-			static_cast<D3D11TextureView*>(fbo->colorBuffer[i].texture)->PrepareForRenderTarget();
+		if (fbo->colorBuffer[i].texture && nativeFbo->targets[i])
+			static_cast<D3D11TextureView*>(fbo->colorBuffer[i].texture)->PrepareForRenderTarget(
+				framebufferWidth, framebufferHeight);
 	if (fbo->depthBuffer.texture)
 		static_cast<D3D11TextureView*>(fbo->depthBuffer.texture)->PrepareForRenderTarget();
 	m_boundColorBlendable = nativeFbo->blendable;

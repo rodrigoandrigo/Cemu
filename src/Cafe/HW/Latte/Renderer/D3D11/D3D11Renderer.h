@@ -183,6 +183,8 @@ private:
 
 	Microsoft::WRL::ComPtr<ID3D11VertexShader> m_presentVS;
 	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_presentPS;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_presentUniformBuffer;
+	UINT m_presentUniformBufferCapacity{};
 	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_surfaceCopyColorPS;
 	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_surfaceCopyDepthPS;
 	Microsoft::WRL::ComPtr<ID3D11SamplerState> m_presentSampler;

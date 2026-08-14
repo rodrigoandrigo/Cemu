@@ -175,14 +175,24 @@ FSCVirtualFile* FSCVirtualFile_Host::OpenFile(const fs::path& path, FSC_ACCESS_F
 				cemu_assert_debug(writeAccessRequested);
 				fs = FileStream::createFile2(path);
 				if (!fs)
-					cemuLog_log(LogType::Force, "FSC: File create failed for {}", _pathToUtf8(path));
+				{
+					const DWORD error = GetLastError();
+					cemuLog_log(LogType::Force,
+						"FSC: File create failed for {} (Win32 error {})",
+						_pathToUtf8(path), error);
+				}
 			}
 		}
 		else if (HAS_FLAG(accessFlags, FSC_ACCESS_FLAG::FILE_ALWAYS_CREATE))
 		{
 			fs = FileStream::createFile2(path);
 			if (!fs)
-				cemuLog_log(LogType::Force, "FSC: File create failed for {}", _pathToUtf8(path));
+			{
+				const DWORD error = GetLastError();
+				cemuLog_log(LogType::Force,
+					"FSC: File create failed for {} (Win32 error {})",
+					_pathToUtf8(path), error);
+			}
 		}
 		else
 		{
