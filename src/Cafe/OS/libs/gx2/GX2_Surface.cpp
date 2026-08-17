@@ -7,6 +7,8 @@
 #include "Cafe/HW/Latte/Core/LattePM4.h"
 #include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
 
+#include <atomic>
+
 namespace GX2
 {
 
@@ -120,20 +122,30 @@ namespace GX2
 		if ((uint32)surface->dim.value() >= 50 || surface->aa.value() >= 0x100 || (uint32)surface->width.value() >= 0x01000000 || 
 			(uint32)surface->height.value() >= 0x01000000 || (uint32)surface->depth.value() >= 0x01000000 || (uint32)surface->format.value() >= 0x10000)
 		{
-			cemuLog_log(LogType::Force, "GX2CalcSurfaceSizeAndAlignment(): Uninitialized surface encountered\n");
-			// overwrite surface parameters with placeholder values to avoid crashing later down the line
+			static std::atomic_bool s_reportedUninitializedFFLSurface{ false };
+			if (!s_reportedUninitializedFFLSurface.exchange(true))
+			{
+				cemuLog_log(LogType::Force,
+					"GX2: ignored an uninitialized FFL/Mii surface and substituted a safe fallback texture. "
+					"Install the Mii Maker system title from your own Wii U dump to enable the original FFL resources.");
+			}
+
+			// Do not retain fields from the invalid descriptor. In particular, stale mip
+			// pointers and resource flags can later be interpreted as valid GPU memory.
+			memset(surface, 0, sizeof(*surface));
+
+			// Use a complete fallback texture descriptor. GX2CalcSurfaceSizeAndAlignment()
+			// fills imageSize, mipSize, alignment and pitch from these valid inputs.
 			surface->dim = Latte::E_DIM::DIM_2D;
 			surface->width = 8;
 			surface->height = 8;
 			surface->depth = 1;
 			surface->tileMode = Latte::E_GX2TILEMODE::TM_2D_TILED_THIN1;
-			surface->pitch = 8;
-			surface->numLevels = 0;
+			surface->numLevels = 1;
 			surface->imagePtr = MEMORY_TILINGAPERTURE_AREA_ADDR;
-			surface->swizzle = 0;
 			surface->aa = 0;
 			surface->format = Latte::E_GX2SURFFMT::R8_G8_B8_A8_UNORM;
-			surface->alignment = 0x400;
+			surface->resFlag = GX2_RESFLAG_USAGE_TEXTURE;
 		}
 	}
 

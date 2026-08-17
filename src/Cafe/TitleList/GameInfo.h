@@ -116,10 +116,15 @@ public:
 	fs::path GetSaveFolder();
 
 private:
-  	bool IsPrioritizedVersionOrFormat(const TitleInfo& currentTitle, const TitleInfo& newTitle)
+	bool IsPrioritizedVersionOrFormat(const TitleInfo& currentTitle, const TitleInfo& newTitle)
 	{
 		if (!currentTitle.IsValid())
 			return true; // always prefer a valid title over an invalid one
+		// A direct brokered launch must never mix its base/update/DLC payload with
+		// an installed copy of the same title. Its source is selected explicitly
+		// by the user and stays mounted as one coherent set.
+		if (currentTitle.IsBrokeredFilesystem() != newTitle.IsBrokeredFilesystem())
+			return newTitle.IsBrokeredFilesystem();
 		// always prefer higher version
 		if (newTitle.GetAppTitleVersion() > currentTitle.GetAppTitleVersion())
 			return true;

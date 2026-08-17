@@ -98,6 +98,7 @@ private:
 	void RefreshBackBuffer();
 	void EnsureBackBufferSize();
 	void InitializePresentationPipeline();
+	bool EnsureActiveShadersCompiled();
 	bool BindActiveShaders();
 	RendererShader* GetRectEmulationShader(class LatteDecompilerShader* vertexShader);
 	bool HasRequiredShaders() const;
@@ -121,6 +122,10 @@ private:
 	void CheckMemoryPressure();
 	bool WaitForGpuIdle();
 	bool CheckDeviceHealth(const char* operation);
+	bool ExecutePixelStreamoutCapture(uint32 baseVertex, uint32 baseInstance,
+		uint32 instanceCount, uint32 vertexCount, uint32 indexCount,
+		Renderer::INDEX_TYPE indexType, ID3D11Buffer* indexBuffer, UINT indexOffset,
+		const uint8* decodedIndices, UINT decodedIndexBytes);
 	void RecordDeviceLost(HRESULT result, const char* operation);
 	uint64 QueryProcessCommitBytes() const;
 	uint64 CurrentLogicalPipelineKey() const;
@@ -148,6 +153,15 @@ private:
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutBuffers{};
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_streamoutStorageBuffer;
 	Microsoft::WRL::ComPtr<ID3D11UnorderedAccessView> m_streamoutStorageUav;
+	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_streamoutCaptureTarget;
+	Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_streamoutCaptureTargetView;
+	Microsoft::WRL::ComPtr<ID3D11DepthStencilState> m_streamoutCaptureDepthState;
+	Microsoft::WRL::ComPtr<ID3D11BlendState> m_streamoutCaptureBlendState;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_streamoutCaptureConstants;
+	Microsoft::WRL::ComPtr<ID3D11Buffer> m_streamoutCaptureRecordMap;
+	Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> m_streamoutCaptureRecordMapView;
+	UINT m_streamoutCaptureConstantsCapacity{};
+	UINT m_streamoutCaptureRecordMapCapacity{};
 	std::vector<uint8> m_bufferCacheShadow;
 	std::vector<uint8> m_uploadBuffer;
 	std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, Latte::GPU_LIMITS::NUM_TEXTURES_PER_STAGE * 3> m_boundTextures{};
@@ -176,10 +190,15 @@ private:
 	decltype(m_samplerSwizzles) m_uploadedSamplerSwizzles{};
 	std::array<bool, 3> m_samplerSwizzleUploaded{};
 	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutOffsets{};
+	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutRangeSizes{};
 	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
 	std::array<bool, 8> m_boundColorBlendable{ true, true, true, true, true, true, true, true };
 	bool m_streamoutActive{};
 	bool m_streamoutUsesStorage{};
+	bool m_streamoutUsesPixelCapture{};
+	bool m_streamoutDataAvailable{};
+	bool m_keepIndexStagingForPixelStreamout{};
+	RendererShader* m_streamoutPixelCaptureShader{};
 
 	Microsoft::WRL::ComPtr<ID3D11VertexShader> m_presentVS;
 	Microsoft::WRL::ComPtr<ID3D11PixelShader> m_presentPS;

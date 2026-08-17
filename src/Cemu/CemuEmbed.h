@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define CEMU_EMBED_ABI_VERSION 1u
-#define CEMU_EMBED_BROKERED_STORAGE_VERSION 3u
+#define CEMU_EMBED_BROKERED_STORAGE_VERSION 4u
 #define CEMU_EMBED_D3D11_SURFACE_VERSION 1u
 #define CEMU_EMBED_LIBRARY_VERSION 2u
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
@@ -116,6 +116,13 @@ typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedBrokeredEnumerateCallback)(
 	void* entry_callback_user_data);
 typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedBrokeredOpenReadCallback)(
 	void* user_data, void* file_handle, void** stream_handle);
+// Opens a file by its stable path relative to a brokered folder. Unlike the
+// enumeration file_handle, the path remains valid after enumeration returns.
+// This is required by the on-demand virtual filesystem used for direct
+// external-title launches.
+typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedBrokeredOpenRelativeReadCallback)(
+	void* user_data, void* folder_handle, const char* relative_path_utf8,
+	void** stream_handle);
 typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedBrokeredReadCallback)(
 	void* user_data, void* stream_handle, uint64_t offset, uint8_t* buffer,
 	uint32_t buffer_size, uint32_t* bytes_read);
@@ -143,6 +150,8 @@ typedef struct CemuEmbedBrokeredStorage {
 	CemuEmbedBrokeredProgressCallback progress;
 	// Optional in version 3. Avoids routing the full file through ABI buffers.
 	CemuEmbedBrokeredCopyFileCallback copy_file;
+	// Required in version 4 for direct, non-staged brokered title mounting.
+	CemuEmbedBrokeredOpenRelativeReadCallback open_relative_read;
 } CemuEmbedBrokeredStorage;
 
 typedef enum CemuEmbedInstallType {
@@ -255,11 +264,27 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InitializeAsync(CemuEmb
 // Launches a Wii U title directory containing the meta, code and content folders.
 // Call only after the instance reaches CEMU_EMBED_STATE_READY.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGame(CemuEmbedInstance* instance, const char* game_path_utf8);
+// Launches a game directly from external storage. supplemental_title_paths
+// contains the other discovered base, update and DLC paths on the same media;
+// they are registered for the launch so Cemu can resolve matching updates/DLC
+// without copying anything into the persistent MLC.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameWithExternalTitles(
+	CemuEmbedInstance* instance, const char* game_path_utf8,
+	const char* const* supplemental_title_paths, uint32_t supplemental_title_count);
 // Stages a StorageFolder-backed title into Cemu's cache through the supplied
 // broker, then launches it. No unrestricted filesystem capability is needed
 // for the selected folder. The broker is called synchronously on this thread.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolder(
 	CemuEmbedInstance* instance, void* folder_handle, const CemuEmbedBrokeredStorage* storage);
+// Mounts an extracted brokered title and its companion base/update/DLC folders
+// directly through Cemu's read-only virtual filesystem. No title payload is
+// copied to LocalState or LocalCache. selected_relative_path_utf8 must be empty;
+// direct folder mounting requires code, content and meta at the folder root.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolders(
+	CemuEmbedInstance* instance, void* selected_folder_handle,
+	const char* selected_relative_path_utf8,
+	void* const* supplemental_folder_handles, uint32_t supplemental_folder_count,
+	const CemuEmbedBrokeredStorage* storage);
 // Installs an extracted base game, update or DLC into Cemu's persistent MLC.
 // The selected folder must contain code, content and meta. expected_type may
 // be AUTO to accept the type declared by app.xml. The operation is synchronous
@@ -277,6 +302,22 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateInstalledTitle
 // the highest installed update and matching DLC through CafeTitleList.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchInstalledTitle(
 	CemuEmbedInstance* instance, uint64_t base_title_id);
+// Removes the base game, its installed update and all installed DLC from the
+// persistent MLC. Save data and user configuration are deliberately retained.
+// The operation is synchronous and is only available while no title is running.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DeleteInstalledTitle(
+	CemuEmbedInstance* instance, uint64_t base_title_id,
+	uint32_t* removed_install_folder_count);
+// Downloads Cemu's current community Graphic Pack release into the managed
+// downloadedGraphicPacks directory. Existing manually imported packs are kept.
+// already_current is nonzero when the stored release already matches upstream.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DownloadGraphicPacks(
+	CemuEmbedInstance* instance, uint32_t* downloaded_pack_count,
+	int32_t* already_current);
+// Clears every cached shader entry. The next launch rebuilds only the shaders
+// needed by the title. This never removes games, saves, settings or packs.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ClearShaderCaches(
+	CemuEmbedInstance* instance, uint32_t* removed_entry_count);
 // Imports Cemu-format graphic packs (rules.txt plus patches/shaders) from a
 // brokered graphicPacks folder into the persistent user-data directory.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrokeredFolder(

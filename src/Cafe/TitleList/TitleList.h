@@ -30,6 +30,11 @@ public:
 	static bool IsScanning(); // returns true if async refresh is currently active
 	static void WaitForMandatoryScan(); // wait for current scan result if no cached info is available
 	static void AddTitleFromPath(fs::path path);
+	// Adds an extracted title backed by an on-demand host broker. These entries
+	// are session-only and are never written into title_list.xml.
+	static bool AddBrokeredTitle(const std::shared_ptr<FSCBrokeredFilesystem>& filesystem,
+		uint64_t* titleIdOut = nullptr);
+	static void ClearBrokeredTitles();
 
 	static uint64 RegisterCallback(void(*cb)(CafeTitleListCallbackEvent* evt, void* ctx), void* ctx); // on register, the callback will be invoked for every already known title
 	static void UnregisterCallback(uint64 id);

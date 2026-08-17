@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Cafe/Filesystem/fsc.h"
+#include "Cafe/Filesystem/fscDeviceBrokered.h"
 #include "config/CemuConfig.h" // for CafeConsoleRegion. Move to NCrypto?
 #include "TitleId.h"
 #include "AppType.h"
@@ -140,6 +141,7 @@ public:
 		WIIU_ARCHIVE = 3, // Wii U compressed single-file archive (.wua)
 	  	NUS = 4, // NUS format. Directory with .app files, title.tik and title.tmd
 	  	WUHB = 5,
+		BROKERED_FS = 6, // extracted title exposed by an embedded host on demand
 		// error
 		INVALID_STRUCTURE = 0,
 	};
@@ -171,6 +173,8 @@ public:
 	TitleInfo() : m_isValid(false) {};
 	TitleInfo(const fs::path& path);
 	TitleInfo(const fs::path& path, std::string_view subPath);
+	TitleInfo(std::shared_ptr<FSCBrokeredFilesystem> brokeredFilesystem,
+		std::string_view sourceIdentity);
 	TitleInfo(const CachedInfo& cachedInfo);
 	~TitleInfo();
 
@@ -195,6 +199,7 @@ public:
 
 	fs::path GetPath() const;
 	TitleDataFormat GetFormat() const { return m_titleFormat; };
+	bool IsBrokeredFilesystem() const { return m_titleFormat == TitleDataFormat::BROKERED_FS; }
 
 	bool Mount(std::string_view virtualPath, std::string_view subfolder, sint32 mountPriority);
 	void Unmount(std::string_view virtualPath);
@@ -273,6 +278,7 @@ private:
 
 		m_mountpoints.clear();
 		m_wudVolume = nullptr;
+		m_brokeredFilesystem = other.m_brokeredFilesystem;
 	}
 
 	bool DetectFormat(const fs::path& path, fs::path& pathOut, TitleDataFormat& formatOut);
@@ -292,6 +298,7 @@ private:
 	class FSTVolume* m_wudVolume{};
 	class ZArchiveReader* m_zarchive{};
 	class WUHBReader* m_wuhbreader{};
+	std::shared_ptr<FSCBrokeredFilesystem> m_brokeredFilesystem;
 	// xml info
 	bool m_hasParsedXmlFiles{ false };
 	ParsedMetaXml* m_parsedMetaXml{};

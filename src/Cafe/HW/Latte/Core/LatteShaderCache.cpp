@@ -34,6 +34,7 @@
 
 #include <audio/IAudioAPI.h>
 #include <util/bootSound/BootSoundReader.h>
+#include <atomic>
 #include <thread>
 
 #if BOOST_OS_WINDOWS
@@ -64,6 +65,7 @@ struct
 }g_shaderCacheLoaderState;
 
 FileCache* s_shaderCacheGeneric = nullptr;	// contains hardware and version independent shader information
+static std::atomic_bool s_isLoadingShaderCache{};
 
 #define SHADER_CACHE_GENERIC_EXTRA_VERSION		2 // changing this constant will invalidate all hardware-independent cache files
 
@@ -116,7 +118,14 @@ void LatteShaderCache_updateCompileQueue(sint32 maxRemainingEntries)
 			break;
 		auto shader = shaderCompileQueue.entry[0].shader;
 		if (shader)
-			LatteShader_FinishCompilation(shader);
+		{
+			// D3D11 restores cached shaders on its own single low-priority worker.
+			// Waiting here turns cache discovery back into a full foreground shader
+			// compilation pass and delays the first frame by several seconds. The
+			// renderer promotes an active entry synchronously before it is bound.
+			if (g_renderer->GetType() != RendererAPI::D3D11)
+				LatteShader_FinishCompilation(shader);
+		}
 		LatteShaderCache_removeFromCompileQueue(0);
 	}
 }
@@ -352,6 +361,12 @@ void LatteShaderCache_drawBackgroundImage(ImTextureID texture, int width, int he
 
 void LatteShaderCache_Load()
 {
+	struct ShaderCacheLoadScope
+	{
+		ShaderCacheLoadScope() { s_isLoadingShaderCache.store(true, std::memory_order_release); }
+		~ShaderCacheLoadScope() { s_isLoadingShaderCache.store(false, std::memory_order_release); }
+	} shaderCacheLoadScope;
+
 	shaderCacheScreenStats.compiledShaderCount = 0;
 	shaderCacheScreenStats.vertexShaderCount = 0;
 	shaderCacheScreenStats.geometryShaderCount = 0;
@@ -496,7 +511,17 @@ void LatteShaderCache_Load()
 	GetProcessMemoryInfo(GetCurrentProcess(), &pmc2, sizeof(PROCESS_MEMORY_COUNTERS));
 	LONGLONG totalMem2 = pmc2.PagefileUsage;
 	LONGLONG memCommited = totalMem2 - totalMem1;
-	cemuLog_log(LogType::Force, "Shader cache loaded with {} shaders. Commited mem {}MB. Took {}ms", numLoadedShaders, (sint32)(memCommited/1024/1024), timeLoad);
+	if (g_renderer->GetType() == RendererAPI::D3D11)
+	{
+		cemuLog_log(LogType::Force,
+			"D3D11 shader cache indexed {} shaders. Commited mem {}MB. Took {}ms; native restoration continues in the background",
+			numLoadedShaders, (sint32)(memCommited / 1024 / 1024), timeLoad);
+	}
+	else
+	{
+		cemuLog_log(LogType::Force, "Shader cache loaded with {} shaders. Commited mem {}MB. Took {}ms",
+			numLoadedShaders, (sint32)(memCommited / 1024 / 1024), timeLoad);
+	}
 #endif
 	LatteShaderCache_finish();
 	// if Vulkan or Metal then also load pipeline cache
@@ -530,6 +555,11 @@ void LatteShaderCache_Load()
 
 	if(Latte_GetStopSignal())
 		LatteThread_Exit();
+}
+
+bool LatteShaderCache_IsLoading()
+{
+	return s_isLoadingShaderCache.load(std::memory_order_acquire);
 }
 
 void LatteShaderCache_ShowProgress(const std::function <bool(void)>& loadUpdateFunc, bool isPipelines)

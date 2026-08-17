@@ -113,6 +113,8 @@ void CafeTitleList::StoreCacheFile()
 
 	for (auto& tiIt : sTLList)
 	{
+		if (tiIt->IsBrokeredFilesystem())
+			continue;
 		TitleInfo::CachedInfo info = tiIt->MakeCacheEntry();
 		auto titleInfoNode = title_list_node.append_child("title");
 		titleInfoNode.append_attribute("titleId").set_value(fmt::format("{:016x}", info.titleId).c_str());
@@ -254,6 +256,44 @@ void CafeTitleList::AddTitleFromPath(fs::path path)
 		AddDiscoveredTitle(titleInfo);
 	else
 		delete titleInfo;
+}
+
+bool CafeTitleList::AddBrokeredTitle(const std::shared_ptr<FSCBrokeredFilesystem>& filesystem,
+	uint64_t* titleIdOut)
+{
+	if (!filesystem)
+		return false;
+	auto* titleInfo = new TitleInfo(filesystem, filesystem->GetIdentity());
+	if (!titleInfo->IsValid())
+	{
+		delete titleInfo;
+		return false;
+	}
+	if (titleIdOut)
+		*titleIdOut = titleInfo->GetAppTitleId();
+	std::unique_lock lock(sTLMutex);
+	AddTitle(titleInfo);
+	return true;
+}
+
+void CafeTitleList::ClearBrokeredTitles()
+{
+	std::unique_lock lock(sTLMutex);
+	for (auto it = sTLList.begin(); it != sTLList.end();)
+	{
+		TitleInfo* titleInfo = *it;
+		if (!titleInfo->IsBrokeredFilesystem())
+		{
+			++it;
+			continue;
+		}
+		_RemoveTitleFromMultimap(titleInfo);
+		it = sTLList.erase(it);
+		CafeTitleListCallbackEvent event{CafeTitleListCallbackEvent::TYPE::TITLE_REMOVED, titleInfo};
+		for (auto& callback : sTLCallbackList)
+			callback.cb(&event, callback.ctx);
+		delete titleInfo;
+	}
 }
 
 bool CafeTitleList::RefreshWorkerThread()

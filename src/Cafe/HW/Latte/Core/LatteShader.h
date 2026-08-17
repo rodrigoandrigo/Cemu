@@ -122,6 +122,10 @@ void LatteShader_DumpRawShader(uint64 baseHash, uint64 auxHash, uint32 type, uin
 // shader cache file
 void LatteShaderCache_Load();
 void LatteShaderCache_Close();
+// True only while a title's transferable shader cache is being restored.
+// Render backends use this to distinguish safe cache prewarming from a newly
+// encountered shader that must be ready for the current draw.
+bool LatteShaderCache_IsLoading();
 
 void LatteShaderCache_writeSeparableVertexShader(uint64 shaderBaseHash, uint64 shaderAuxHash, uint8* fetchShader, uint32 fetchShaderSize, uint8* vertexShader, uint32 vertexShaderSize, uint32* contextRegisters, bool usesGeometryShader);
 void LatteShaderCache_writeSeparableGeometryShader(uint64 shaderBaseHash, uint64 shaderAuxHash, uint8* geometryShader, uint32 geometryShaderSize, uint8* gsCopyShader, uint32 gsCopyShaderSize, uint32* contextRegisters, uint32* hleSpecialState, uint32 vsRingParameterCount);

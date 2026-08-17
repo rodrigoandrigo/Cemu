@@ -1,5 +1,7 @@
 #pragma once
 
+#include <memory>
+
 struct FSCVirtualFile;
 
 #define FSC_TYPE_INVALID				(0)
@@ -209,6 +211,12 @@ bool FSCDeviceWUHB_Mount(std::string_view mountPath, std::string_view destinatio
 
 // hostFS device
 bool FSCDeviceHostFS_Mount(std::string_view mountPath, std::string_view hostTargetPath, sint32 priority);
+
+// Brokered host device. The data source remains owned by the embedding host
+// and is read on demand through FSCBrokeredFilesystem callbacks.
+class FSCBrokeredFilesystem;
+bool FSCDeviceBrokered_Mount(std::string_view mountPath, std::string_view destinationBaseDir,
+	const std::shared_ptr<FSCBrokeredFilesystem>& filesystem, sint32 priority);
 
 // redirect device
 void fscDeviceRedirect_map();

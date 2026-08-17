@@ -90,6 +90,39 @@ TitleInfo::TitleInfo(const fs::path& path, std::string_view subPath)
 		CalcUID();
 }
 
+TitleInfo::TitleInfo(std::shared_ptr<FSCBrokeredFilesystem> brokeredFilesystem,
+	std::string_view sourceIdentity)
+	: m_titleFormat(TitleDataFormat::BROKERED_FS),
+	  m_brokeredFilesystem(std::move(brokeredFilesystem))
+{
+	if (!m_brokeredFilesystem)
+	{
+		SetInvalidReason(InvalidReason::BAD_PATH_OR_INACCESSIBLE);
+		return;
+	}
+	// This is a diagnostic identity only. All payload I/O remains behind the
+	// brokered virtual filesystem and never reaches std::filesystem.
+	m_fullPath = fs::path("brokered") / _utf8ToPath(sourceIdentity);
+	m_isValid = true;
+	m_isValid = ParseXmlInfo();
+	// Some extracted dumps merge the base content tree with an update app.xml.
+	// Staging used to rewrite app.xml for this case; keep the same behaviour in
+	// memory so direct external launches never modify the removable drive.
+	if (m_isValid && m_parsedAppXml && m_parsedMetaXml &&
+		(m_parsedAppXml->title_id >> 32) == 0x0005000Eull &&
+		(m_parsedMetaXml->m_title_id >> 32) == 0x00050000ull &&
+		static_cast<uint32>(m_parsedAppXml->title_id) == static_cast<uint32>(m_parsedMetaXml->m_title_id) &&
+		m_brokeredFilesystem->ContainsDirectory("content"))
+	{
+		cemuLog_log(LogType::Force,
+			"Brokered title has merged base metadata with an update app.xml; using base title id {:016x} in memory",
+			m_parsedMetaXml->m_title_id);
+		m_parsedAppXml->title_id = m_parsedMetaXml->m_title_id;
+	}
+	if (m_isValid)
+		CalcUID();
+}
+
 TitleInfo::TitleInfo(const TitleInfo::CachedInfo& cachedInfo)
 {
 	m_cachedInfo = new CachedInfo(cachedInfo);
@@ -309,6 +342,11 @@ void TitleInfo::CalcUID()
 		m_uid = 0;
 		return;
 	}
+	if (m_titleFormat == TitleDataFormat::BROKERED_FS)
+	{
+		m_uid = std::hash<std::string>{}(m_brokeredFilesystem->GetIdentity());
+		return;
+	}
 	// get absolute normalized path
 	fs::path normalizedPath;
 	if (m_fullPath.is_relative())
@@ -402,6 +440,17 @@ bool TitleInfo::Mount(std::string_view virtualPath, std::string_view subfolder, 
 		if (!r)
 		{
 			cemuLog_log(LogType::Force, "Failed to mount {} to {}", virtualPath, subfolder);
+			SetInvalidReason(InvalidReason::BAD_PATH_OR_INACCESSIBLE);
+			return false;
+		}
+	}
+	else if (m_titleFormat == TitleDataFormat::BROKERED_FS)
+	{
+		bool r = FSCDeviceBrokered_Mount(virtualPath, subfolder,
+			m_brokeredFilesystem, mountPriority);
+		if (!r)
+		{
+			cemuLog_log(LogType::Force, "Failed to mount brokered title {} to {}", virtualPath, subfolder);
 			SetInvalidReason(InvalidReason::BAD_PATH_OR_INACCESSIBLE);
 			return false;
 		}
@@ -776,6 +825,9 @@ std::string TitleInfo::GetPrintPath() const
 		break;
 	case TitleDataFormat::WUHB:
 		tmp.append(" [WUHB]");
+		break;
+	case TitleDataFormat::BROKERED_FS:
+		tmp.append(" [Brokered external]");
 		break;
 	default:
 		break;

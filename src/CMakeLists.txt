@@ -72,6 +72,7 @@ add_library(CemuBin SHARED
 )
 
 target_compile_definitions(CemuBin PRIVATE CEMU_EMBED_BUILD)
+target_include_directories(CemuBin PRIVATE ${RAPIDJSON_INCLUDE_DIRS})
 
 cemu_use_precompiled_header(CemuBin)
 
@@ -232,6 +233,8 @@ target_link_libraries(CemuBin PRIVATE
 	CemuInput
 	CemuResource
 	CemuUtil
+	CURL::libcurl
+	libzip::zip
 )
 
 if(MINGW AND NOT CEMU_UWP)

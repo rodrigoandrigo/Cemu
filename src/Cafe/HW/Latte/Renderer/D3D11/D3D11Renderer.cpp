@@ -12,6 +12,7 @@
 #include "Common/FileStream.h"
 #include "config/ActiveSettings.h"
 #include "interface/WindowSystem.h"
+#include "util/helpers/helpers.h"
 
 #include <backends/imgui_impl_dx11.h>
 #include <d3dcompiler.h>
@@ -24,11 +25,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cctype>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <fstream>
 #include <imgui.h>
 #include "imgui/imgui_extension.h"
@@ -39,6 +43,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include "util/helpers/Semaphore.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -53,11 +58,29 @@ namespace
 // transform feedback in the same draw without an overlap at u0.
 constexpr UINT StreamoutUavSlot = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
 
+// Feature level 11.0 permits UAV writes from the pixel shader, but not from
+// VS/GS.  Xbox UWP exposes exactly that feature level.  The compatibility
+// path below therefore replays the vertex stream as points and stores the XFB
+// words from a pixel shader through this ordinary OM UAV slot.
+constexpr UINT StreamoutPixelCaptureUavSlot = 1;
+constexpr UINT StreamoutPixelCaptureWidth = 2048;
+constexpr UINT StreamoutPixelCaptureHeight = 1024;
+constexpr UINT StreamoutPixelCaptureCapacity =
+	StreamoutPixelCaptureWidth * StreamoutPixelCaptureHeight;
+constexpr UINT StreamoutPixelCaptureWordsPerPass = 32;
+
 #if defined(CEMU_UWP)
 // Serialize Cemu shader translation with the first draw that makes D3D11On12
 // compile a native Xbox pipeline. Both paths have large transient footprints.
 std::mutex s_xboxShaderPipelineMutex;
 #endif
+
+class D3D11Shader;
+void D3D11ShaderQueueStart();
+void D3D11ShaderQueueStop();
+void D3D11ShaderQueueSubmit(D3D11Shader* shader);
+bool D3D11ShaderQueuePromote(D3D11Shader* shader);
+void D3D11ShaderQueueCancel(D3D11Shader* shader);
 
 #if defined(CEMU_D3D11_DRIVER_TRACE)
 std::atomic_uint64_t s_driverCallSequence{};
@@ -830,31 +853,75 @@ class D3D11Shader final : public RendererShader
 {
 public:
 	D3D11Shader(ID3D11Device* device, ShaderType type, uint64 baseHash, uint64 auxHash,
-		bool isGfxPack, const std::string& source)
-		: RendererShader(type, baseHash, auxHash, true, isGfxPack)
+		bool isGfxPack, const std::string& source, bool compileAsync)
+		: RendererShader(type, baseHash, auxHash, true, isGfxPack), m_device(device),
+		  m_source(source)
 	{
-		Compile(device, source);
-		ReleaseTransientBytecode();
+		StartCompilation(compileAsync);
 	}
 	D3D11Shader(ID3D11Device* device, ShaderType type, uint64 baseHash, uint64 auxHash,
-		bool isGfxPack, const std::string& source, bool sourceIsHlsl)
-		: RendererShader(type, baseHash, auxHash, true, isGfxPack)
+		bool isGfxPack, const std::string& source, bool sourceIsHlsl, bool compileAsync)
+		: RendererShader(type, baseHash, auxHash, true, isGfxPack), m_device(device),
+		  m_source(source), m_sourceIsHlsl(sourceIsHlsl)
 	{
-		if (sourceIsHlsl)
-			CompileHLSL(device, source);
-		else
-			Compile(device, source);
-		ReleaseTransientBytecode();
+		StartCompilation(compileAsync);
 	}
+	~D3D11Shader() override { D3D11ShaderQueueCancel(this); }
 
-	void PreponeCompilation(bool) override {}
-	bool IsCompiled() override { return m_compiled; }
-	bool WaitForCompiled() override { return m_compiled; }
+	void PreponeCompilation(bool) override
+	{
+		if (m_compilationState.hasState(CompilationState::Done))
+			return;
+		if (D3D11ShaderQueuePromote(this))
+		{
+			CompileNow();
+			m_compilationState.setValue(CompilationState::Done);
+			return;
+		}
+		m_compilationState.waitUntilValue(CompilationState::Done);
+	}
+	bool IsCompiled() override
+	{
+		return m_compilationState.hasState(CompilationState::Done) &&
+			m_compiled.load(std::memory_order_acquire);
+	}
+	bool WaitForCompiled() override
+	{
+		m_compilationState.waitUntilValue(CompilationState::Done);
+		return m_compiled.load(std::memory_order_acquire);
+	}
 	ID3D11VertexShader* Vertex() const { return m_vs.Get(); }
 	ID3D11PixelShader* Pixel() const { return m_ps.Get(); }
 	ID3D11GeometryShader* Geometry() const { return m_gs.Get(); }
 	ID3D11GeometryShader* StreamoutGeometry() const { return m_streamoutGs.Get(); }
 	bool UsesStreamoutStorage() const { return m_usesStreamoutStorage; }
+	bool HasPixelStreamoutCapture() const
+	{
+		return m_pixelStreamoutCaptureVs && !m_pixelStreamoutCapturePasses.empty();
+	}
+	ID3D11VertexShader* PixelStreamoutCaptureVertex() const
+	{
+		return m_pixelStreamoutCaptureVs.Get();
+	}
+	UINT PixelStreamoutCapturePassCount() const
+	{
+		return static_cast<UINT>(m_pixelStreamoutCapturePasses.size());
+	}
+	ID3D11GeometryShader* PixelStreamoutCaptureGeometry(UINT index) const
+	{
+		return index < m_pixelStreamoutCapturePasses.size() ?
+			m_pixelStreamoutCapturePasses[index].geometry.Get() : nullptr;
+	}
+	ID3D11PixelShader* PixelStreamoutCapturePixel(UINT index) const
+	{
+		return index < m_pixelStreamoutCapturePasses.size() ?
+			m_pixelStreamoutCapturePasses[index].pixel.Get() : nullptr;
+	}
+	UINT PixelStreamoutCaptureStride(UINT buffer) const
+	{
+		return buffer < m_pixelStreamoutCaptureStrides.size() ?
+			m_pixelStreamoutCaptureStrides[buffer] : 0;
+	}
 	ID3DBlob* Bytecode() const { return m_bytecode.Get(); }
 	uint64 BaseHash() const { return m_baseHash; }
 	uint64 AuxHash() const { return m_auxHash; }
@@ -870,6 +937,72 @@ public:
 	static constexpr UINT InvalidSlot = UINT_MAX;
 
 private:
+	friend class D3D11ShaderCompilerQueue;
+
+	enum class CompilationState : uint8
+	{
+		None,
+		Queued,
+		Compiling,
+		Done,
+	};
+
+	void StartCompilation(bool compileAsync)
+	{
+		if (compileAsync)
+		{
+			m_compilationState.setValue(CompilationState::Queued);
+			D3D11ShaderQueueSubmit(this);
+			return;
+		}
+		m_compilationState.setValue(CompilationState::Compiling);
+		CompileNow();
+		m_compilationState.setValue(CompilationState::Done);
+	}
+
+	void CompileNow()
+	{
+#if defined(CEMU_UWP)
+		// Xbox exposes one compiler/translation memory budget to the whole title.
+		// This lock is shared by foreground promotion and low-priority cache work.
+		std::lock_guard pipelineLock(s_xboxShaderPipelineMutex);
+#endif
+		try
+		{
+			if (m_sourceIsHlsl)
+				CompileHLSL(m_device.Get(), m_source);
+			else
+				Compile(m_device.Get(), m_source);
+		}
+		catch (const std::exception& ex)
+		{
+			m_compiled.store(false, std::memory_order_release);
+			cemuLog_log(LogType::Force,
+				"D3D11 shader {:016x}_{:016x} failed outside the compiler boundary: {}",
+				m_baseHash, m_auxHash, ex.what());
+		}
+		catch (...)
+		{
+			m_compiled.store(false, std::memory_order_release);
+			OutputDebugStringA("[Cemu/D3D11] unexpected shader compiler exception\n");
+		}
+		ReleaseTransientBytecode();
+		m_source.clear();
+		m_source.shrink_to_fit();
+	}
+
+	struct PixelStreamoutCapturePass
+	{
+		ComPtr<ID3D11GeometryShader> geometry;
+		ComPtr<ID3D11PixelShader> pixel;
+	};
+	struct StreamoutBlock
+	{
+		UINT slot{};
+		UINT stride{};
+		UINT location{};
+	};
+
 	void ReleaseTransientBytecode()
 	{
 		// Only vertex bytecode is needed later by CreateInputLayout. Pixel and
@@ -1327,11 +1460,11 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 			m_samplerSwizzleSlot = samplerSwizzleSlot;
 
 		CompileHLSL(device, hlsl, true);
-		if (m_compiled)
+		if (m_compiled.load(std::memory_order_acquire))
 			cemuLog_logOnce(LogType::Force,
 				"D3D11 native geometry shader {:016x}_{:016x}: translated automatically from Cemu GLSL",
 				m_baseHash, m_auxHash);
-		return m_compiled;
+		return m_compiled.load(std::memory_order_acquire);
 	}
 
 	struct GeometryInterfaceField
@@ -1611,7 +1744,7 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 			"D3D11 native geometry shader {:016x}_{:016x}: SPIRV-Cross has no HLSL geometry-stage backend; using reflected topology-preserving compatibility shader",
 			m_baseHash, m_auxHash);
 		CompileHLSL(device, hlsl, true);
-		return m_compiled;
+		return m_compiled.load(std::memory_order_acquire);
 	}
 
 	bool CompileKnownGeometryShader(ID3D11Device* device)
@@ -1717,13 +1850,13 @@ void main(point GeometryInput inputVertices[1],
 )HLSL";
 
 		CompileHLSL(device, hlsl, true);
-		if (m_compiled)
+		if (m_compiled.load(std::memory_order_acquire))
 		{
 			cemuLog_logOnce(LogType::Force,
 				"D3D11 native geometry shader {:016x}_{:016x}: using exact point-sprite HLSL translation",
 				m_baseHash, m_auxHash);
 		}
-		return m_compiled;
+		return m_compiled.load(std::memory_order_acquire);
 	}
 
 	void DumpUnsupportedGeometrySource(const std::string& source, const std::vector<uint32>& spirv) const
@@ -1814,6 +1947,9 @@ void main(point GeometryInput inputVertices[1],
 			m_textureSlots.fill(InvalidSlot);
 			m_uniformSlots.fill(InvalidSlot);
 			std::string hlsl;
+#if defined(CEMU_UWP)
+			std::string pixelStreamoutCaptureHlsl;
+#endif
 			UINT uniformSlot{};
 			const char* profile = GetType() == ShaderType::kVertex ? "vs_5_0" :
 				GetType() == ShaderType::kFragment ? "ps_5_0" : "gs_5_0";
@@ -1865,11 +2001,11 @@ void main(point GeometryInput inputVertices[1],
 			auto resources = compiler.get_shader_resources();
 			const auto executionModel = compiler.get_execution_model();
 #if defined(CEMU_UWP)
-			// The SPIR-V contains extra transform-feedback stage outputs. Leaving them in the
-			// ordinary raster HLSL is enough for xbsc to reject the native function.
 			// XFB locations are allocated after all regular stage outputs by the
-			// decompiler, so filter only that trailing interface range. Position and
-			// every Wii U varying used by the next stage remain enabled.
+			// decompiler, so filtering the trailing interface range preserves position
+			// and every Wii U varying used by the next stage. The unfiltered variant is
+			// compiled separately for the pixel-UAV fallback after resource bindings
+			// have been mapped below.
 			UINT firstXfbLocation = UINT_MAX;
 			size_t xfbCursor{};
 			while ((xfbCursor = source.find("XFB_BLOCK_LAYOUT(", xfbCursor)) != std::string::npos)
@@ -1879,17 +2015,6 @@ void main(point GeometryInput inputVertices[1],
 					"XFB_BLOCK_LAYOUT(%u, %u, %u)", &slot, &stride, &location) == 3)
 					firstXfbLocation = (std::min)(firstXfbLocation, location);
 				xfbCursor += 17;
-			}
-			if (firstXfbLocation != UINT_MAX)
-			{
-				auto activeInterfaces = compiler.get_active_interface_variables();
-				for (const auto& output : resources.stage_outputs)
-				{
-					if (compiler.has_decoration(output.id, spv::DecorationLocation) &&
-						compiler.get_decoration(output.id, spv::DecorationLocation) >= firstXfbLocation)
-						activeInterfaces.erase(output.id);
-				}
-				compiler.set_enabled_interface_variables(std::move(activeInterfaces));
 			}
 #endif
 			const auto descriptorCount = [&](const spirv_cross::Resource& resource)
@@ -1998,7 +2123,7 @@ void main(point GeometryInput inputVertices[1],
 					return;
 				}
 				CompileGeometryCompatibilityShader(device, compiler, resources);
-				if (m_compiled && !CreateStreamoutShader(device, source))
+			if (m_compiled.load(std::memory_order_acquire) && !CreateStreamoutShader(device, source))
 					m_compiled = false;
 				return;
 			}
@@ -2009,10 +2134,58 @@ void main(point GeometryInput inputVertices[1],
 			// Preserve the SPIR-V name for stages supported by the HLSL backend.
 			options.use_entry_point_name = true;
 			compiler.set_hlsl_options(options);
+#if defined(CEMU_UWP)
+			if (GetType() == ShaderType::kVertex && firstXfbLocation != UINT_MAX)
+			{
+				// The normal Xbox vertex function must omit XFB outputs, but the
+				// pixel-UAV fallback needs their original bit-exact values. Generate a
+				// private vertex function with only the XFB interface; it is never
+				// bound in the title's raster pipeline. Omitting ordinary varyings
+				// keeps that private function below Xbox's strict output-signature
+				// limits.
+				auto allActiveInterfaces = compiler.get_active_interface_variables();
+				auto captureInterfaces = allActiveInterfaces;
+				for (const auto& output : resources.stage_outputs)
+				{
+					if (compiler.has_decoration(output.id, spv::DecorationLocation) &&
+						compiler.get_decoration(output.id, spv::DecorationLocation) < firstXfbLocation)
+						captureInterfaces.erase(output.id);
+				}
+				compiler.set_enabled_interface_variables(std::move(captureInterfaces));
+				try
+				{
+					pixelStreamoutCaptureHlsl = compiler.compile();
+				}
+				catch (const std::exception& ex)
+				{
+					// The fallback is optional. Failing to translate its private vertex
+					// function must not reject the ordinary raster shader.
+					cemuLog_logOnce(LogType::Force,
+						"D3D11 Xbox pixel stream-output translation skipped for {:016x}_{:016x}: {}",
+						m_baseHash, m_auxHash, ex.what());
+				}
+				auto rasterInterfaces = std::move(allActiveInterfaces);
+				for (const auto& output : resources.stage_outputs)
+				{
+					if (compiler.has_decoration(output.id, spv::DecorationLocation) &&
+						compiler.get_decoration(output.id, spv::DecorationLocation) >= firstXfbLocation)
+						rasterInterfaces.erase(output.id);
+				}
+				compiler.set_enabled_interface_variables(std::move(rasterInterfaces));
+			}
+#endif
 			hlsl = compiler.compile();
 			hlsl = AddRuntimeSamplerSwizzles(std::move(hlsl), uniformSlot, m_usesRuntimeSwizzle);
 			if (m_usesRuntimeSwizzle)
 				m_samplerSwizzleSlot = uniformSlot;
+#if defined(CEMU_UWP)
+			if (!pixelStreamoutCaptureHlsl.empty())
+			{
+				bool usesCaptureRuntimeSwizzle{};
+				pixelStreamoutCaptureHlsl = AddRuntimeSamplerSwizzles(
+					std::move(pixelStreamoutCaptureHlsl), uniformSlot, usesCaptureRuntimeSwizzle);
+			}
+#endif
 			}
 			std::vector<uint32>().swap(spirv);
 			ComPtr<ID3DBlob> errors;
@@ -2051,6 +2224,10 @@ void main(point GeometryInput inputVertices[1],
 				const HRESULT createResult = device->CreateVertexShader(m_bytecode->GetBufferPointer(),
 					m_bytecode->GetBufferSize(), nullptr, &m_vs);
 				ThrowIfFailed(createResult, "CreateVertexShader");
+#if defined(CEMU_UWP)
+				if (!pixelStreamoutCaptureHlsl.empty())
+					CreatePixelStreamoutCaptureVertex(device, pixelStreamoutCaptureHlsl);
+#endif
 			}
 			else if (GetType() == ShaderType::kFragment)
 			{
@@ -2090,19 +2267,247 @@ void main(point GeometryInput inputVertices[1],
 		}
 	}
 
+	bool CreatePixelStreamoutCaptureVertex(ID3D11Device* device, const std::string& hlsl)
+	{
+		m_pixelStreamoutCaptureVs.Reset();
+		m_pixelStreamoutCaptureBytecode.Reset();
+		ComPtr<ID3DBlob> bytecode;
+		ComPtr<ID3DBlob> errors;
+		const HRESULT compileResult = CompileHLSLCached(hlsl.data(), hlsl.size(), "vs_5_0",
+			RuntimeShaderCompileFlags(), &bytecode, &errors);
+		if (FAILED(compileResult))
+		{
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 Xbox pixel stream-output vertex capture disabled for {:016x}_{:016x}: {}",
+				m_baseHash, m_auxHash,
+				errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error");
+			return false;
+		}
+		const HRESULT createResult = device->CreateVertexShader(bytecode->GetBufferPointer(),
+			bytecode->GetBufferSize(), nullptr, &m_pixelStreamoutCaptureVs);
+		if (FAILED(createResult))
+		{
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 Xbox pixel stream-output vertex capture creation failed for {:016x}_{:016x} (0x{:08X})",
+				m_baseHash, m_auxHash, static_cast<uint32>(createResult));
+			m_pixelStreamoutCaptureVs.Reset();
+			return false;
+		}
+		m_pixelStreamoutCaptureBytecode = std::move(bytecode);
+		return true;
+	}
+
+	bool CreatePixelStreamoutCaptureShader(ID3D11Device* device,
+		const std::vector<StreamoutBlock>& blocks)
+	{
+		m_pixelStreamoutCapturePasses.clear();
+		m_pixelStreamoutCaptureStrides.fill(0);
+		auto disableCapture = [this]()
+		{
+			m_pixelStreamoutCapturePasses.clear();
+			m_pixelStreamoutCaptureStrides.fill(0);
+			m_pixelStreamoutCaptureVs.Reset();
+			return true;
+		};
+		if (GetType() != ShaderType::kVertex)
+		{
+			// A feature-level 11.0 pixel-UAV replay can only be inserted after the
+			// vertex stage. Geometry output needs an explicit all-stage UAV path,
+			// which is selected automatically on FL 11.1 and newer.
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 Xbox pixel stream-output fallback cannot capture geometry shader {:016x}_{:016x}",
+				m_baseHash, m_auxHash);
+			return true;
+		}
+		ComPtr<ID3DBlob> captureBytecode = std::move(m_pixelStreamoutCaptureBytecode);
+		if (!m_pixelStreamoutCaptureVs || !captureBytecode)
+			return disableCapture();
+
+		ComPtr<ID3D11ShaderReflection> reflection;
+		if (FAILED(D3DReflect(captureBytecode->GetBufferPointer(), captureBytecode->GetBufferSize(),
+			IID_PPV_ARGS(&reflection))))
+			return disableCapture();
+		D3D11_SHADER_DESC shaderDesc{};
+		if (FAILED(reflection->GetDesc(&shaderDesc)))
+			return disableCapture();
+		std::vector<D3D11_SIGNATURE_PARAMETER_DESC> outputs(shaderDesc.OutputParameters);
+		for (UINT i = 0; i < shaderDesc.OutputParameters; ++i)
+		{
+			if (FAILED(reflection->GetOutputParameterDesc(i, &outputs[i])))
+				return disableCapture();
+		}
+
+		struct CaptureValue
+		{
+			UINT buffer{};
+			UINT wordsPerVertex{};
+			UINT wordOffset{};
+			UINT semanticIndex{};
+			std::string hlslType;
+		};
+		std::vector<CaptureValue> values;
+		for (const auto& block : blocks)
+		{
+			if (block.slot >= LATTE_NUM_STREAMOUT_BUFFER || !block.stride ||
+				(block.stride % sizeof(uint32)) != 0)
+				return disableCapture();
+			const UINT wordsPerVertex = block.stride / sizeof(uint32);
+			if (wordsPerVertex > D3D11_SO_OUTPUT_COMPONENT_COUNT ||
+				(m_pixelStreamoutCaptureStrides[block.slot] &&
+					m_pixelStreamoutCaptureStrides[block.slot] != block.stride))
+				return disableCapture();
+			m_pixelStreamoutCaptureStrides[block.slot] = block.stride;
+			for (UINT word = 0; word < wordsPerVertex; ++word)
+			{
+				const UINT semanticIndex = block.location + word;
+				auto output = std::find_if(outputs.begin(), outputs.end(), [semanticIndex](const auto& value) {
+					return value.SemanticName && _stricmp(value.SemanticName, "TEXCOORD") == 0 &&
+						value.SemanticIndex == semanticIndex;
+				});
+				if (output == outputs.end() || output->Mask == 0)
+					return disableCapture();
+				const char* baseType = output->ComponentType == D3D_REGISTER_COMPONENT_FLOAT32 ? "float" :
+					output->ComponentType == D3D_REGISTER_COMPONENT_SINT32 ? "int" :
+					output->ComponentType == D3D_REGISTER_COMPONENT_UINT32 ? "uint" : nullptr;
+				if (!baseType)
+					return disableCapture();
+				values.push_back({ block.slot, wordsPerVertex, word, semanticIndex, baseType });
+			}
+		}
+		if (values.empty())
+			return disableCapture();
+
+		for (size_t first = 0; first < values.size(); first += StreamoutPixelCaptureWordsPerPass)
+		{
+			const size_t count = (std::min)(values.size() - first,
+				static_cast<size_t>(StreamoutPixelCaptureWordsPerPass));
+			const UINT packedCount = static_cast<UINT>((count + 3) / 4);
+			std::string geometryHlsl = R"HLSL(
+cbuffer CemuStreamoutCapture : register(b0)
+{
+    uint4 cemuRecordState;
+    uint4 cemuRingBase;
+    uint4 cemuBufferLimit;
+};
+StructuredBuffer<uint> cemuRecordMap : register(t0);
+struct CaptureInput
+{
+)HLSL";
+			for (size_t index = 0; index < count; ++index)
+			{
+				const auto& value = values[first + index];
+				geometryHlsl += fmt::format("    {} cemuValue{} : TEXCOORD{};\n",
+					value.hlslType, index, value.semanticIndex);
+			}
+			geometryHlsl += "};\nstruct CaptureOutput\n{\n"
+				"    float4 position : SV_Position;\n"
+				"    nointerpolation uint cemuRecord : TEXCOORD0;\n";
+			for (UINT packed = 0; packed < packedCount; ++packed)
+				geometryHlsl += fmt::format("    nointerpolation uint4 cemuPacked{} : TEXCOORD{};\n",
+					packed, packed + 1);
+			geometryHlsl += R"HLSL(};
+[maxvertexcount(1)]
+void main(point CaptureInput inputVertices[1], uint primitiveId : SV_PrimitiveID,
+          inout PointStream<CaptureOutput> outputStream)
+{
+    const uint vertexIndex = cemuRecordState.z != 0u ? cemuRecordMap[primitiveId] : primitiveId;
+    const uint record = cemuRecordState.x + vertexIndex;
+    if (record >= cemuRecordState.y)
+        return;
+    CaptureOutput output = (CaptureOutput)0;
+    output.cemuRecord = record;
+    const uint x = record & 2047u;
+    const uint y = record >> 11u;
+    output.position = float4((float(x) + 0.5f) / 1024.0f - 1.0f,
+                             1.0f - (float(y) + 0.5f) / 512.0f, 0.0f, 1.0f);
+)HLSL";
+			for (size_t index = 0; index < count; ++index)
+			{
+				const auto& value = values[first + index];
+				const std::string input = fmt::format("inputVertices[0].cemuValue{}", index);
+				const std::string bits = value.hlslType == "float" ?
+					fmt::format("asuint({})", input) : value.hlslType == "int" ?
+					fmt::format("uint({})", input) : input;
+				geometryHlsl += fmt::format("    output.cemuPacked{}.{} = {};\n",
+					index / 4, "xyzw"[index % 4], bits);
+			}
+			geometryHlsl += "    outputStream.Append(output);\n}\n";
+
+			std::string pixelHlsl = R"HLSL(
+RWByteAddressBuffer cemuStreamout : register(u1);
+cbuffer CemuStreamoutCapture : register(b0)
+{
+    uint4 cemuRecordState;
+    uint4 cemuRingBase;
+    uint4 cemuBufferLimit;
+};
+struct CaptureInput
+{
+    nointerpolation uint cemuRecord : TEXCOORD0;
+)HLSL";
+			for (UINT packed = 0; packed < packedCount; ++packed)
+				pixelHlsl += fmt::format("    nointerpolation uint4 cemuPacked{} : TEXCOORD{};\n",
+					packed, packed + 1);
+			pixelHlsl += "};\nfloat4 main(CaptureInput input) : SV_Target\n{\n";
+			for (size_t index = 0; index < count; ++index)
+			{
+				const auto& value = values[first + index];
+				pixelHlsl += fmt::format(
+					"    if (input.cemuRecord < cemuBufferLimit[{}]) cemuStreamout.Store((cemuRingBase[{}] + input.cemuRecord * {}u + {}u) * 4u, input.cemuPacked{}.{});\n",
+					value.buffer, value.buffer, value.wordsPerVertex, value.wordOffset,
+					index / 4, "xyzw"[index % 4]);
+			}
+			pixelHlsl += "    return float4(0.0f, 0.0f, 0.0f, 0.0f);\n}\n";
+
+			ComPtr<ID3DBlob> geometryBytecode;
+			ComPtr<ID3DBlob> errors;
+			HRESULT result = CompileHLSLCached(geometryHlsl.data(), geometryHlsl.size(), "gs_5_0",
+				RuntimeShaderCompileFlags(), geometryBytecode.GetAddressOf(), errors.GetAddressOf());
+			if (FAILED(result))
+			{
+				cemuLog_log(LogType::Force,
+					"D3D11 Xbox pixel stream-output geometry capture failed for {:016x}_{:016x}: {}",
+					m_baseHash, m_auxHash, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error");
+				return disableCapture();
+			}
+			ComPtr<ID3D11GeometryShader> geometry;
+			if (FAILED(device->CreateGeometryShader(geometryBytecode->GetBufferPointer(),
+				geometryBytecode->GetBufferSize(), nullptr, &geometry)))
+			{
+				return disableCapture();
+			}
+			errors.Reset();
+			ComPtr<ID3DBlob> pixelBytecode;
+			result = CompileHLSLCached(pixelHlsl.data(), pixelHlsl.size(), "ps_5_0",
+				RuntimeShaderCompileFlags(), pixelBytecode.GetAddressOf(), errors.GetAddressOf());
+			if (FAILED(result))
+			{
+				cemuLog_log(LogType::Force,
+					"D3D11 Xbox pixel stream-output shader capture failed for {:016x}_{:016x}: {}",
+					m_baseHash, m_auxHash, errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error");
+				return disableCapture();
+			}
+			ComPtr<ID3D11PixelShader> pixel;
+			if (FAILED(device->CreatePixelShader(pixelBytecode->GetBufferPointer(),
+				pixelBytecode->GetBufferSize(), nullptr, &pixel)))
+			{
+				return disableCapture();
+			}
+			m_pixelStreamoutCapturePasses.push_back({ std::move(geometry), std::move(pixel) });
+		}
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 Xbox pixel-UAV stream-output fallback active for vertex shader {:016x}_{:016x}",
+			m_baseHash, m_auxHash);
+		return true;
+	}
+
 	bool CreateStreamoutShader(ID3D11Device* device, const std::string& source)
 	{
-		struct XfbBlock
-		{
-			UINT slot{};
-			UINT stride{};
-			UINT location{};
-		};
-		std::vector<XfbBlock> blocks;
+		std::vector<StreamoutBlock> blocks;
 		size_t cursor{};
 		while ((cursor = source.find("XFB_BLOCK_LAYOUT(", cursor)) != std::string::npos)
 		{
-			XfbBlock block{};
+			StreamoutBlock block{};
 			if (std::sscanf(source.c_str() + cursor, "XFB_BLOCK_LAYOUT(%u, %u, %u)",
 				&block.slot, &block.stride, &block.location) == 3 &&
 				block.slot < D3D11_SO_BUFFER_SLOT_COUNT && block.stride &&
@@ -2117,14 +2522,10 @@ void main(point GeometryInput inputVertices[1],
 			return false;
 
 #if defined(CEMU_UWP)
-		// Series S D3D11On12 validates this object but xbsc_xs aborts later while
-		// materializing its native function ("Broken function found"), removing the
-		// complete D3D12 device with DXGI_ERROR_DEVICE_REMOVED. Do not call the API
-		// on UWP. The renderer's unavailable-source fallback clears the destination
-		// range, so stale transform-feedback vertices cannot become giant triangles.
-		cemuLog_logOnce(LogType::Force,
-			"D3D11 Series S stream-output compatibility fallback active");
-		return true;
+		// Do not create a D3D11 stream-output function on Xbox. xbsc_xs accepts the
+		// object initially, then can remove the D3D12 device while materializing it
+		// on first use. The pixel-UAV replay below uses only FL 11.0 functionality.
+		return CreatePixelStreamoutCaptureShader(device, blocks);
 #endif
 
 		ComPtr<ID3D11ShaderReflection> reflection;
@@ -2195,18 +2596,181 @@ void main(point GeometryInput inputVertices[1],
 		return true;
 	}
 
-	bool m_compiled{};
+	ComPtr<ID3D11Device> m_device;
+	std::string m_source;
+	bool m_sourceIsHlsl{};
+	StateSemaphore<CompilationState> m_compilationState{ CompilationState::None };
+	std::atomic_bool m_compiled{};
 	ComPtr<ID3DBlob> m_bytecode;
 	ComPtr<ID3D11VertexShader> m_vs;
 	ComPtr<ID3D11PixelShader> m_ps;
 	ComPtr<ID3D11GeometryShader> m_gs;
 	ComPtr<ID3D11GeometryShader> m_streamoutGs;
+	ComPtr<ID3D11VertexShader> m_pixelStreamoutCaptureVs;
+	ComPtr<ID3DBlob> m_pixelStreamoutCaptureBytecode;
 	std::array<UINT, 256> m_textureSlots{};
 	std::array<UINT, 256> m_uniformSlots{};
 	UINT m_samplerSwizzleSlot{ InvalidSlot };
 	bool m_usesRuntimeSwizzle{};
 	bool m_usesStreamoutStorage{};
+	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_pixelStreamoutCaptureStrides{};
+	std::vector<PixelStreamoutCapturePass> m_pixelStreamoutCapturePasses;
 };
+
+// D3D11 has no portable equivalent of Vulkan's pipeline cache.  Creating a
+// shader object can still trigger D3D11On12 work, so restore known shaders in
+// one low-priority worker and promote the small subset needed by the current
+// draw synchronously.  The queue owns no shaders: every owner either promotes
+// or cancels its pending job before destruction.
+class D3D11ShaderCompilerQueue
+{
+public:
+	void Start()
+	{
+		std::lock_guard lock(m_mutex);
+		if (m_running)
+			return;
+		m_running = true;
+		m_thread = std::thread(&D3D11ShaderCompilerQueue::ThreadMain, this);
+	}
+
+	void Stop()
+	{
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_running)
+				return;
+			m_running = false;
+			for (auto* shader : m_queue)
+			{
+				shader->m_compiled.store(false, std::memory_order_release);
+				shader->m_compilationState.setValue(D3D11Shader::CompilationState::Done);
+			}
+			m_queue.clear();
+		}
+		m_condition.notify_all();
+		if (m_thread.joinable())
+			m_thread.join();
+	}
+
+	void Submit(D3D11Shader* shader)
+	{
+		Start();
+		{
+			std::lock_guard lock(m_mutex);
+			if (!m_running)
+			{
+				// Shutdown raced title-cache discovery. Do not leave a shader in
+				// QUEUED without a worker that can ever complete it.
+				shader->m_compiled.store(false, std::memory_order_release);
+				shader->m_compilationState.setValue(D3D11Shader::CompilationState::Done);
+				return;
+			}
+			m_queue.push_back(shader);
+		}
+		m_condition.notify_one();
+	}
+
+	bool Promote(D3D11Shader* shader)
+	{
+		std::lock_guard lock(m_mutex);
+		if (!shader->m_compilationState.hasState(D3D11Shader::CompilationState::Queued))
+			return false;
+		auto it = std::find(m_queue.begin(), m_queue.end(), shader);
+		if (it == m_queue.end())
+			return false;
+		m_queue.erase(it);
+		shader->m_compilationState.setValue(D3D11Shader::CompilationState::Compiling);
+		return true;
+	}
+
+	void Cancel(D3D11Shader* shader)
+	{
+		{
+			std::lock_guard lock(m_mutex);
+			if (shader->m_compilationState.hasState(D3D11Shader::CompilationState::Queued))
+			{
+				auto it = std::find(m_queue.begin(), m_queue.end(), shader);
+				if (it != m_queue.end())
+				{
+					m_queue.erase(it);
+					shader->m_compiled.store(false, std::memory_order_release);
+					shader->m_compilationState.setValue(D3D11Shader::CompilationState::Done);
+					return;
+				}
+			}
+		}
+		if (!shader->m_compilationState.hasState(D3D11Shader::CompilationState::Done))
+			shader->m_compilationState.waitUntilValue(D3D11Shader::CompilationState::Done);
+	}
+
+	~D3D11ShaderCompilerQueue() { Stop(); }
+
+private:
+	void ThreadMain()
+	{
+		SetThreadName("d3d11ShaderComp");
+#if defined(CEMU_UWP)
+		// Cache restoration should fill otherwise idle time, not steal a core from
+		// Latte's emulation and render threads.
+		SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
+		while (true)
+		{
+			D3D11Shader* shader{};
+			{
+				std::unique_lock lock(m_mutex);
+				m_condition.wait(lock, [this]() { return !m_running || !m_queue.empty(); });
+				if (!m_running)
+					return;
+				shader = m_queue.front();
+				m_queue.pop_front();
+				shader->m_compilationState.setValue(D3D11Shader::CompilationState::Compiling);
+			}
+			shader->CompileNow();
+			shader->m_compilationState.setValue(D3D11Shader::CompilationState::Done);
+#if defined(CEMU_UWP)
+			// Give the emulation/render threads a scheduling window between cache
+			// entries. A foreground shader can still promote immediately, but a long
+			// cache restores no longer monopolizes the Series S compiler path.
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+#endif
+		}
+	}
+
+	std::mutex m_mutex;
+	std::condition_variable m_condition;
+	std::deque<D3D11Shader*> m_queue;
+	std::thread m_thread;
+	bool m_running{};
+};
+
+D3D11ShaderCompilerQueue s_d3d11ShaderCompilerQueue;
+
+void D3D11ShaderQueueStart()
+{
+	s_d3d11ShaderCompilerQueue.Start();
+}
+
+void D3D11ShaderQueueStop()
+{
+	s_d3d11ShaderCompilerQueue.Stop();
+}
+
+void D3D11ShaderQueueSubmit(D3D11Shader* shader)
+{
+	s_d3d11ShaderCompilerQueue.Submit(shader);
+}
+
+bool D3D11ShaderQueuePromote(D3D11Shader* shader)
+{
+	return s_d3d11ShaderCompilerQueue.Promote(shader);
+}
+
+void D3D11ShaderQueueCancel(D3D11Shader* shader)
+{
+	s_d3d11ShaderCompilerQueue.Cancel(shader);
+}
 
 class D3D11Query final : public LatteQueryObject
 {
@@ -3238,7 +3802,13 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 	cemuLog_log(LogType::Force,
 		"Direct3D 11 feature level 0x{:04X}; transform feedback path: {}",
 		static_cast<uint32>(m_device->GetFeatureLevel()),
-		UseTFViaSSBO() ? "shader storage" : "native compatibility");
+		UseTFViaSSBO() ? "shader storage" :
+#if defined(CEMU_UWP)
+			"pixel-UAV compatibility"
+#else
+			"native compatibility"
+#endif
+		);
 }
 
 D3D11Renderer::~D3D11Renderer() = default;
@@ -3372,6 +3942,7 @@ void D3D11Renderer::EnsureBackBufferSize()
 void D3D11Renderer::Initialize()
 {
 	glslang::InitializeProcess();
+	D3D11ShaderQueueStart();
 	InitializePresentationPipeline();
 	Renderer::Initialize();
 	// Renderer::Initialize() creates the TV context first and the pad context
@@ -3385,6 +3956,9 @@ void D3D11Renderer::Initialize()
 
 void D3D11Renderer::Shutdown()
 {
+	// Stop before releasing any D3D11 objects. The compiler worker only touches
+	// the device, but it may be in an Xbox driver call while the title closes.
+	D3D11ShaderQueueStop();
 	if (m_imguiInitialized)
 	{
 		ImGui::SetCurrentContext(imguiTVContext);
@@ -4044,6 +4618,8 @@ void D3D11Renderer::InvalidateNativePipelineState()
 	m_appliedBlendStateValid = false;
 	m_appliedDepthStencilStateValid = false;
 	m_appliedPrimitiveTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	m_appliedViewportValid = false;
+	m_appliedScissorValid = false;
 }
 
 bool D3D11Renderer::ResolveTextureFeedbackLoops(
@@ -4964,7 +5540,18 @@ void D3D11Renderer::bufferCache_init(const sint32 size)
 	desc.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
 	ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &m_bufferCache), "Create buffer cache");
 	desc.ByteWidth = LatteStreamout_GetRingBufferSize();
-	if (UseTFViaSSBO())
+	// Xbox FL 11.0 uses the same raw ring buffer as the normal shader-storage
+	// path, but populates it from a pixel-UAV replay rather than VS/GS UAV stores.
+	// Keep this resource independent from UseTFViaSSBO(): the latter deliberately
+	// remains false on FL 11.0 so the decompiler emits the reflected XFB values
+	// consumed by the replay geometry shader.
+	const bool needsStreamoutStorageBuffer =
+#if defined(CEMU_UWP)
+		true;
+#else
+		UseTFViaSSBO();
+#endif
+	if (needsStreamoutStorageBuffer)
 	{
 		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
 		desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
@@ -4986,6 +5573,33 @@ void D3D11Renderer::bufferCache_init(const sint32 size)
 			ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &streamoutBuffer),
 				"Create stream-output ring buffer");
 	}
+#if defined(CEMU_UWP)
+	D3D11_TEXTURE2D_DESC captureTargetDesc{};
+	captureTargetDesc.Width = StreamoutPixelCaptureWidth;
+	captureTargetDesc.Height = StreamoutPixelCaptureHeight;
+	captureTargetDesc.MipLevels = 1;
+	captureTargetDesc.ArraySize = 1;
+	captureTargetDesc.Format = DXGI_FORMAT_R8_UNORM;
+	captureTargetDesc.SampleDesc.Count = 1;
+	captureTargetDesc.Usage = D3D11_USAGE_DEFAULT;
+	captureTargetDesc.BindFlags = D3D11_BIND_RENDER_TARGET;
+	ThrowIfFailed(m_device->CreateTexture2D(&captureTargetDesc, nullptr, &m_streamoutCaptureTarget),
+		"Create Xbox stream-output capture target");
+	ThrowIfFailed(m_device->CreateRenderTargetView(m_streamoutCaptureTarget.Get(), nullptr,
+		&m_streamoutCaptureTargetView), "Create Xbox stream-output capture target view");
+	D3D11_DEPTH_STENCIL_DESC captureDepthDesc{};
+	captureDepthDesc.DepthEnable = FALSE;
+	captureDepthDesc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+	captureDepthDesc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+	captureDepthDesc.StencilEnable = FALSE;
+	ThrowIfFailed(m_device->CreateDepthStencilState(&captureDepthDesc, &m_streamoutCaptureDepthState),
+		"Create Xbox stream-output capture depth state");
+	D3D11_BLEND_DESC captureBlendDesc{};
+	captureBlendDesc.RenderTarget[0].BlendEnable = FALSE;
+	captureBlendDesc.RenderTarget[0].RenderTargetWriteMask = 0;
+	ThrowIfFailed(m_device->CreateBlendState(&captureBlendDesc, &m_streamoutCaptureBlendState),
+		"Create Xbox stream-output capture blend state");
+#endif
 	for (auto& buffer : m_vertexBuffers)
 		buffer = m_bufferCache;
 }
@@ -5067,7 +5681,7 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
 				StreamoutUavSlot, 1, &empty, nullptr);
 		}
-		else
+		else if (!m_streamoutUsesPixelCapture)
 		{
 			std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
 			std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
@@ -5075,7 +5689,8 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 		}
 		m_streamoutActive = false;
 	}
-	ID3D11Buffer* sourceBuffer = m_streamoutUsesStorage ? m_streamoutStorageBuffer.Get() : nullptr;
+	ID3D11Buffer* sourceBuffer = m_streamoutDataAvailable &&
+		(m_streamoutUsesStorage || m_streamoutUsesPixelCapture) ? m_streamoutStorageBuffer.Get() : nullptr;
 	for (UINT i = 0; !sourceBuffer && i < m_streamoutBuffers.size(); ++i)
 	{
 		if (m_streamoutEnabled[i] && m_streamoutOffsets[i] == src)
@@ -5207,8 +5822,13 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 }
 
 RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, uint64 baseHash,
-	uint64 auxHash, const std::string& source, bool, bool isGfxPackSource)
+	uint64 auxHash, const std::string& source, bool isGameShader, bool isGfxPackSource)
 {
+	// Only entries restored from the transferable cache can be deferred. A
+	// shader discovered while the title is running must be available now; using
+	// the isGameShader argument for this distinction would also defer normal
+	// runtime game shaders.
+	const bool compileAsync = isGameShader && LatteShaderCache_IsLoading();
 	if (m_deviceLost.load(std::memory_order_relaxed))
 		return nullptr;
 	const uint64 failureKey = ShaderFailureKey(type, baseHash, auxHash);
@@ -5221,37 +5841,39 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 	// The desktop cache benefits from parallel compilation, but Xbox compiler and
 	// translation workers share one strict process budget. Serialize the complete
 	// pipeline so glslang, SPIRV-Cross and xbsc_xs.dll cannot overlap across jobs.
-	std::lock_guard pipelineLock(s_xboxShaderPipelineMutex);
-	if (m_deviceLost.load(std::memory_order_relaxed))
-		return nullptr;
-	constexpr uint64 resumeCompileMB = 3840;
-	constexpr uint64 stopCompileMB = 4096;
-	uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
-	if (m_shaderCompilationBlocked.load(std::memory_order_relaxed))
+	// Cached shaders are admitted to the low-priority queue immediately; the
+	// queue takes the same lock when it performs the actual translation.
+	if (!compileAsync)
 	{
-		if (commitMB < resumeCompileMB)
-			m_shaderCompilationBlocked.store(false, std::memory_order_relaxed);
-		else
+		if (m_deviceLost.load(std::memory_order_relaxed))
 			return nullptr;
-	}
-	if (commitMB >= stopCompileMB)
-	{
-		// This function may execute on a shader-cache worker. Never use the D3D11
-		// immediate context here to evict resources: doing so races the graphics
-		// thread and can clear live texture/shader bindings. The present-thread
-		// memory guard performs retirement safely.
-		cemuLog_log(LogType::Force,
-			"D3D11 Series S shader compilation paused at {} MB process commit "
-			"after {} compiled shaders",
-			commitMB, m_compiledShaderCount.load(std::memory_order_relaxed));
-		m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
-		return nullptr;
+		constexpr uint64 resumeCompileMB = 3840;
+		constexpr uint64 stopCompileMB = 4096;
+		uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
+		if (m_shaderCompilationBlocked.load(std::memory_order_relaxed))
+		{
+			if (commitMB < resumeCompileMB)
+				m_shaderCompilationBlocked.store(false, std::memory_order_relaxed);
+			else
+				return nullptr;
+		}
+		if (commitMB >= stopCompileMB)
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 Series S shader compilation paused at {} MB process commit "
+				"after {} compiled shaders",
+				commitMB, m_compiledShaderCount.load(std::memory_order_relaxed));
+			m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
+			return nullptr;
+		}
 	}
 #endif
 	try
 	{
 		auto shader = std::make_unique<D3D11Shader>(m_device.Get(), type, baseHash,
-			auxHash, isGfxPackSource, source);
+			auxHash, isGfxPackSource, source, compileAsync);
+		if (compileAsync)
+			return shader.release();
 		// Xbox may report a shader creation failure as a native xbsc exception and
 		// remove the underlying D3D12 device before the D3D11 call returns. Latch
 		// that state immediately on the compilation thread so no other worker keeps
@@ -5341,6 +5963,7 @@ void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffs
 		offset + rangeSize <= static_cast<uint32>(LatteStreamout_GetRingBufferSize());
 	m_streamoutEnabled[index] = validRange;
 	m_streamoutOffsets[index] = validRange ? static_cast<UINT>(offset) : 0;
+	m_streamoutRangeSizes[index] = validRange ? rangeSize : 0;
 	if (rangeSize != 0 && !validRange)
 		cemuLog_log(LogType::Force,
 			"D3D11 stream-output buffer {} rejected invalid range offset={} size={}",
@@ -5350,10 +5973,15 @@ void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffs
 void D3D11Renderer::streamout_begin()
 {
 	m_streamoutUsesStorage = false;
+	m_streamoutUsesPixelCapture = false;
+	m_streamoutDataAvailable = false;
+	m_streamoutPixelCaptureShader = nullptr;
 	auto* gsContext = LatteSHRC_GetActiveGeometryShader();
 	auto* vsContext = LatteSHRC_GetActiveVertexShader();
 	auto* shader = gsContext ? static_cast<D3D11Shader*>(gsContext->shader) :
 		(vsContext ? static_cast<D3D11Shader*>(vsContext->shader) : nullptr);
+	if (shader)
+		shader->PreponeCompilation(true);
 	const bool hasOutputBuffer = std::any_of(m_streamoutEnabled.begin(),
 		m_streamoutEnabled.end(), [](bool enabled) { return enabled; });
 	if (shader && shader->UsesStreamoutStorage() && hasOutputBuffer && m_streamoutStorageUav)
@@ -5363,9 +5991,37 @@ void D3D11Renderer::streamout_begin()
 			D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
 			StreamoutUavSlot, 1, &uav, nullptr);
 		m_streamoutUsesStorage = true;
+		m_streamoutDataAvailable = true;
 		m_streamoutActive = true;
 		return;
 	}
+#if defined(CEMU_UWP)
+	if (!gsContext && shader && shader->HasPixelStreamoutCapture() && hasOutputBuffer &&
+		m_streamoutStorageBuffer && m_streamoutStorageUav && m_streamoutCaptureTargetView)
+	{
+		// FL 11.0 has no vertex/geometry UAV stores. The replay runs after the
+		// title draw, uses the original VS with point topology and writes its
+		// reflected XFB scalars from a pixel shader into this raw ring buffer.
+		m_streamoutUsesPixelCapture = true;
+		m_streamoutPixelCaptureShader = shader;
+		m_streamoutActive = true;
+		return;
+	}
+	if (gsContext)
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 Xbox stream-output geometry fallback unavailable; native stream output remains disabled");
+	}
+	else if (!shader || !shader->HasPixelStreamoutCapture())
+	{
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 Xbox stream-output capture shader unavailable; native stream output remains disabled");
+	}
+	m_streamoutEnabled.fill(false);
+	m_streamoutRangeSizes.fill(0);
+	m_streamoutActive = false;
+	return;
+#endif
 	if (!shader || !shader->StreamoutGeometry())
 	{
 		cemuLog_logOnce(LogType::Force,
@@ -5406,7 +6062,7 @@ void D3D11Renderer::streamout_rendererFinishDrawcall()
 				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
 				StreamoutUavSlot, 1, &empty, nullptr);
 		}
-		else
+		else if (!m_streamoutUsesPixelCapture)
 		{
 			std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
 			std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
@@ -5415,11 +6071,200 @@ void D3D11Renderer::streamout_rendererFinishDrawcall()
 		m_streamoutActive = false;
 	}
 	m_streamoutUsesStorage = false;
+	m_streamoutUsesPixelCapture = false;
+	m_streamoutDataAvailable = false;
+	m_streamoutPixelCaptureShader = nullptr;
 	m_streamoutEnabled.fill(false);
+	m_streamoutRangeSizes.fill(0);
 	// Restore the title's GS or the RECT emulation GS. Merely restoring the
 	// title GS loses rectangle emulation on subsequent draws in the sequence.
 	BindActiveShaders();
 }
+
+bool D3D11Renderer::ExecutePixelStreamoutCapture(uint32 baseVertex, uint32 baseInstance,
+	uint32 instanceCount, uint32 vertexCount, uint32 indexCount, Renderer::INDEX_TYPE indexType,
+	ID3D11Buffer* indexBuffer, UINT indexOffset, const uint8* decodedIndices, UINT decodedIndexBytes)
+{
+#if !defined(CEMU_UWP)
+	return false;
+#else
+	const bool indexed = indexType != INDEX_TYPE::NONE;
+	const UINT indexStride = indexType == INDEX_TYPE::U16 ? sizeof(uint16) :
+		indexType == INDEX_TYPE::U32 ? sizeof(uint32) : 0;
+	auto* captureShader = static_cast<D3D11Shader*>(m_streamoutPixelCaptureShader);
+	if (!captureShader || !m_streamoutStorageUav ||
+		!m_streamoutCaptureTargetView || !m_streamoutCaptureDepthState ||
+		!m_streamoutCaptureBlendState || !captureShader->PixelStreamoutCaptureVertex() ||
+		!vertexCount || !instanceCount ||
+		(indexed && (!indexBuffer || !decodedIndices || !indexStride ||
+			indexCount > (std::numeric_limits<UINT>::max)() / indexStride ||
+			decodedIndexBytes < indexCount * indexStride)))
+		return false;
+
+	struct CaptureConstants
+	{
+		uint32 recordState[4]{};
+		uint32 ringBase[4]{};
+		uint32 bufferLimit[4]{};
+	};
+	CaptureConstants constants{};
+	uint32 recordLimit{};
+	for (UINT buffer = 0; buffer < LATTE_NUM_STREAMOUT_BUFFER; ++buffer)
+	{
+		if (!m_streamoutEnabled[buffer])
+			continue;
+		const UINT stride = captureShader->PixelStreamoutCaptureStride(buffer);
+		if (!stride)
+		{
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 Xbox pixel stream-output replay has no reflected stride for buffer {}", buffer);
+			return false;
+		}
+		constants.ringBase[buffer] = m_streamoutOffsets[buffer] / sizeof(uint32);
+		constants.bufferLimit[buffer] = (std::min)(m_streamoutRangeSizes[buffer] / stride,
+			StreamoutPixelCaptureCapacity);
+		recordLimit = (std::max)(recordLimit, constants.bufferLimit[buffer]);
+	}
+	if (!recordLimit)
+		return true;
+
+	ID3D11ShaderResourceView* recordMap{};
+	if (indexed)
+	{
+		if (!m_streamoutCaptureRecordMap || indexCount > m_streamoutCaptureRecordMapCapacity)
+		{
+			UINT newCapacity = m_streamoutCaptureRecordMapCapacity ?
+				m_streamoutCaptureRecordMapCapacity : 256u;
+			while (newCapacity < indexCount &&
+				newCapacity <= (std::numeric_limits<UINT>::max)() / 2u)
+				newCapacity *= 2u;
+			newCapacity = (std::max)(newCapacity, indexCount);
+			if (newCapacity > (std::numeric_limits<UINT>::max)() / sizeof(uint32))
+				return false;
+
+			D3D11_BUFFER_DESC desc{};
+			desc.ByteWidth = newCapacity * sizeof(uint32);
+			desc.Usage = D3D11_USAGE_DYNAMIC;
+			desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+			desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
+			desc.StructureByteStride = sizeof(uint32);
+			ComPtr<ID3D11Buffer> buffer;
+			if (FAILED(m_device->CreateBuffer(&desc, nullptr, &buffer)))
+				return false;
+
+			D3D11_SHADER_RESOURCE_VIEW_DESC viewDesc{};
+			viewDesc.Format = DXGI_FORMAT_UNKNOWN;
+			viewDesc.ViewDimension = D3D11_SRV_DIMENSION_BUFFER;
+			viewDesc.Buffer.FirstElement = 0;
+			viewDesc.Buffer.NumElements = newCapacity;
+			ComPtr<ID3D11ShaderResourceView> view;
+			if (FAILED(m_device->CreateShaderResourceView(buffer.Get(), &viewDesc, &view)))
+				return false;
+			m_streamoutCaptureRecordMap = std::move(buffer);
+			m_streamoutCaptureRecordMapView = std::move(view);
+			m_streamoutCaptureRecordMapCapacity = newCapacity;
+		}
+
+		D3D11_MAPPED_SUBRESOURCE mapped{};
+		if (FAILED(m_context->Map(m_streamoutCaptureRecordMap.Get(), 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+			return false;
+		auto* destination = static_cast<uint32*>(mapped.pData);
+		for (UINT index = 0; index < indexCount; ++index)
+		{
+			uint32 value{};
+			std::memcpy(&value, decodedIndices + static_cast<size_t>(index) * indexStride,
+				indexStride);
+			if (indexType == INDEX_TYPE::U16)
+				value &= 0xFFFFu;
+			destination[index] = value <= (std::numeric_limits<uint32>::max)() - baseVertex ?
+				value + baseVertex : (std::numeric_limits<uint32>::max)();
+		}
+		m_context->Unmap(m_streamoutCaptureRecordMap.Get(), 0);
+		recordMap = m_streamoutCaptureRecordMapView.Get();
+	}
+
+	ID3D11RenderTargetView* target = m_streamoutCaptureTargetView.Get();
+	ID3D11UnorderedAccessView* streamoutUav = m_streamoutStorageUav.Get();
+	m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &target, nullptr,
+		StreamoutPixelCaptureUavSlot, 1, &streamoutUav, nullptr);
+	const D3D11_VIEWPORT viewport{ 0.0f, 0.0f,
+		static_cast<float>(StreamoutPixelCaptureWidth), static_cast<float>(StreamoutPixelCaptureHeight), 0.0f, 1.0f };
+	const D3D11_RECT scissor{ 0, 0, static_cast<LONG>(StreamoutPixelCaptureWidth),
+		static_cast<LONG>(StreamoutPixelCaptureHeight) };
+	m_context->RSSetViewports(1, &viewport);
+	m_context->RSSetScissorRects(1, &scissor);
+	const float blendFactor[4]{};
+	m_context->OMSetBlendState(m_streamoutCaptureBlendState.Get(), blendFactor, 0xFFFFFFFF);
+	m_context->OMSetDepthStencilState(m_streamoutCaptureDepthState.Get(), 0);
+	m_context->VSSetShader(captureShader->PixelStreamoutCaptureVertex(), nullptr, 0);
+	m_context->IASetInputLayout(m_inputLayout.Get());
+	m_context->GSSetShaderResources(0, 1, &recordMap);
+	if (indexed)
+		m_context->IASetIndexBuffer(indexBuffer,
+			indexType == INDEX_TYPE::U16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT,
+			indexOffset);
+	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
+
+	bool captured = true;
+	for (UINT pass = 0; pass < captureShader->PixelStreamoutCapturePassCount(); ++pass)
+	{
+		auto* geometry = captureShader->PixelStreamoutCaptureGeometry(pass);
+		auto* pixel = captureShader->PixelStreamoutCapturePixel(pass);
+		if (!geometry || !pixel)
+		{
+			captured = false;
+			break;
+		}
+		m_context->GSSetShader(geometry, nullptr, 0);
+		m_context->PSSetShader(pixel, nullptr, 0);
+		for (uint32 instance = 0; instance < instanceCount; ++instance)
+		{
+			const uint64 recordBase = static_cast<uint64>(instance) * vertexCount +
+				(indexed ? 0u : baseVertex);
+			if (recordBase >= recordLimit || recordBase >= StreamoutPixelCaptureCapacity)
+				break;
+			constants.recordState[0] = static_cast<uint32>(recordBase);
+			constants.recordState[1] = recordLimit;
+			constants.recordState[2] = indexed ? 1u : 0u;
+			if (!UpdateDynamicConstantBuffer(m_streamoutCaptureConstants,
+				m_streamoutCaptureConstantsCapacity, &constants, sizeof(constants)))
+			{
+				captured = false;
+				break;
+			}
+			ID3D11Buffer* constantsBuffer = m_streamoutCaptureConstants.Get();
+			m_context->GSSetConstantBuffers(0, 1, &constantsBuffer);
+			m_context->PSSetConstantBuffers(0, 1, &constantsBuffer);
+			if (!indexed)
+				m_context->DrawInstanced(vertexCount, 1, baseVertex, baseInstance + instance);
+			else
+				m_context->DrawIndexedInstanced(indexCount, 1, 0, baseVertex, baseInstance + instance);
+		}
+		if (!captured)
+			break;
+	}
+	ID3D11UnorderedAccessView* emptyUav{};
+	m_context->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+		nullptr, nullptr, StreamoutPixelCaptureUavSlot, 1, &emptyUav, nullptr);
+	ID3D11ShaderResourceView* emptyResource{};
+	m_context->GSSetShaderResources(0, 1, &emptyResource);
+	m_context->GSSetShader(nullptr, nullptr, 0);
+	m_context->PSSetShader(nullptr, nullptr, 0);
+	// The temporary GS resource is not tracked by the ordinary texture binder.
+	// Clear its cache as well, so the original GS resources are re-applied instead
+	// of inheriting an implicitly removed binding on the next GX2 draw.
+	ClearShaderResources();
+	// The replay deliberately changes every graphics-stage binding. The next GX2
+	// draw rebuilds the ordinary FBO/pipeline rather than inheriting capture state.
+	InvalidateNativePipelineState();
+	m_graphicsStateInvalid = true;
+	m_streamoutDataAvailable = captured;
+	return captured;
+#endif
+}
+
 void D3D11Renderer::draw_beginSequence() {}
 
 RendererShader* D3D11Renderer::GetRectEmulationShader(LatteDecompilerShader* vertexShader)
@@ -5533,7 +6378,7 @@ RendererShader* D3D11Renderer::GetRectEmulationShader(LatteDecompilerShader* ver
 	source.append("}\r\noutputStream.RestartStrip();\r\n}\r\n");
 
 	auto shader = std::make_unique<D3D11Shader>(m_device.Get(),
-		RendererShader::ShaderType::kGeometry, key, 0, false, source, true);
+		RendererShader::ShaderType::kGeometry, key, 0, false, source, true, false);
 	if (!shader->IsCompiled() || !shader->Geometry())
 	{
 		cemuLog_log(LogType::Force,
@@ -5544,6 +6389,28 @@ RendererShader* D3D11Renderer::GetRectEmulationShader(LatteDecompilerShader* ver
 	auto* result = shader.get();
 	m_rectShaderCache.emplace(key, std::move(shader));
 	return result;
+}
+
+bool D3D11Renderer::EnsureActiveShadersCompiled()
+{
+	const std::array<LatteDecompilerShader*, 3> contexts = {
+		LatteSHRC_GetActiveVertexShader(),
+		LatteSHRC_GetActivePixelShader(),
+		LatteSHRC_GetActiveGeometryShader(),
+	};
+	for (auto* context : contexts)
+	{
+		auto* shader = context ? static_cast<D3D11Shader*>(context->shader) : nullptr;
+		if (!shader)
+			continue;
+		// A cache worker may already be compiling this entry. Promotion either
+		// claims a queued item or waits for that single in-flight job; it never
+		// races the device or exposes a half-created native shader.
+		shader->PreponeCompilation(true);
+		if (!shader->IsCompiled())
+			return false;
+	}
+	return true;
 }
 
 bool D3D11Renderer::BindActiveShaders()
@@ -6142,6 +7009,13 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		LatteSHRC_UpdateActiveShaders();
 		if (LatteGPUState.activeShaderHasError)
 			return;
+		if (!EnsureActiveShadersCompiled())
+		{
+			LatteGPUState.activeShaderHasError = true;
+			cemuLog_log(LogType::Force,
+				"D3D11 draw skipped because an active shader could not be prepared");
+			return;
+		}
 		while (true)
 		{
 			LatteGPUState.repeatTextureInitialization = false;
@@ -6210,6 +7084,26 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	uint32 hostIndexCount{}, indexMax{};
 	Renderer::IndexAllocation allocation{};
 	const void* indices = indexDataMPTR != MPTR_NULL ? memory_getPointerFromPhysicalOffset(indexDataMPTR) : nullptr;
+#if defined(CEMU_UWP)
+	// The pixel-UAV stream-output replay needs the decoded host indices after the
+	// normal upload. Force a fresh cached allocation here and retain its tiny CPU
+	// staging copy just until the replay has converted it into a GPU record map.
+	m_keepIndexStagingForPixelStreamout = false;
+	if (indices && !UseTFViaSSBO() &&
+		LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0 &&
+		!LatteSHRC_GetActiveGeometryShader())
+	{
+		auto* vertexContext = LatteSHRC_GetActiveVertexShader();
+		auto* vertexShader = vertexContext ? static_cast<D3D11Shader*>(vertexContext->shader) : nullptr;
+		if (vertexShader && vertexShader->HasPixelStreamoutCapture())
+		{
+			m_keepIndexStagingForPixelStreamout = true;
+			LatteIndices_invalidateAll();
+		}
+	}
+#else
+	m_keepIndexStagingForPixelStreamout = false;
+#endif
 	LatteIndices_decode(indices, indexType, count, primitive, indexMax, hostIndexType, hostIndexCount, allocation);
 	if (m_deviceLost.load(std::memory_order_relaxed))
 		return;
@@ -6280,6 +7174,8 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		(rasterizerKilled || bothFacesCulled) && !m_streamoutActive;
 	const bool suppressStorageRaster =
 		(rasterizerKilled || bothFacesCulled) && m_streamoutActive && m_streamoutUsesStorage;
+	const bool skipPixelCaptureRaster =
+		(rasterizerKilled || bothFacesCulled) && m_streamoutActive && m_streamoutUsesPixelCapture;
 	if (suppressStorageRaster)
 	{
 		// The UAV shader must still execute to produce transform feedback, but GX2
@@ -6289,12 +7185,19 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		m_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr,
 			StreamoutUavSlot, 1, &uav, nullptr);
 	}
+	else if (skipPixelCaptureRaster)
+	{
+		// Pixel-UAV capture is replayed below with a private target. Unlike the
+		// shader-storage path, the title draw itself has no feedback work left to
+		// execute, so honoring GX2 raster discard avoids a redundant full draw.
+		m_context->OMSetRenderTargets(0, nullptr, nullptr);
+	}
 
-	if (skipRasterDraw)
+	if (skipRasterDraw || skipPixelCaptureRaster)
 	{
 		// Vulkan represents both states directly. D3D11 has no rasterizer-discard
 		// switch and no FRONT_AND_BACK cull mode, so a draw without stream output
-		// is a true no-op.
+		// is a true no-op. Pixel stream-output is handled by its dedicated replay.
 	}
 	else if (hostIndexType != INDEX_TYPE::NONE)
 	{
@@ -6340,7 +7243,8 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	// D3D11.1 UAV path writes feedback from the ordinary raster shader, so replaying
 	// it would draw every primitive twice and waste nearly half the available GPU
 	// time in stream-out-heavy scenes.
-	const bool needsRasterReplay = drawIssued && m_streamoutActive && !m_streamoutUsesStorage;
+	const bool needsRasterReplay = drawIssued && m_streamoutActive &&
+		!m_streamoutUsesStorage && !m_streamoutUsesPixelCapture;
 	// Present reports removal every frame. On Xbox, sample at the first draw of
 	// each frame as well, retaining early diagnostics without calling through
 	// D3D11On12 after every individual draw. Keep desktop behavior unchanged.
@@ -6361,11 +7265,45 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		LatteGPUState.drawCallCounter++;
 		return;
 	}
-	if (!drawIssued && m_streamoutActive)
+	bool pixelCaptureSucceeded{};
+	if (m_streamoutActive && m_streamoutUsesPixelCapture)
+	{
+		auto* indexAllocation = static_cast<IndexBufferAllocation*>(allocation.rendererInternal);
+		ID3D11Buffer* indexBuffer = indexAllocation ? indexAllocation->buffer.Get() : nullptr;
+		const UINT indexOffset = indexAllocation ? indexAllocation->offset : 0;
+		const uint8* decodedIndices = indexAllocation && !indexAllocation->data.empty() ?
+			indexAllocation->data.data() : nullptr;
+		const UINT decodedIndexBytes = indexAllocation ?
+			static_cast<UINT>(indexAllocation->data.size()) : 0;
+		pixelCaptureSucceeded = ExecutePixelStreamoutCapture(baseVertex, baseInstance, instanceCount,
+			count, hostIndexCount, hostIndexType, indexBuffer, indexOffset,
+			decodedIndices, decodedIndexBytes);
+		if (m_keepIndexStagingForPixelStreamout && indexAllocation)
+		{
+			// The record map has already been uploaded. Do not retain a duplicate CPU
+			// copy in the index LRU; the next pixel-capture draw invalidates it before
+			// decode, guaranteeing that its indices are current as well.
+			std::vector<uint8>().swap(indexAllocation->data);
+		}
+		m_keepIndexStagingForPixelStreamout = false;
+		if (!pixelCaptureSucceeded)
+		{
+			m_streamoutDataAvailable = false;
+			m_streamoutEnabled.fill(false);
+			m_streamoutRangeSizes.fill(0);
+			cemuLog_logOnce(LogType::Force,
+				"D3D11 Xbox pixel stream-output replay failed; destination ranges were not reused");
+		}
+	}
+	if (!drawIssued && !pixelCaptureSucceeded && m_streamoutActive)
+	{
 		m_streamoutEnabled.fill(false);
+		m_streamoutRangeSizes.fill(0);
+		m_streamoutDataAvailable = false;
+	}
 	// This also unbinds SO and restores the title/rectangle geometry shader.
 	LatteStreamout_FinishDrawcall(false);
-	if (suppressStorageRaster && m_activeFbo)
+	if ((suppressStorageRaster || skipPixelCaptureRaster) && m_activeFbo)
 	{
 		auto* nativeFbo = static_cast<D3D11CachedFBO*>(m_activeFbo);
 		m_context->OMSetRenderTargets(nativeFbo->targetCount,
@@ -6527,7 +7465,8 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 	data->offset = m_indexRingOffset;
 	m_indexRingOffset += alignedSize;
 	++m_indexUploadCount;
-	std::vector<uint8>().swap(data->data);
+	if (!m_keepIndexStagingForPixelStreamout)
+		std::vector<uint8>().swap(data->data);
 	allocation.mem = nullptr;
 }
 

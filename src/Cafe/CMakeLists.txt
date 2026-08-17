@@ -5,6 +5,8 @@ add_library(CemuCafe
   CafeSystem.cpp
   CafeSystem.h
   Filesystem/fsc.cpp
+  Filesystem/fscDeviceBrokered.cpp
+  Filesystem/fscDeviceBrokered.h
   Filesystem/fscDeviceHostFS.cpp
   Filesystem/fscDeviceHostFS.h
   Filesystem/fscDeviceRedirect.cpp
