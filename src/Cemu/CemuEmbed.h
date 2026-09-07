@@ -27,7 +27,8 @@ extern "C" {
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
 #define CEMU_EMBED_GAMEPAD_VERSION 1u
 #define CEMU_EMBED_DIMENSIONS_VERSION 1u
-#define CEMU_EMBED_SETTINGS_VERSION 1u
+#define CEMU_EMBED_SETTINGS_VERSION 2u
+#define CEMU_EMBED_GRAPHIC_PACK_VERSION 1u
 typedef struct CemuEmbedInstance CemuEmbedInstance;
 
 typedef enum CemuEmbedResult { CEMU_EMBED_OK, CEMU_EMBED_INVALID_ARGUMENT, CEMU_EMBED_INVALID_STATE, CEMU_EMBED_BUSY, CEMU_EMBED_INITIALIZATION_FAILED, CEMU_EMBED_LAUNCH_FAILED, CEMU_EMBED_STORAGE_FAILED } CemuEmbedResult;
@@ -130,10 +131,8 @@ typedef void (CEMU_EMBED_CALL *CemuEmbedBrokeredCloseCallback)(void* user_data, 
 typedef void (CEMU_EMBED_CALL *CemuEmbedBrokeredProgressCallback)(
 	void* user_data, uint64_t bytes_copied, uint64_t total_bytes,
 	const char* relative_path_utf8);
-// Optional direct-copy fast path in version 3. The host may use its brokered
-// StorageFile handle to let the platform storage service copy directly into
-// the app-owned destination. Returning anything other than OK makes Cemu use
-// the open/read fallback for that file.
+// Optional direct-copy fast path in version 3, used only by explicit import or
+// installation operations. Game launching never calls this callback.
 typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedBrokeredCopyFileCallback)(
 	void* user_data, void* file_handle, const char* destination_path_utf8);
 
@@ -191,9 +190,27 @@ typedef struct CemuEmbedActiveAccount {
 	char account_id_utf8[64];
 } CemuEmbedActiveAccount;
 
+// Strings remain valid only for the duration of the enumeration callback.
+// identity_utf8 is the stable normalized rules.txt path used to update one
+// specific pack without affecting the other packs compatible with the title.
+typedef struct CemuEmbedGraphicPack {
+	uint32_t struct_size;
+	uint32_t abi_version;
+	const char* identity_utf8;
+	const char* name_utf8;
+	const char* category_utf8;
+	const char* description_utf8;
+	int32_t enabled;
+	int32_t default_enabled;
+} CemuEmbedGraphicPack;
+
+typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedGraphicPackCallback)(
+	void* user_data, const CemuEmbedGraphicPack* graphic_pack);
+
 // User-facing global settings supported by embedded hosts. Integer enum values
 // match Cemu's settings.xml representation. Paths, accounts, graphic packs and
-// controller profiles have dedicated host APIs and are intentionally excluded.
+// detailed controller mappings have dedicated host APIs; only player one's
+// emulated Wii U controller type is included here.
 typedef struct CemuEmbedSettings {
 	uint32_t struct_size;
 	uint32_t abi_version;
@@ -237,6 +254,9 @@ typedef struct CemuEmbedSettings {
 	int32_t emulate_skylander_portal;
 	int32_t emulate_infinity_base;
 	int32_t emulate_dimensions_toypad;
+	// Player one's emulated Wii U controller: 0=GamePad, 1=Pro Controller,
+	// 2=Classic Controller, 3=Wii Remote.
+	int32_t emulated_controller_type;
 } CemuEmbedSettings;
 
 typedef enum CemuEmbedDimensionsFigureType {
@@ -261,8 +281,9 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Create(const CemuEmbedC
 // surface size changes while the instance is initializing or ready.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetSurface(CemuEmbedInstance* instance, const CemuEmbedSurface* surface);
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InitializeAsync(CemuEmbedInstance* instance);
-// Launches a Wii U title directory containing the meta, code and content folders.
-// Call only after the instance reaches CEMU_EMBED_STATE_READY.
+// Launches any title format supported by Cemu, including WUA, WUD, WUX, ISO,
+// WUHB, RPX/ELF, title.tmd and extracted code/content/meta folders. Call only
+// after the instance reaches CEMU_EMBED_STATE_READY.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGame(CemuEmbedInstance* instance, const char* game_path_utf8);
 // Launches a game directly from external storage. supplemental_title_paths
 // contains the other discovered base, update and DLC paths on the same media;
@@ -271,15 +292,14 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGame(CemuEmbedIns
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameWithExternalTitles(
 	CemuEmbedInstance* instance, const char* game_path_utf8,
 	const char* const* supplemental_title_paths, uint32_t supplemental_title_count);
-// Stages a StorageFolder-backed title into Cemu's cache through the supplied
-// broker, then launches it. No unrestricted filesystem capability is needed
-// for the selected folder. The broker is called synchronously on this thread.
+// Launches a StorageFolder-backed extracted title directly through the supplied
+// read-only broker. Game data remains on its original storage device.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolder(
 	CemuEmbedInstance* instance, void* folder_handle, const CemuEmbedBrokeredStorage* storage);
-// Mounts an extracted brokered title and its companion base/update/DLC folders
-// directly through Cemu's read-only virtual filesystem. No title payload is
-// copied to LocalState or LocalCache. selected_relative_path_utf8 must be empty;
-// direct folder mounting requires code, content and meta at the folder root.
+// Mounts an extracted brokered title and companion folders directly through
+// Cemu's read-only virtual filesystem. When selected_relative_path_utf8 names a
+// WUA or another supported standalone file, all reads are serviced directly by
+// the broker. Game data is never copied to Cemu's internal storage.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolders(
 	CemuEmbedInstance* instance, void* selected_folder_handle,
 	const char* selected_relative_path_utf8,
@@ -314,6 +334,13 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DeleteInstalledTitle(
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DownloadGraphicPacks(
 	CemuEmbedInstance* instance, uint32_t* downloaded_pack_count,
 	int32_t* already_current);
+// Validates and installs a community Graphic Pack ZIP already downloaded by
+// the host. UWP hosts use the Windows HTTP stack so TLS uses the platform
+// certificate store instead of requiring a bundled OpenSSL CA file.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallDownloadedGraphicPacks(
+	CemuEmbedInstance* instance, const void* archive_data, uint64_t archive_size,
+	const char* release_name_utf8, uint32_t* installed_pack_count,
+	int32_t* already_current);
 // Clears every cached shader entry. The next launch rebuilds only the shaders
 // needed by the title. This never removes games, saves, settings or packs.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ClearShaderCaches(
@@ -328,16 +355,24 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFrom
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledForTitle(
 	CemuEmbedInstance* instance, uint64_t base_title_id, int32_t enabled,
 	uint32_t* affected_pack_count);
+// Enumerates every installed pack compatible with one base title.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateGraphicPacksForTitle(
+	CemuEmbedInstance* instance, uint64_t base_title_id,
+	CemuEmbedGraphicPackCallback callback, void* user_data);
+// Updates exactly one installed pack identified by identity_utf8. The selected
+// state is persisted and used on the next launch of compatible games.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPackEnabled(
+	CemuEmbedInstance* instance, uint64_t base_title_id,
+	const char* identity_utf8, int32_t enabled);
 // Applies the host-safe automatic policy for a title: compatibility
 // Workarounds are enabled, while executable Mods and Cheats are disabled.
 // Graphics packs and every other category retain the user's saved state.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ApplySafeGraphicPackPolicyForTitle(
 	CemuEmbedInstance* instance, uint64_t base_title_id,
 	uint32_t* affected_pack_count);
-// Creates player one's Wii U GamePad profile. On a UWP/Xbox host, the host's
-// Windows.Gaming.Input snapshot takes precedence and replaces a stale SDL
-// profile copied from a desktop session. Desktop builds use the first SDL
-// gamepad, preferring an Xbox device.
+// Ensures player one's selected emulated Wii U controller profile has a physical
+// input source. On UWP/Xbox, the host's Windows.Gaming.Input snapshot takes
+// precedence and replaces a stale SDL source copied from a desktop session.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile(
 	CemuEmbedInstance* instance, int32_t* profile_ready);
 // Publishes the latest host-owned gamepad state. This has no WinRT objects in

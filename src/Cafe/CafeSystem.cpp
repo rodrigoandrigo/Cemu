@@ -24,6 +24,7 @@
 #include "Cafe/OS/RPL/rpl.h"
 #include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/Filesystem/FST/FST.h"
+#include "Cafe/Filesystem/fscDeviceBrokered.h"
 #include "Common/FileStream.h"
 #include "GamePatch.h"
 #include "HW/Espresso/Debugger/GDBStub.h"
@@ -990,6 +991,43 @@ namespace CafeSystem
         PPCRecompiler_init();
         // load executable
         PrepareExecutable();
+		InitVirtualMlcStorage();
+		MountExtras();
+		return PREPARE_STATUS_CODE::SUCCESS;
+	}
+
+	PREPARE_STATUS_CODE PrepareForegroundTitleFromBrokeredStandaloneRPX(
+		const std::shared_ptr<FSCBrokeredFilesystem>& filesystem,
+		std::string_view executablePath)
+	{
+		if (!filesystem || !filesystem->ContainsFile(executablePath))
+			return PREPARE_STATUS_CODE::INVALID_RPX;
+		sLaunchModeIsStandalone = true;
+		const fs::path relativePath = _utf8ToPath(executablePath);
+		const std::string codeDirectory = _pathToUtf8(relativePath.parent_path());
+		if (!FSCDeviceBrokered_Mount("/internal/code/", codeDirectory,
+			filesystem, FSC_PRIORITY_BASE))
+			return PREPARE_STATUS_CODE::UNABLE_TO_MOUNT;
+
+		if (boost::iequals(_pathToUtf8(relativePath.parent_path().filename()), "code"))
+		{
+			const fs::path contentPath = relativePath.parent_path().parent_path() / "content";
+			if (filesystem->ContainsDirectory(_pathToUtf8(contentPath)) &&
+				!FSCDeviceBrokered_Mount("/vol/content", _pathToUtf8(contentPath),
+					filesystem, FSC_PRIORITY_BASE))
+				return PREPARE_STATUS_CODE::UNABLE_TO_MOUNT;
+		}
+
+		_pathToExecutable = "/internal/code/" + _pathToUtf8(relativePath.filename());
+		auto execData = fsc_extractFile(_pathToExecutable.c_str());
+		if (!execData)
+			return PREPARE_STATUS_CODE::INVALID_RPX;
+		const uint32 hash = generateHashFromRawRPXData(execData->data(), execData->size());
+		sForegroundTitleId = 0xFFFFFFFF00000000ULL | static_cast<uint64>(hash);
+		SetupMemorySpace();
+		PPCRecompiler_init();
+		if (PrepareExecutable() != PREPARE_STATUS_CODE::SUCCESS)
+			return PREPARE_STATUS_CODE::INVALID_RPX;
 		InitVirtualMlcStorage();
 		MountExtras();
 		return PREPARE_STATUS_CODE::SUCCESS;

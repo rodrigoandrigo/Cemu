@@ -1,4 +1,5 @@
 #include "TitleList.h"
+#include "Common/VirtualFile.h"
 #include "Common/FileStream.h"
 
 #include "util/helpers/helpers.h"
@@ -218,7 +219,7 @@ void CafeTitleList::AddTitleFromPath(fs::path path)
 {
 	if (path.has_extension() && boost::iequals(_pathToUtf8(path.extension()), ".wua"))
 	{
-		ZArchiveReader* zar = ZArchiveReader::OpenFromFile(path);
+		ZArchiveReader* zar = OpenZArchiveFile(path);
 		if (!zar)
 		{
 			cemuLog_log(LogType::Force, "Found {} but it is not a valid Wii U archive file", _pathToUtf8(path));
@@ -282,7 +283,8 @@ void CafeTitleList::ClearBrokeredTitles()
 	for (auto it = sTLList.begin(); it != sTLList.end();)
 	{
 		TitleInfo* titleInfo = *it;
-		if (!titleInfo->IsBrokeredFilesystem())
+		if (!titleInfo->IsBrokeredFilesystem() &&
+			!VirtualFile::Exists(titleInfo->GetPath()))
 		{
 			++it;
 			continue;

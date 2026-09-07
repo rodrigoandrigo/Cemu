@@ -1,4 +1,33 @@
 #include "Common/windows/FileStream_win32.h"
+#include "Common/VirtualFile.h"
+
+namespace
+{
+#if defined(CEMU_UWP)
+std::wstring MakeExtendedLengthPath(const wchar_t* path)
+{
+	if (!path)
+		return {};
+	std::wstring normalized(path);
+	std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+	if (normalized.rfind(L"\\\\?\\", 0) == 0)
+		return normalized;
+	if (normalized.rfind(L"\\\\", 0) == 0)
+		return L"\\\\?\\UNC\\" + normalized.substr(2);
+	if (normalized.size() >= 3 && normalized[1] == L':' && normalized[2] == L'\\')
+		return L"\\\\?\\" + normalized;
+	return normalized;
+}
+#endif
+}
+
+class VirtualFileStreamTag
+{
+public:
+	explicit VirtualFileStreamTag(std::unique_ptr<VirtualFile::Stream> stream)
+		: stream(std::move(stream)) {}
+	std::unique_ptr<VirtualFile::Stream> stream;
+};
 
 FileStream* FileStream::openFile(std::string_view path)
 {
@@ -18,12 +47,30 @@ FileStream* FileStream::openFile(const wchar_t* path, bool allowWrite)
 
 FileStream* FileStream::openFile2(const fs::path& path, bool allowWrite)
 {
+	if (!allowWrite)
+	{
+		auto stream = VirtualFile::Open(path);
+		if (stream)
+			return new FileStream(std::make_unique<VirtualFileStreamTag>(std::move(stream)));
+	}
 	return openFile(path.generic_wstring().c_str(), allowWrite);
 }
 
 FileStream* FileStream::createFile(const wchar_t* path)
 {
+	#if defined(CEMU_UWP)
+	const auto extendedPath = MakeExtendedLengthPath(path);
+	if (extendedPath.empty())
+		return nullptr;
+	CREATEFILE2_EXTENDED_PARAMETERS parameters{};
+	parameters.dwSize = sizeof(parameters);
+	parameters.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+	parameters.dwFileFlags = FILE_FLAG_SEQUENTIAL_SCAN;
+	HANDLE hFile = CreateFile2(extendedPath.c_str(), FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE, CREATE_ALWAYS, &parameters);
+	#else
 	HANDLE hFile = CreateFileW(path, FILE_GENERIC_READ | FILE_GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 0, 0);
+	#endif
 	if (hFile == INVALID_HANDLE_VALUE)
 		return nullptr;
 	return new FileStream(hFile);
@@ -32,10 +79,7 @@ FileStream* FileStream::createFile(const wchar_t* path)
 FileStream* FileStream::createFile(std::string_view path)
 {
 	auto w = boost::nowide::widen(path.data(), path.size());
-	HANDLE hFile = CreateFileW(w.c_str(), FILE_GENERIC_READ | FILE_GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS, 0, 0);
-	if (hFile == INVALID_HANDLE_VALUE)
-		return nullptr;
-	return new FileStream(hFile);
+	return createFile(w.c_str());
 }
 
 FileStream* FileStream::createFile2(const fs::path& path)
@@ -66,6 +110,11 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
 
 void FileStream::SetPosition(uint64 pos)
 {
+	if (m_virtualFile)
+	{
+		m_virtualPosition = pos;
+		return;
+	}
 	LONG posHigh = (LONG)(pos >> 32);
 	LONG posLow = (LONG)(pos);
 	SetFilePointer(m_hFile, posLow, &posHigh, FILE_BEGIN);
@@ -73,6 +122,8 @@ void FileStream::SetPosition(uint64 pos)
 
 uint64 FileStream::GetSize()
 {
+	if (m_virtualFile)
+		return m_virtualFile->stream->GetSize();
 	DWORD fileSizeHigh = 0;
 	DWORD fileSizeLow = 0;
 	fileSizeLow = GetFileSize(m_hFile, &fileSizeHigh);
@@ -81,11 +132,27 @@ uint64 FileStream::GetSize()
 
 bool FileStream::SetEndOfFile()
 {
+	if (m_virtualFile)
+		return false;
 	return ::SetEndOfFile(m_hFile) != 0;
 }
 
 void FileStream::extract(std::vector<uint8>& data)
 {
+	if (m_virtualFile)
+	{
+		const uint64 fileSize = GetSize();
+		if (fileSize > UINT32_MAX)
+		{
+			data.clear();
+			return;
+		}
+		data.resize(static_cast<size_t>(fileSize));
+		SetPosition(0);
+		if (readData(data.data(), static_cast<uint32>(fileSize)) != fileSize)
+			data.clear();
+		return;
+	}
 	DWORD fileSize = GetFileSize(m_hFile, nullptr);
 	data.resize(fileSize);
 	SetFilePointer(m_hFile, 0, 0, FILE_BEGIN);
@@ -95,6 +162,12 @@ void FileStream::extract(std::vector<uint8>& data)
 
 uint32 FileStream::readData(void* data, uint32 length)
 {
+	if (m_virtualFile)
+	{
+		const uint32 bytesRead = m_virtualFile->stream->Read(m_virtualPosition, data, length);
+		m_virtualPosition += bytesRead;
+		return bytesRead;
+	}
 	DWORD bytesRead = 0;
 	ReadFile(m_hFile, data, length, &bytesRead, NULL);
 	return bytesRead;
@@ -134,6 +207,8 @@ bool FileStream::readLine(std::string& line)
 
 sint32 FileStream::writeData(const void* data, sint32 length)
 {
+	if (m_virtualFile)
+		return 0;
 	DWORD bytesWritten = 0;
 	WriteFile(m_hFile, data, length, &bytesWritten, NULL);
 	return bytesWritten;
@@ -176,7 +251,7 @@ void FileStream::writeLine(const char* str)
 
 FileStream::~FileStream()
 {
-	if(m_isValid)
+	if(m_isValid && !m_virtualFile)
 		CloseHandle(m_hFile);
 }
 
@@ -184,4 +259,9 @@ FileStream::FileStream(HANDLE hFile)
 {
 	m_hFile = hFile;
 	m_isValid = true;
+}
+
+FileStream::FileStream(std::unique_ptr<VirtualFileStreamTag> stream)
+	: m_isValid(true), m_virtualFile(std::move(stream))
+{
 }

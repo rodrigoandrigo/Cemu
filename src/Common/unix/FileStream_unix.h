@@ -50,9 +50,12 @@ class FileStream
  private:
 	void SyncReadWriteSeek(bool nextOpIsWrite);
 	FileStream(const fs::path& path, bool isOpen, bool isWriteable);
+	explicit FileStream(std::unique_ptr<class VirtualFileStreamTag>);
 
 	bool m_isValid{};
 	std::fstream m_fileStream;
 	bool m_prevOperationWasWrite{false};
+	std::unique_ptr<class VirtualFileStreamTag> m_virtualFile;
+	uint64 m_virtualPosition{};
 
 };

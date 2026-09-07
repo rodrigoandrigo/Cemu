@@ -674,9 +674,28 @@ if (ENABLE_D3D11)
   find_package(spirv_cross_core CONFIG REQUIRED)
   find_package(spirv_cross_glsl CONFIG REQUIRED)
   find_package(spirv_cross_hlsl CONFIG REQUIRED)
+  set(D3D11_RENDERER_IMPLEMENTATION
+    HW/Latte/Renderer/D3D11/D3D11RendererUtilities.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererShader.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererResources.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererCore.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererRenderTarget.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererTexture.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererBuffer.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererStreamout.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererDraw.inl
+    HW/Latte/Renderer/D3D11/D3D11RendererQuery.inl
+  )
+  # These sections intentionally form one translation unit. Native D3D11
+  # resource types are shared through an anonymous namespace, so compiling the
+  # sections independently would create different C++ types in each object.
+  set_source_files_properties(${D3D11_RENDERER_IMPLEMENTATION}
+    PROPERTIES HEADER_FILE_ONLY TRUE
+  )
   target_sources(CemuCafe PRIVATE
     HW/Latte/Renderer/D3D11/D3D11Renderer.cpp
     HW/Latte/Renderer/D3D11/D3D11Renderer.h
+    ${D3D11_RENDERER_IMPLEMENTATION}
   )
   target_link_libraries(CemuCafe PRIVATE
     spirv-cross-core

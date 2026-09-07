@@ -2,7 +2,8 @@
 
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 
-#include <d3d11_3.h>
+#include <d3d11.h>
+#include <d3d11sdklayers.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
 #include <atomic>
@@ -23,6 +24,7 @@ public:
 
 	void Initialize() override;
 	void Shutdown() override;
+	void EnableDebugMode() override;
 	bool GetVRAMInfo(int& usageInMB, int& totalInMB) const override;
 	bool IsPadWindowActive() override;
 	void ClearColorbuffer(bool padView) override;
@@ -34,7 +36,9 @@ public:
 	bool BeginFrame(bool mainWindow) override;
 	bool UseTFViaSSBO() const override
 	{
-		return m_device && m_device->GetFeatureLevel() >= D3D_FEATURE_LEVEL_11_1;
+		// Feature Level 11.0 has no all-stage UAV support. UWP uses the dedicated
+		// pixel-UAV replay and desktop uses native D3D11 stream output instead.
+		return false;
 	}
 	void Flush(bool waitIdle) override;
 	void NotifyLatteCommandProcessorIdle() override;
@@ -95,6 +99,7 @@ public:
 	ID3D11DeviceContext* GetContext() const { return m_context.Get(); }
 
 private:
+	void GetVendorInformation() override;
 	void RefreshBackBuffer();
 	void EnsureBackBufferSize();
 	void InitializePresentationPipeline();
@@ -140,9 +145,7 @@ private:
 	};
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
-	Microsoft::WRL::ComPtr<ID3D11Device1> m_device1;
 	Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
-	Microsoft::WRL::ComPtr<ID3D11DeviceContext1> m_context1;
 	Microsoft::WRL::ComPtr<ID3D11InfoQueue> m_infoQueue;
 	Microsoft::WRL::ComPtr<IDXGISwapChain> m_swapChain;
 	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_backBuffer;
@@ -263,5 +266,6 @@ private:
 	std::atomic_bool m_shaderCompilationBlocked{};
 	bool m_inputLayoutKeyValid{};
 	bool m_imguiInitialized{};
+	bool m_debugModeEnabled{};
 	bool m_graphicsStateInvalid{};
 };

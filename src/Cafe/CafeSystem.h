@@ -2,9 +2,13 @@
 #include "Cafe/OS/RPL/rpl.h"
 #include "Cafe/TitleList/TitleId.h"
 
+#include <memory>
+#include <string_view>
+
 enum class CosCapabilityBits : uint64;
 enum class CosCapabilityGroup : uint32;
 enum class CafeConsoleRegion;
+class FSCBrokeredFilesystem;
 
 namespace CafeSystem
 {
@@ -29,6 +33,9 @@ namespace CafeSystem
 
 	PREPARE_STATUS_CODE PrepareForegroundTitle(TitleId titleId);
 	PREPARE_STATUS_CODE PrepareForegroundTitleFromStandaloneRPX(const fs::path& path);
+	PREPARE_STATUS_CODE PrepareForegroundTitleFromBrokeredStandaloneRPX(
+		const std::shared_ptr<FSCBrokeredFilesystem>& filesystem,
+		std::string_view executablePath);
 	void LaunchForegroundTitle();
 	bool IsTitleRunning();
 

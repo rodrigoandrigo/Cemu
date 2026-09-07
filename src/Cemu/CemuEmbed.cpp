@@ -13,6 +13,8 @@
 #include "Cafe/Filesystem/FST/KeyCache.h"
 #include "Cafe/Filesystem/fscDeviceBrokered.h"
 #include "Common/CemuRuntime.h"
+#include "Common/FileStream.h"
+#include "Common/VirtualFile.h"
 #include "input/InputManager.h"
 #include "input/ControllerFactory.h"
 #include "input/api/Controller.h"
@@ -83,6 +85,7 @@ struct CemuEmbedInstance {
 	std::atomic_bool initialized{false};
 	std::atomic_bool surfaceConfigured{false};
 	std::atomic_bool dimensionsToypadEnabled{false};
+	std::vector<fs::path> externalVirtualFiles;
 	CemuEmbedInstance(const CemuEmbedConfig& config, const CemuEmbedCallbacks& callbacks)
 		: executablePath(config.executable_path_utf8), userDataPath(config.user_data_path_utf8), configPath(config.config_path_utf8), cachePath(config.cache_path_utf8), dataPath(config.data_path_utf8), config(config), callbacks(callbacks), loggingCallbacks(callbacks) {
 		this->config.executable_path_utf8 = executablePath.c_str();
@@ -129,18 +132,12 @@ std::pair<uint32_t, uint32_t> CountGraphicPacksForTitle(uint64_t titleId) {
 void SaveGraphicPackState(const GraphicPackPtr& pack) {
 	auto& entries = GetConfigHandle().data().graphic_pack_entries;
 	const auto path = _utf8ToPath(pack->GetNormalizedPathString());
-	if (pack->IsEnabled()) {
-		auto& entry = entries[path];
-		entry.clear();
-		for (const auto& preset : pack->GetActivePresets())
-			entry.try_emplace(preset->category, preset->name);
-	} else if (pack->IsDefaultEnabled()) {
-		auto& entry = entries[path];
-		entry.clear();
+	auto& entry = entries[path];
+	entry.clear();
+	for (const auto& preset : pack->GetActivePresets())
+		entry.try_emplace(preset->category, preset->name);
+	if (!pack->IsEnabled())
 		entry.try_emplace("_disabled", "true");
-	} else {
-		entries.erase(path);
-	}
 }
 
 struct BrokeredCopyContext {
@@ -347,13 +344,16 @@ bool IsSafeArchivePath(const char* pathName, fs::path& relativePath) {
 }
 
 bool WriteGraphicPackVersion(const fs::path& path, const std::string& version) {
-	std::ofstream output(path, std::ios::binary | std::ios::trunc);
+	std::unique_ptr<FileStream> output(FileStream::createFile2(path));
 	if (!output)
 		return false;
-	output.write(version.data(), static_cast<std::streamsize>(version.size()));
-	output.put('\n');
-	output.flush();
-	return static_cast<bool>(output);
+	if (version.size() > static_cast<size_t>((std::numeric_limits<sint32>::max)()))
+		return false;
+	const auto length = static_cast<sint32>(version.size());
+	if (output->writeData(version.data(), length) != length)
+		return false;
+	const char newline = '\n';
+	return output->writeData(&newline, 1) == 1;
 }
 
 bool ExtractGraphicPackArchive(const std::vector<uint8_t>& archive,
@@ -432,10 +432,12 @@ bool ExtractGraphicPackArchive(const std::vector<uint8_t>& archive,
 			zip_error_fini(&zipError);
 			return false;
 		}
-		std::ofstream output(target, std::ios::binary | std::ios::trunc);
+		std::unique_ptr<FileStream> output(FileStream::createFile2(target));
 		if (!output) {
 			zip_fclose(file);
-			errorText = "Cemu could not write a Graphic Pack file.";
+			errorText = fmt::format(
+				"Cemu could not create Graphic Pack file '{}'.",
+				_pathToUtf8(relative));
 			zip_close(zip);
 			zip_error_fini(&zipError);
 			return false;
@@ -453,16 +455,19 @@ bool ExtractGraphicPackArchive(const std::vector<uint8_t>& archive,
 				zip_error_fini(&zipError);
 				return false;
 			}
-			output.write(chunk.data(), read);
-			if (!output) {
+			const auto requested = static_cast<sint32>(read);
+			if (output->writeData(chunk.data(), requested) != requested) {
 				zip_fclose(file);
-				errorText = "Cemu could not save an extracted Graphic Pack file.";
+				errorText = fmt::format(
+					"Cemu could not write Graphic Pack file '{}'.",
+					_pathToUtf8(relative));
 				zip_close(zip);
 				zip_error_fini(&zipError);
 				return false;
 			}
 			remaining -= static_cast<uint64_t>(read);
 		}
+		output.reset();
 		zip_fclose(file);
 		extractedFile = true;
 	}
@@ -738,6 +743,36 @@ CemuEmbedResult CEMU_EMBED_CALL CopyBrokeredEntry(void* userData, const char* re
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
 	return CEMU_EMBED_OK;
+}
+
+void ClearExternalVirtualFiles(CemuEmbedInstance* instance)
+{
+	for (const auto& path : instance->externalVirtualFiles)
+		VirtualFile::Unregister(path);
+	instance->externalVirtualFiles.clear();
+}
+
+bool RegisterExternalVirtualFiles(CemuEmbedInstance* instance,
+	const std::shared_ptr<FSCBrokeredFilesystem>& filesystem,
+	const fs::path& virtualRoot)
+{
+	for (const auto& [relativePath, size] : filesystem->GetFiles())
+	{
+		const fs::path path = (virtualRoot / _utf8ToPath(relativePath)).lexically_normal();
+		VirtualFile::Source source;
+		source.size = size;
+		source.open = [filesystem, relativePath](void*& stream) {
+			return filesystem->OpenRead(relativePath, stream);
+		};
+		source.read = [filesystem](void* stream, uint64 offset, uint8* buffer, uint32 length) {
+			return filesystem->Read(stream, offset, buffer, length);
+		};
+		source.close = [filesystem](void* stream) { filesystem->Close(stream); };
+		if (!VirtualFile::Register(path, std::move(source)))
+			return false;
+		instance->externalVirtualFiles.emplace_back(path);
+	}
+	return true;
 }
 
 CemuEmbedResult StageBrokeredFolder(CemuEmbedInstance* instance, void* folderHandle,
@@ -1175,20 +1210,8 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameWithExternalTitle
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolder(
 	CemuEmbedInstance* instance, void* folderHandle, const CemuEmbedBrokeredStorage* storage) {
-	if (!instance || !folderHandle || !HasRequiredBrokeredStorage(storage)) return CEMU_EMBED_INVALID_ARGUMENT;
-	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY) {
-		ReportError(instance, CEMU_EMBED_INVALID_STATE, "Cemu is not ready to stage or launch a title yet.");
-		return CEMU_EMBED_INVALID_STATE;
-	}
-	if (CafeSystem::IsTitleRunning()) {
-		ReportError(instance, CEMU_EMBED_BUSY, "A title is already running.");
-		return CEMU_EMBED_BUSY;
-	}
-	CafeTitleList::ClearBrokeredTitles();
-	fs::path stagedPath;
-	const auto stageResult = StageBrokeredFolder(instance, folderHandle, *storage,
-		"current", true, stagedPath);
-	return stageResult == CEMU_EMBED_OK ? LaunchGameFromPath(instance, stagedPath) : stageResult;
+	return CemuEmbed_LaunchGameFromBrokeredFolders(instance, folderHandle, nullptr,
+		nullptr, 0, storage);
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolders(
 	CemuEmbedInstance* instance, void* selectedFolderHandle,
@@ -1200,18 +1223,59 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolde
 		return CEMU_EMBED_INVALID_ARGUMENT;
 	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY) {
 		ReportError(instance, CEMU_EMBED_INVALID_STATE,
-			"Cemu is not ready to stage or launch a title yet.");
+			"Cemu is not ready to launch an external title yet.");
 		return CEMU_EMBED_INVALID_STATE;
 	}
 	if (CafeSystem::IsTitleRunning()) {
 		ReportError(instance, CEMU_EMBED_BUSY, "A title is already running.");
 		return CEMU_EMBED_BUSY;
 	}
+	CafeTitleList::ClearBrokeredTitles();
+	ClearExternalVirtualFiles(instance);
 
 	if (selectedRelativePathUtf8 && *selectedRelativePathUtf8) {
-		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
-			"Direct external storage currently supports extracted Wii U title folders (code, content and meta). Disc/archive files require staging or extraction first.");
-		return CEMU_EMBED_LAUNCH_FAILED;
+		fs::path selectedRelativePath;
+		if (!MakeSafeRelativePath(selectedRelativePathUtf8, selectedRelativePath)) {
+			ReportError(instance, CEMU_EMBED_INVALID_ARGUMENT,
+				"The selected external game file has an invalid relative path.");
+			return CEMU_EMBED_INVALID_ARGUMENT;
+		}
+		std::string indexError;
+		auto filesystem = BuildBrokeredFilesystem(selectedFolderHandle, *storage,
+			fmt::format("external-file/{:016X}",
+				static_cast<uint64>(reinterpret_cast<uintptr_t>(selectedFolderHandle))),
+			indexError);
+		const std::string normalizedSelected = _pathToUtf8(selectedRelativePath.lexically_normal());
+		if (!filesystem || !filesystem->ContainsFile(normalizedSelected)) {
+			ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+				filesystem ? "The selected external game file is no longer available."
+					: indexError.c_str());
+			return CEMU_EMBED_STORAGE_FAILED;
+		}
+		const fs::path virtualRoot = fs::path("brokered-files") /
+			fmt::format("{:016X}", static_cast<uint64>(reinterpret_cast<uintptr_t>(selectedFolderHandle)));
+		if (!RegisterExternalVirtualFiles(instance, filesystem, virtualRoot)) {
+			ClearExternalVirtualFiles(instance);
+			ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+				"Cemu could not register the external game files for direct access.");
+			return CEMU_EMBED_STORAGE_FAILED;
+		}
+		const fs::path virtualSelected = virtualRoot / selectedRelativePath;
+		const auto fileType = DetermineCafeSystemFileType(virtualSelected);
+		if (fileType == CafeTitleFileType::RPX || fileType == CafeTitleFileType::ELF) {
+			const auto result = CafeSystem::PrepareForegroundTitleFromBrokeredStandaloneRPX(
+				filesystem, normalizedSelected);
+			if (result != CafeSystem::PREPARE_STATUS_CODE::SUCCESS) {
+				ReportError(instance, CEMU_EMBED_LAUNCH_FAILED,
+					"Cemu could not prepare the external RPX/ELF directly from its storage device.");
+				return CEMU_EMBED_LAUNCH_FAILED;
+			}
+			CafeSystem::LaunchForegroundTitle();
+			return CEMU_EMBED_OK;
+		}
+		cemuLog_log(LogType::Force, "Launching external game directly without copying: {}",
+			normalizedSelected);
+		return LaunchGameFromPath(instance, virtualSelected);
 	}
 
 	std::vector<void*> folderHandles;
@@ -1226,7 +1290,6 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolde
 	// The old bridge copied every file to cache before adding it to the title
 	// list. Build a metadata/index tree instead. FSCDeviceBrokered opens source
 	// files by relative path only when GX2 or the game asks for them.
-	CafeTitleList::ClearBrokeredTitles();
 	// Reclaim only the superseded external-title staging cache. Saves, settings,
 	// shader caches and every other cache category are intentionally untouched.
 	std::error_code externalCacheError;
@@ -1505,6 +1568,125 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DeleteInstalledTitle(
 	return CEMU_EMBED_OK;
 }
 
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallDownloadedGraphicPacks(
+	CemuEmbedInstance* instance, const void* archiveData, uint64_t archiveSize,
+	const char* releaseNameUtf8, uint32_t* installedPackCount,
+	int32_t* alreadyCurrent) {
+	if (!instance || !archiveData || archiveSize == 0 ||
+		archiveSize > kGraphicPackDownloadLimit || !releaseNameUtf8 || !*releaseNameUtf8 ||
+		archiveSize > (std::numeric_limits<size_t>::max)())
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (installedPackCount)
+		*installedPackCount = 0;
+	if (alreadyCurrent)
+		*alreadyCurrent = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning()) {
+		ReportError(instance, CEMU_EMBED_BUSY,
+			"Stop the running title before installing Graphic Packs.");
+		return CEMU_EMBED_BUSY;
+	}
+
+	const auto* archiveBytes = static_cast<const uint8_t*>(archiveData);
+	std::vector<uint8_t> archive(archiveBytes,
+		archiveBytes + static_cast<size_t>(archiveSize));
+	const std::string releaseName(releaseNameUtf8);
+	const fs::path destination =
+		ActiveSettings::GetUserDataPath("graphicPacks/downloadedGraphicPacks");
+	const fs::path versionPath = destination / "version.txt";
+	std::string installedVersion;
+	if (ReadSmallTextFile(versionPath, installedVersion)) {
+		const auto newline = installedVersion.find_first_of("\r\n");
+		if (newline != std::string::npos)
+			installedVersion.erase(newline);
+	}
+	const uint32_t existingPackCount = CountGraphicPackRules(destination);
+	if (installedVersion == releaseName && existingPackCount != 0) {
+		GraphicPack2::ClearGraphicPacks();
+		GraphicPack2::LoadAll();
+		if (installedPackCount)
+			*installedPackCount = existingPackCount;
+		if (alreadyCurrent)
+			*alreadyCurrent = 1;
+		return CEMU_EMBED_OK;
+	}
+
+	const fs::path staging = destination.parent_path() /
+		"gp-download.tmp";
+	const fs::path backup = destination.parent_path() /
+		"gp-download.bak";
+	const fs::path legacyStaging = destination.parent_path() /
+		"downloadedGraphicPacks.cemu-embed-staging";
+	const fs::path legacyBackup = destination.parent_path() /
+		"downloadedGraphicPacks.cemu-embed-previous";
+	std::error_code error;
+	fs::create_directories(destination.parent_path(), error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not create the Graphic Pack download directory.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	fs::remove_all(staging, error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not clear the previous Graphic Pack staging directory.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	fs::remove_all(backup, error);
+	if (error) {
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not clear the previous Graphic Pack backup directory.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	for (const auto& legacyPath : { legacyStaging, legacyBackup }) {
+		error.clear();
+		fs::remove_all(legacyPath, error);
+		if (error)
+			cemuLog_log(LogType::Force,
+				"Could not completely remove legacy Graphic Pack staging path {}: {}",
+				_pathToUtf8(legacyPath), error.message());
+	}
+	error.clear();
+	std::string extractionError;
+	if (!ExtractGraphicPackArchive(archive, staging, extractionError)) {
+		fs::remove_all(staging, error);
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED, extractionError.c_str());
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	const uint32_t extractedPackCount = CountGraphicPackRules(staging);
+	if (extractedPackCount == 0 ||
+		!WriteGraphicPackVersion(staging / "version.txt", releaseName)) {
+		fs::remove_all(staging, error);
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			extractedPackCount == 0
+				? "The downloaded archive does not contain any Cemu rules.txt Graphic Packs."
+				: "Cemu could not record the installed Graphic Pack release version.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	if (fs::exists(destination, error))
+		fs::rename(destination, backup, error);
+	if (!error)
+		fs::rename(staging, destination, error);
+	if (error) {
+		std::error_code restoreError;
+		if (fs::exists(backup, restoreError) && !fs::exists(destination, restoreError))
+			fs::rename(backup, destination, restoreError);
+		fs::remove_all(staging, restoreError);
+		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+			"Cemu could not activate the downloaded Graphic Packs.");
+		return CEMU_EMBED_STORAGE_FAILED;
+	}
+	fs::remove_all(backup, error);
+	GraphicPack2::ClearGraphicPacks();
+	GraphicPack2::LoadAll();
+	if (installedPackCount)
+		*installedPackCount = extractedPackCount;
+	cemuLog_log(LogType::Force, "Installed {} downloaded Graphic Pack(s), release {}",
+		extractedPackCount, releaseName);
+	return CEMU_EMBED_OK;
+}
+
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DownloadGraphicPacks(
 	CemuEmbedInstance* instance, uint32_t* downloadedPackCount,
 	int32_t* alreadyCurrent) {
@@ -1598,67 +1780,8 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_DownloadGraphicPacks(
 			"Cemu could not download the current Graphic Pack archive.");
 		return CEMU_EMBED_STORAGE_FAILED;
 	}
-
-	const fs::path staging = destination.parent_path() /
-		"downloadedGraphicPacks.cemu-embed-staging";
-	const fs::path backup = destination.parent_path() /
-		"downloadedGraphicPacks.cemu-embed-previous";
-	std::error_code error;
-	fs::create_directories(destination.parent_path(), error);
-	if (error) {
-		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
-			"Cemu could not create the Graphic Pack download directory.");
-		return CEMU_EMBED_STORAGE_FAILED;
-	}
-	fs::remove_all(staging, error);
-	if (error) {
-		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
-			"Cemu could not clear the previous Graphic Pack staging directory.");
-		return CEMU_EMBED_STORAGE_FAILED;
-	}
-	fs::remove_all(backup, error);
-	if (error) {
-		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
-			"Cemu could not clear the previous Graphic Pack backup directory.");
-		return CEMU_EMBED_STORAGE_FAILED;
-	}
-	std::string extractionError;
-	if (!ExtractGraphicPackArchive(archive.bytes, staging, extractionError)) {
-		fs::remove_all(staging, error);
-		ReportError(instance, CEMU_EMBED_STORAGE_FAILED, extractionError.c_str());
-		return CEMU_EMBED_STORAGE_FAILED;
-	}
-	const uint32_t extractedPackCount = CountGraphicPackRules(staging);
-	if (extractedPackCount == 0 ||
-		!WriteGraphicPackVersion(staging / "version.txt", releaseName)) {
-		fs::remove_all(staging, error);
-		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
-			extractedPackCount == 0
-				? "The downloaded archive does not contain any Cemu rules.txt Graphic Packs."
-				: "Cemu could not record the installed Graphic Pack release version.");
-		return CEMU_EMBED_STORAGE_FAILED;
-	}
-	if (fs::exists(destination, error))
-		fs::rename(destination, backup, error);
-	if (!error)
-		fs::rename(staging, destination, error);
-	if (error) {
-		std::error_code restoreError;
-		if (fs::exists(backup, restoreError) && !fs::exists(destination, restoreError))
-			fs::rename(backup, destination, restoreError);
-		fs::remove_all(staging, restoreError);
-		ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
-			"Cemu could not activate the downloaded Graphic Packs.");
-		return CEMU_EMBED_STORAGE_FAILED;
-	}
-	fs::remove_all(backup, error);
-	GraphicPack2::ClearGraphicPacks();
-	GraphicPack2::LoadAll();
-	if (downloadedPackCount)
-		*downloadedPackCount = extractedPackCount;
-	cemuLog_log(LogType::Force, "Downloaded {} Graphic Pack(s), release {}",
-		extractedPackCount, releaseName);
-	return CEMU_EMBED_OK;
+	return CemuEmbed_InstallDownloadedGraphicPacks(instance, archive.bytes.data(),
+		archive.bytes.size(), releaseName.c_str(), downloadedPackCount, alreadyCurrent);
 }
 
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ClearShaderCaches(
@@ -1888,6 +2011,63 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledForTi
 		enabled ? "Enabled" : "Disabled", affected, baseTitleId);
 	return CEMU_EMBED_OK;
 }
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateGraphicPacksForTitle(
+	CemuEmbedInstance* instance, uint64_t baseTitleId,
+	CemuEmbedGraphicPackCallback callback, void* userData) {
+	if (!instance || !baseTitleId || !callback)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	baseTitleId = TitleIdParser::MakeBaseTitleId(baseTitleId);
+	for (const auto& pack : GraphicPack2::GetGraphicPacks()) {
+		if (!pack->ContainsTitleId(baseTitleId))
+			continue;
+		const std::string identity = pack->GetNormalizedPathString();
+		const std::string& virtualPath = pack->GetVirtualPath();
+		const size_t separator = virtualPath.find_last_of('/');
+		const std::string category = separator == std::string::npos
+			? std::string{} : virtualPath.substr(0, separator);
+		CemuEmbedGraphicPack info{
+			sizeof(info), CEMU_EMBED_GRAPHIC_PACK_VERSION,
+			identity.c_str(), pack->GetName().c_str(), category.c_str(),
+			pack->GetDescription().c_str(), pack->IsEnabled() ? 1 : 0,
+			pack->IsDefaultEnabled() ? 1 : 0
+		};
+		const auto result = callback(userData, &info);
+		if (result != CEMU_EMBED_OK)
+			return result;
+	}
+	return CEMU_EMBED_OK;
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPackEnabled(
+	CemuEmbedInstance* instance, uint64_t baseTitleId,
+	const char* identityUtf8, int32_t enabled) {
+	if (!instance || !baseTitleId || !identityUtf8 || !*identityUtf8)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+	baseTitleId = TitleIdParser::MakeBaseTitleId(baseTitleId);
+	for (const auto& pack : GraphicPack2::GetGraphicPacks()) {
+		if (!pack->ContainsTitleId(baseTitleId) ||
+			pack->GetNormalizedPathString() != identityUtf8)
+			continue;
+		pack->SetEnabled(enabled != 0);
+		SaveGraphicPackState(pack);
+		if (!GetConfigHandle().Save()) {
+			ReportError(instance, CEMU_EMBED_STORAGE_FAILED,
+				"Cemu could not persist the Graphic Pack state.");
+			return CEMU_EMBED_STORAGE_FAILED;
+		}
+		cemuLog_log(LogType::Force, "{} graphic pack {} for title {:016x}",
+			enabled ? "Enabled" : "Disabled", pack->GetVirtualPath(), baseTitleId);
+		return CEMU_EMBED_OK;
+	}
+	return CEMU_EMBED_INVALID_ARGUMENT;
+}
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ApplySafeGraphicPackPolicyForTitle(
 	CemuEmbedInstance* instance, uint64_t baseTitleId,
 	uint32_t* affectedPackCount) {
@@ -1956,8 +2136,8 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile
 			// Mutating an active EmulatedController in place can race the 1 ms
 			// input update thread on Xbox and caused crashes when a game first
 			// consumed controller input.
-			auto replacement = ControllerFactory::CreateEmulatedController(
-				0, EmulatedController::Type::VPAD);
+			const auto selectedType = emulated ? emulated->type() : EmulatedController::Type::VPAD;
+			auto replacement = ControllerFactory::CreateEmulatedController(0, selectedType);
 			if (!replacement)
 				return CEMU_EMBED_INITIALIZATION_FAILED;
 			controller = std::make_shared<UWPGamepadController>();
@@ -1966,22 +2146,23 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile
 				return CEMU_EMBED_INITIALIZATION_FAILED;
 			input.set_controller(replacement);
 			if (!input.save(0))
-				cemuLog_log(LogType::Force, "Could not save the host Xbox GamePad profile");
+				cemuLog_log(LogType::Force, "Could not save the host Xbox controller profile");
 			input.on_device_changed();
 			cemuLog_log(LogType::Force,
-				"Configured the host Xbox GamePad profile safely without SDL/WGI cross-thread access");
+				"Configured the host Xbox controller as {} safely without SDL/WGI cross-thread access",
+				replacement->type_string());
 		}
 		*profileReady = controller->is_connected() ? 1 : 0;
 		return CEMU_EMBED_OK;
 		}
 		catch (const std::exception& exception) {
 			cemuLog_log(LogType::Force,
-				"Could not configure the host Xbox GamePad profile: {}", exception.what());
+				"Could not configure the host Xbox controller profile: {}", exception.what());
 			return CEMU_EMBED_INITIALIZATION_FAILED;
 		}
 		catch (...) {
 			cemuLog_log(LogType::Force,
-				"Could not configure the host Xbox GamePad profile due to an unknown error");
+				"Could not configure the host Xbox controller profile due to an unknown error");
 			return CEMU_EMBED_INITIALIZATION_FAILED;
 		}
 	}
@@ -2031,18 +2212,19 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnsureDefaultGamepadProfile
 	if (!emulated->set_default_mapping(selected)) {
 		emulated->clear_controllers();
 		cemuLog_log(LogType::Force,
-			"Could not create the default Wii U GamePad mapping for {}",
+			"Could not create the default {} mapping for {}", emulated->type_string(),
 			selected->display_name());
 		return CEMU_EMBED_OK;
 	}
 	if (!input.save(0)) {
 		cemuLog_log(LogType::Force,
-			"The Xbox controller is active, but its Wii U GamePad profile could not be saved");
+			"The physical controller is active, but its {} profile could not be saved",
+			emulated->type_string());
 	}
 	input.on_device_changed();
 	*profileReady = 1;
 	cemuLog_log(LogType::Force,
-		"Created the default Wii U GamePad profile for {}", selected->display_name());
+		"Created the default {} profile for {}", emulated->type_string(), selected->display_name());
 #endif
 	return CEMU_EMBED_OK;
 }
@@ -2128,6 +2310,9 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetSettings(
 	settings->emulate_skylander_portal = c.emulated_usb_devices.emulate_skylander_portal.GetValue();
 	settings->emulate_infinity_base = c.emulated_usb_devices.emulate_infinity_base.GetValue();
 	settings->emulate_dimensions_toypad = c.emulated_usb_devices.emulate_dimensions_toypad.GetValue();
+	const auto playerOne = InputManager::instance().get_controller(0);
+	settings->emulated_controller_type = playerOne ?
+		static_cast<int32_t>(playerOne->type()) : static_cast<int32_t>(EmulatedController::Type::VPAD);
 	return CEMU_EMBED_OK;
 }
 
@@ -2138,6 +2323,54 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetSettings(
 		return CEMU_EMBED_INVALID_ARGUMENT;
 	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
 		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+	const auto requestedControllerType = static_cast<EmulatedController::Type>(
+		(std::clamp)(settings->emulated_controller_type, 0,
+			static_cast<int32_t>(EmulatedController::Type::MAX) - 1));
+	auto& input = InputManager::instance();
+	auto currentController = input.get_controller(0);
+	if (!currentController || currentController->type() != requestedControllerType) {
+		try {
+			auto replacement = ControllerFactory::CreateEmulatedController(0, requestedControllerType);
+			if (!replacement)
+				return CEMU_EMBED_INITIALIZATION_FAILED;
+			std::shared_ptr<ControllerBase> physicalController;
+			if (currentController) {
+				for (const auto& configured : currentController->get_controllers()) {
+					if (configured && configured->api() == InputAPI::WGIGamepad) {
+						physicalController = configured;
+						break;
+					}
+				}
+			}
+#if defined(CEMU_UWP)
+			if (!physicalController && UWPGamepadController::IsHostGamepadConnected())
+				physicalController = std::make_shared<UWPGamepadController>();
+#endif
+			if (physicalController) {
+				replacement->add_controller(physicalController);
+				if (!replacement->set_default_mapping(physicalController))
+					return CEMU_EMBED_INITIALIZATION_FAILED;
+			}
+			auto previous = input.set_controller(replacement);
+			if (!input.save(0)) {
+				if (previous)
+					input.set_controller(previous);
+				else
+					input.delete_controller(0);
+				return CEMU_EMBED_STORAGE_FAILED;
+			}
+			input.on_device_changed();
+			cemuLog_log(LogType::Force, "Player one emulated controller changed to {}",
+				replacement->type_string());
+		}
+		catch (const std::exception& exception) {
+			cemuLog_log(LogType::Force, "Could not change the emulated controller: {}",
+				exception.what());
+			return CEMU_EMBED_INITIALIZATION_FAILED;
+		}
+	}
 	auto& c = GetConfig();
 	c.cpu_mode.SetValue(static_cast<CPUMode>((std::clamp)(settings->cpu_mode, 0, 4)));
 	c.console_language.SetValue(static_cast<CafeConsoleLanguage>((std::clamp)(settings->console_language, 0, 11)));
@@ -2397,6 +2630,8 @@ extern "C" void CEMU_EMBED_CALL CemuEmbed_Destroy(CemuEmbedInstance* instance) {
 		InputManager::instance().set_virtual_mouse(false, {}, false);
 		CafeSystem::Shutdown();
 	}
+	CafeTitleList::ClearBrokeredTitles();
+	ClearExternalVirtualFiles(instance);
 	{ std::lock_guard lock(s_instanceMutex); if (s_instance == instance) s_instance = nullptr; }
 	if (instance->loggingCallbacksInstalled.load(std::memory_order_acquire)) cemuLog_clearCallbacks();
 	delete instance;

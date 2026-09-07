@@ -47,7 +47,10 @@ class FileStream
 
  private:
 	FileStream(HANDLE hFile);
+	explicit FileStream(std::unique_ptr<class VirtualFileStreamTag>);
 
 	bool m_isValid{};
-	HANDLE m_hFile;
+	HANDLE m_hFile{INVALID_HANDLE_VALUE};
+	std::unique_ptr<class VirtualFileStreamTag> m_virtualFile;
+	uint64 m_virtualPosition{};
 };

@@ -28,6 +28,7 @@ public:
 	bool ContainsDirectory(std::string_view relativePath) const;
 	uint64 GetFileSize(std::string_view relativePath) const;
 	std::vector<FSCDirEntry> GetDirectoryEntries(std::string_view relativePath) const;
+	std::vector<std::pair<std::string, uint64>> GetFiles() const;
 	bool OpenRead(std::string_view relativePath, void*& stream) const;
 	uint32 Read(void* stream, uint64 offset, uint8* buffer, uint32 size) const;
 	void Close(void* stream) const;

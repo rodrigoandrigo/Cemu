@@ -301,6 +301,16 @@ std::vector<FSCDirEntry> FSCBrokeredFilesystem::GetDirectoryEntries(std::string_
 	return entries;
 }
 
+std::vector<std::pair<std::string, uint64>> FSCBrokeredFilesystem::GetFiles() const
+{
+	std::vector<std::pair<std::string, uint64>> files;
+	files.reserve(m_entries.size());
+	for (const auto& [_, entry] : m_entries)
+		if (!entry.isDirectory)
+			files.emplace_back(entry.path, entry.size);
+	return files;
+}
+
 bool FSCBrokeredFilesystem::OpenRead(std::string_view relativePath, void*& stream) const
 {
 	stream = nullptr;

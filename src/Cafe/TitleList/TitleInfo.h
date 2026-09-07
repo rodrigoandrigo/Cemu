@@ -17,6 +17,7 @@ enum class CafeTitleFileType
 };
 
 CafeTitleFileType DetermineCafeSystemFileType(fs::path filePath);
+class ZArchiveReader* OpenZArchiveFile(const fs::path& path);
 
 struct ParsedAppXml
 {

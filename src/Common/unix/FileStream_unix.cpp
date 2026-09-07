@@ -1,5 +1,14 @@
 #include "Common/unix/FileStream_unix.h"
+#include "Common/VirtualFile.h"
 #include <cstdarg>
+
+class VirtualFileStreamTag
+{
+public:
+	explicit VirtualFileStreamTag(std::unique_ptr<VirtualFile::Stream> stream)
+		: stream(std::move(stream)) {}
+	std::unique_ptr<VirtualFile::Stream> stream;
+};
 
 fs::path findPathCI(const fs::path& path)
 {
@@ -32,6 +41,12 @@ FileStream* FileStream::openFile(const wchar_t* path, bool allowWrite)
 
 FileStream* FileStream::openFile2(const fs::path& path, bool allowWrite)
 {
+	if (!allowWrite)
+	{
+		auto stream = VirtualFile::Open(path);
+		if (stream)
+			return new FileStream(std::make_unique<VirtualFileStreamTag>(std::move(stream)));
+	}
 	FileStream* fs = new FileStream(path, true, allowWrite);
 	if (fs->m_isValid)
 		return fs;
@@ -81,6 +96,11 @@ std::optional<std::vector<uint8>> FileStream::LoadIntoMemory(const fs::path& pat
 
 void FileStream::SetPosition(uint64 pos)
 {
+	if (m_virtualFile)
+	{
+		m_virtualPosition = pos;
+		return;
+	}
 	cemu_assert(m_isValid);
 	if (m_prevOperationWasWrite)
 		m_fileStream.seekp((std::streampos)pos);
@@ -90,6 +110,8 @@ void FileStream::SetPosition(uint64 pos)
 
 uint64 FileStream::GetSize()
 {
+	if (m_virtualFile)
+		return m_virtualFile->stream->GetSize();
 	cemu_assert(m_isValid);
 	auto currentPos = m_fileStream.tellg();
 	m_fileStream.seekg(0, std::ios::end);
@@ -101,6 +123,8 @@ uint64 FileStream::GetSize()
 
 bool FileStream::SetEndOfFile()
 {
+	if (m_virtualFile)
+		return false;
 	assert_dbg();
 	return true;
 	//return ::SetEndOfFile(m_hFile) != 0;
@@ -121,6 +145,12 @@ void FileStream::Flush()
 
 uint32 FileStream::readData(void* data, uint32 length)
 {
+	if (m_virtualFile)
+	{
+		const uint32 bytesRead = m_virtualFile->stream->Read(m_virtualPosition, data, length);
+		m_virtualPosition += bytesRead;
+		return bytesRead;
+	}
 	SyncReadWriteSeek(false);
 	m_fileStream.read((char*)data, length);
 	size_t bytesRead = m_fileStream.gcount();
@@ -161,6 +191,8 @@ bool FileStream::readLine(std::string& line)
 
 sint32 FileStream::writeData(const void* data, sint32 length)
 {
+	if (m_virtualFile)
+		return 0;
 	SyncReadWriteSeek(true);
 	m_fileStream.write((const char*)data, length);
 	return length;
@@ -208,6 +240,11 @@ FileStream::~FileStream()
 		m_fileStream.close();
 	}
 	//	CloseHandle(m_hFile);
+}
+
+FileStream::FileStream(std::unique_ptr<VirtualFileStreamTag> stream)
+	: m_isValid(true), m_virtualFile(std::move(stream))
+{
 }
 
 FileStream::FileStream(const fs::path& path, bool isOpen, bool isWriteable)
