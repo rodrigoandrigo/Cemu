@@ -1083,6 +1083,113 @@ CemuEmbedResult LaunchGameFromPath(CemuEmbedInstance* instance, const fs::path& 
 	CafeSystem::LaunchForegroundTitle();
 	return CEMU_EMBED_OK;
 }
+
+uint32_t HashStandaloneExecutable(const uint8_t* data, size_t size) {
+	uint32_t hash = 0x3416DCBF;
+	for (size_t index = 0; index < size; ++index) {
+		hash = (hash << 3) | (hash >> 29);
+		hash += data[index];
+	}
+	return hash;
+}
+
+TitleId NormalizeGraphicPackTitleId(TitleInfo& title) {
+	if (!title.IsValid())
+		return 0;
+	TitleId titleId = title.GetAppTitleId();
+	if (!titleId)
+		return 0;
+	if (title.GetTitleType() == TitleIdParser::TITLE_TYPE::AOC)
+		titleId &= ~0xFF00000000ull;
+	return TitleIdParser::MakeBaseTitleId(titleId);
+}
+
+TitleId IdentifyGamePathForGraphicPacks(fs::path gamePath) {
+	std::error_code error;
+	if (fs::is_directory(gamePath, error) &&
+		!fs::is_directory(gamePath / "code", error) &&
+		fs::is_regular_file(gamePath / "title.tmd", error))
+		gamePath /= "title.tmd";
+	const auto type = DetermineCafeSystemFileType(gamePath);
+	if (type == CafeTitleFileType::RPX || type == CafeTitleFileType::ELF) {
+		auto data = FileStream::LoadIntoMemory(gamePath);
+		if (!data || data->empty())
+			return 0;
+		return 0xFFFFFFFF00000000ull |
+			static_cast<TitleId>(HashStandaloneExecutable(data->data(), data->size()));
+	}
+	TitleInfo title{ gamePath };
+	return NormalizeGraphicPackTitleId(title);
+}
+
+TitleId IdentifyBrokeredGameForGraphicPacks(CemuEmbedInstance* instance,
+	const std::shared_ptr<FSCBrokeredFilesystem>& filesystem,
+	std::string_view selectedRelativePath) {
+	if (!filesystem)
+		return 0;
+	if (selectedRelativePath.empty()) {
+		if (filesystem->ContainsFile("title.tmd")) {
+			ClearExternalVirtualFiles(instance);
+			const fs::path virtualRoot = fs::path("brokered-identify") /
+				fmt::format("{:016X}", static_cast<uint64>(
+					reinterpret_cast<uintptr_t>(filesystem.get())));
+			if (!RegisterExternalVirtualFiles(instance, filesystem, virtualRoot)) {
+				ClearExternalVirtualFiles(instance);
+				return 0;
+			}
+			TitleInfo title{ virtualRoot / "title.tmd" };
+			const TitleId titleId = NormalizeGraphicPackTitleId(title);
+			ClearExternalVirtualFiles(instance);
+			return titleId;
+		}
+		TitleInfo title{ filesystem, filesystem->GetIdentity() };
+		return NormalizeGraphicPackTitleId(title);
+	}
+	fs::path relativePath;
+	const std::string selectedRelativePathString(selectedRelativePath);
+	if (!MakeSafeRelativePath(selectedRelativePathString.c_str(), relativePath))
+		return 0;
+	const std::string normalized = _pathToUtf8(relativePath.lexically_normal());
+	if (!filesystem->ContainsFile(normalized))
+		return 0;
+	const auto type = DetermineCafeSystemFileType(relativePath);
+	if (type == CafeTitleFileType::RPX || type == CafeTitleFileType::ELF) {
+		const uint64 size = filesystem->GetFileSize(normalized);
+		if (!size || size > (std::numeric_limits<size_t>::max)())
+			return 0;
+		void* stream{};
+		if (!filesystem->OpenRead(normalized, stream))
+			return 0;
+		std::vector<uint8_t> data(static_cast<size_t>(size));
+		uint64 offset{};
+		while (offset < size) {
+			const uint32 request = static_cast<uint32>((std::min)(
+				size - offset, 1024ull * 1024ull));
+			const uint32 read = filesystem->Read(stream, offset,
+				data.data() + static_cast<size_t>(offset), request);
+			if (!read)
+				break;
+			offset += read;
+		}
+		filesystem->Close(stream);
+		if (offset != size)
+			return 0;
+		return 0xFFFFFFFF00000000ull |
+			static_cast<TitleId>(HashStandaloneExecutable(data.data(), data.size()));
+	}
+	ClearExternalVirtualFiles(instance);
+	const fs::path virtualRoot = fs::path("brokered-identify") /
+		fmt::format("{:016X}", static_cast<uint64>(reinterpret_cast<uintptr_t>(filesystem.get())));
+	if (!RegisterExternalVirtualFiles(instance, filesystem, virtualRoot)) {
+		ClearExternalVirtualFiles(instance);
+		return 0;
+	}
+	TitleInfo title{ virtualRoot / relativePath };
+	const TitleId titleId = NormalizeGraphicPackTitleId(title);
+	ClearExternalVirtualFiles(instance);
+	return titleId;
+}
+
 void Initialize(CemuEmbedInstance* instance) {
 	try {
 		std::set<fs::path> failedWriteAccess;
@@ -1360,6 +1467,40 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredFolde
 		storage->progress(storage->user_data, 1, 1, "External title mounted");
 	CafeSystem::LaunchForegroundTitle();
 	return CEMU_EMBED_OK;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_IdentifyGamePath(
+	CemuEmbedInstance* instance, const char* gamePathUtf8,
+	uint64_t* baseTitleId) {
+	if (!instance || !gamePathUtf8 || !*gamePathUtf8 || !baseTitleId)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	*baseTitleId = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+	*baseTitleId = IdentifyGamePathForGraphicPacks(_utf8ToPath(gamePathUtf8));
+	return *baseTitleId ? CEMU_EMBED_OK : CEMU_EMBED_LAUNCH_FAILED;
+}
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_IdentifyGameFromBrokeredFolder(
+	CemuEmbedInstance* instance, void* folderHandle,
+	const char* selectedRelativePathUtf8,
+	const CemuEmbedBrokeredStorage* storage, uint64_t* baseTitleId) {
+	if (!instance || !folderHandle || !HasRequiredBrokeredStorage(storage) || !baseTitleId)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	*baseTitleId = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+	if (CafeSystem::IsTitleRunning())
+		return CEMU_EMBED_BUSY;
+	std::string indexError;
+	auto filesystem = BuildBrokeredFilesystem(folderHandle, *storage,
+		fmt::format("identify/{:016X}",
+			static_cast<uint64>(reinterpret_cast<uintptr_t>(folderHandle))), indexError);
+	if (!filesystem)
+		return CEMU_EMBED_STORAGE_FAILED;
+	*baseTitleId = IdentifyBrokeredGameForGraphicPacks(instance, filesystem,
+		selectedRelativePathUtf8 ? selectedRelativePathUtf8 : "");
+	return *baseTitleId ? CEMU_EMBED_OK : CEMU_EMBED_LAUNCH_FAILED;
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallTitleFromBrokeredFolder(
 	CemuEmbedInstance* instance, void* folderHandle,

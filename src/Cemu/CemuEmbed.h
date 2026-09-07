@@ -305,6 +305,15 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_LaunchGameFromBrokeredF
 	const char* selected_relative_path_utf8,
 	void* const* supplemental_folder_handles, uint32_t supplemental_folder_count,
 	const CemuEmbedBrokeredStorage* storage);
+// Resolves the real base Title ID used by Graphic Packs without launching or
+// copying the game. Standalone RPX/ELF files use Cemu's normal content-hash ID.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_IdentifyGamePath(
+	CemuEmbedInstance* instance, const char* game_path_utf8,
+	uint64_t* base_title_id);
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_IdentifyGameFromBrokeredFolder(
+	CemuEmbedInstance* instance, void* folder_handle,
+	const char* selected_relative_path_utf8,
+	const CemuEmbedBrokeredStorage* storage, uint64_t* base_title_id);
 // Installs an extracted base game, update or DLC into Cemu's persistent MLC.
 // The selected folder must contain code, content and meta. expected_type may
 // be AUTO to accept the type declared by app.xml. The operation is synchronous
