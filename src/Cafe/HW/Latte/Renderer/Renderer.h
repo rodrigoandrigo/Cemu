@@ -55,6 +55,7 @@ public:
 	virtual ~Renderer() = default;
 
 	RendererAPI GetType() const { return m_rendererAPI; }
+	const std::string& GetDeviceName() { return m_selectedDeviceName; }
 
 	virtual void Initialize();
 	virtual void Shutdown();
@@ -166,6 +167,7 @@ protected:
 	virtual void GetVendorInformation() { }
 	RendererAPI m_rendererAPI;
 	GfxVendor m_vendor = GfxVendor::Generic;
+	std::string m_selectedDeviceName = "";
 
 	static uint8 SRGBComponentToRGB(uint8 ci);
 	static uint8 RGBComponentToSRGB(uint8 cli);
