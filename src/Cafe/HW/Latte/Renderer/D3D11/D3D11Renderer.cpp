@@ -2,6 +2,7 @@
 
 #include "Cafe/HW/Latte/Core/FetchShader.h"
 #include "Cafe/HW/Latte/Core/LatteIndices.h"
+#include "Cafe/HW/Latte/Core/Latte.h"
 #include "Cafe/HW/Latte/Core/LatteQueryObject.h"
 #include "Cafe/HW/Latte/Core/LatteShader.h"
 #include "Cafe/HW/Latte/Core/LatteTexture.h"
@@ -9,6 +10,7 @@
 #include "Cafe/HW/Latte/Renderer/RendererCore.h"
 #include "Cemu/CemuEmbed.h"
 #include "Cemu/Logging/CemuLogging.h"
+#include "Common/CemuRuntime.h"
 #include "Common/FileStream.h"
 #include "config/ActiveSettings.h"
 #include "interface/WindowSystem.h"
@@ -54,9 +56,9 @@ extern std::atomic_int g_compiling_pipelines;
 // color aliases of a depth surface without issuing a normal shader draw.
 void LatteDraw_handleSpecialState8_clearAsDepth();
 
-// The implementation is grouped by responsibility while remaining in one
-// translation unit. Several native resource types intentionally live in an
-// anonymous namespace and are shared across these implementation sections.
+// Closely coupled native resource and draw sections share this implementation
+// unit. Synchronization and device diagnostics are independent compiled units;
+// new modules should follow that boundary instead of growing this aggregator.
 #include "Cafe/HW/Latte/Renderer/D3D11/D3D11RendererUtilities.inl"
 #include "Cafe/HW/Latte/Renderer/D3D11/D3D11RendererShader.inl"
 #include "Cafe/HW/Latte/Renderer/D3D11/D3D11RendererResources.inl"

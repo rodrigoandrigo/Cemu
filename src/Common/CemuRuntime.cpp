@@ -12,6 +12,9 @@ std::atomic_bool s_embeddingMode{false};
 std::atomic_bool s_outOfMemory{false};
 std::mutex s_fatalErrorMutex;
 std::string s_fatalError;
+std::atomic_bool s_graphicsDeviceLost{false};
+std::mutex s_graphicsDeviceLostMutex;
+std::string s_graphicsDeviceLostMessage;
 }
 
 void SetEmbeddingMode(bool enabled) { s_embeddingMode.store(enabled, std::memory_order_release); }
@@ -27,6 +30,23 @@ bool HasFatalError() { std::lock_guard lock(s_fatalErrorMutex); return !s_fatalE
 std::string GetFatalError() { std::lock_guard lock(s_fatalErrorMutex); return s_fatalError; }
 void RecordOutOfMemory() noexcept { s_outOfMemory.store(true, std::memory_order_release); }
 bool HasOutOfMemory() noexcept { return s_outOfMemory.load(std::memory_order_acquire); }
+void RecordGraphicsDeviceLost(std::string message)
+{
+	{
+		std::lock_guard lock(s_graphicsDeviceLostMutex);
+		s_graphicsDeviceLostMessage = std::move(message);
+	}
+	s_graphicsDeviceLost.store(true, std::memory_order_release);
+}
+bool ConsumeGraphicsDeviceLost(std::string& message)
+{
+	if (!s_graphicsDeviceLost.exchange(false, std::memory_order_acq_rel))
+		return false;
+	std::lock_guard lock(s_graphicsDeviceLostMutex);
+	message = std::move(s_graphicsDeviceLostMessage);
+	s_graphicsDeviceLostMessage.clear();
+	return true;
+}
 
 [[noreturn]] void RaiseFatalError(std::string message, int desktopExitCode)
 {

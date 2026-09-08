@@ -19,5 +19,7 @@ namespace CemuRuntime
 	std::string GetFatalError();
 	void RecordOutOfMemory() noexcept;
 	bool HasOutOfMemory() noexcept;
+	void RecordGraphicsDeviceLost(std::string message);
+	bool ConsumeGraphicsDeviceLost(std::string& message);
 	[[noreturn]] void RaiseFatalError(std::string message, int desktopExitCode = -1);
 }

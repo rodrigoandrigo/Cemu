@@ -19,6 +19,9 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 		throw std::runtime_error("The host did not provide a valid Direct3D 11 SwapChainPanel surface.");
 	m_device = static_cast<ID3D11Device*>(surface->device);
 	m_context = static_cast<ID3D11DeviceContext*>(surface->immediate_context);
+	// Optional Windows 8+ context methods map to explicit discard/barrier hints
+	// in D3D11On12. Keep the base context as the compatibility requirement.
+	m_context.As(&m_context1);
 	if (m_device->GetFeatureLevel() != D3D_FEATURE_LEVEL_11_0)
 		throw std::runtime_error(fmt::format(
 			"The Direct3D host must provide exactly DirectX 11 Feature Level 11.0 (received 0x{:04X}).",
@@ -53,6 +56,12 @@ D3D11Renderer::D3D11Renderer() : Renderer(RendererAPI::D3D11)
 		m_infoQueue->ClearStoredMessages();
 	}
 	m_swapChain = static_cast<IDXGISwapChain*>(surface->swap_chain);
+	ComPtr<IDXGIDevice1> dxgiDevice1;
+	if (SUCCEEDED(m_device.As(&dxgiDevice1)))
+		dxgiDevice1->SetMaximumFrameLatency(2);
+	ComPtr<IDXGISwapChain2> latencySwapChain;
+	if (SUCCEEDED(m_swapChain.As(&latencySwapChain)))
+		latencySwapChain->SetMaximumFrameLatency(2);
 	RefreshBackBuffer();
 	cemuLog_log(LogType::Force, "------- Init Direct3D 11 graphics backend -------");
 	cemuLog_log(LogType::Force, "Direct3D 11 backend: native GX2 resources, shaders, draw calls and SwapChainPanel presentation.");
@@ -151,6 +160,10 @@ void D3D11Renderer::RefreshBackBuffer()
 	m_backBuffer = buffer;
 	m_backBufferView.Reset();
 	ThrowIfFailed(m_device->CreateRenderTargetView(m_backBuffer.Get(), nullptr, &m_backBufferView), "Create back-buffer RTV");
+	D3D11_TEXTURE2D_DESC desc{};
+	m_backBuffer->GetDesc(&desc);
+	m_backBufferWidth = desc.Width;
+	m_backBufferHeight = desc.Height;
 }
 
 void D3D11Renderer::EnsureBackBufferSize()
@@ -161,15 +174,14 @@ void D3D11Renderer::EnsureBackBufferSize()
 	requestedWidth = (std::max)(requestedWidth, 1);
 	requestedHeight = (std::max)(requestedHeight, 1);
 
-	DXGI_SWAP_CHAIN_DESC description{};
-	ThrowIfFailed(m_swapChain->GetDesc(&description), "IDXGISwapChain::GetDesc");
-	if (description.BufferDesc.Width == static_cast<UINT>(requestedWidth) &&
-		description.BufferDesc.Height == static_cast<UINT>(requestedHeight))
+	if (m_backBufferWidth == static_cast<UINT>(requestedWidth) &&
+		m_backBufferHeight == static_cast<UINT>(requestedHeight))
 		return;
 
 	m_context->OMSetRenderTargets(0, nullptr, nullptr);
 	m_backBufferView.Reset();
 	m_backBuffer.Reset();
+	m_backBufferWidth = m_backBufferHeight = 0;
 	m_context->Flush();
 
 	ThrowIfFailed(m_swapChain->ResizeBuffers(
@@ -319,10 +331,8 @@ bool D3D11Renderer::BeginFrame(bool mainWindow)
 	RefreshBackBuffer();
 	ID3D11RenderTargetView* view = m_backBufferView.Get();
 	m_context->OMSetRenderTargets(1, &view, nullptr);
-	D3D11_TEXTURE2D_DESC backBufferDesc{};
-	m_backBuffer->GetDesc(&backBufferDesc);
-	const int width = static_cast<int>((std::max)(backBufferDesc.Width, 1u));
-	const int height = static_cast<int>((std::max)(backBufferDesc.Height, 1u));
+	const int width = static_cast<int>((std::max)(m_backBufferWidth, 1u));
+	const int height = static_cast<int>((std::max)(m_backBufferHeight, 1u));
 	renderTarget_setViewport(0, 0, static_cast<float>(width), static_cast<float>(height), 0, 1, false);
 	renderTarget_setScissor(0, 0, width, height);
 	return true;
@@ -363,8 +373,6 @@ void D3D11Renderer::SwapBuffers(bool swapTV, bool)
 	}
 	D3D11_DEBUG_CHECK("after Present");
 	m_context->OMSetRenderTargets(0, nullptr, nullptr);
-	m_backBufferView.Reset();
-	m_backBuffer.Reset();
 	CheckMemoryPressure();
 }
 
@@ -469,50 +477,6 @@ void D3D11Renderer::Flush(bool waitIdle)
 		WaitForGpuIdle();
 }
 
-bool D3D11Renderer::WaitForGpuIdle()
-{
-	if (m_deviceLost.load(std::memory_order_relaxed))
-		return false;
-	if (!m_gpuIdleQuery)
-	{
-		D3D11_QUERY_DESC desc{ D3D11_QUERY_EVENT, 0 };
-		const HRESULT createResult = m_device->CreateQuery(&desc, &m_gpuIdleQuery);
-		if (FAILED(createResult))
-		{
-			cemuLog_log(LogType::Force,
-				"D3D11: GPU-idle wait unavailable (CreateQuery HRESULT 0x{:08X})",
-				static_cast<uint32>(createResult));
-			return false;
-		}
-	}
-
-	// End is ordered after earlier draws. Flush must follow End because GetData
-	// deliberately uses DONOTFLUSH and therefore cannot submit the query itself.
-	m_context->End(m_gpuIdleQuery.Get());
-	m_context->Flush();
-	uint32 spinCount = 0;
-	for (;;)
-	{
-		const HRESULT status = m_context->GetData(m_gpuIdleQuery.Get(), nullptr, 0,
-			D3D11_ASYNC_GETDATA_DONOTFLUSH);
-		if (status == S_OK)
-			return true;
-		if (status != S_FALSE)
-		{
-			if (IsDeviceLostResult(status))
-				RecordDeviceLost(status, "GPU-idle wait");
-			else
-				cemuLog_log(LogType::Force,
-					"D3D11: GPU-idle wait failed with HRESULT 0x{:08X}",
-					static_cast<uint32>(status));
-			return false;
-		}
-		_mm_pause();
-		if ((++spinCount & 0x3FF) == 0)
-			std::this_thread::yield();
-	}
-}
-
 void D3D11Renderer::RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache)
 {
 	int usageInMB = -1;
@@ -612,8 +576,8 @@ void D3D11Renderer::CheckMemoryPressure()
 	int videoUsageMB = -1;
 	int videoBudgetMB = -1;
 	GetVRAMInfo(videoUsageMB, videoBudgetMB);
-	constexpr uint64 softLimitMB = 4096;
-	constexpr uint64 releaseLimitMB = 3968;
+	constexpr uint64 softLimitMB = D3D11ProcessMemoryLimitMB;
+	constexpr uint64 releaseLimitMB = D3D11MemoryReleaseLimitMB;
 	if (processCommitMB < softLimitMB)
 	{
 		if (m_memoryPressureActive && processCommitMB < releaseLimitMB)
@@ -630,13 +594,13 @@ void D3D11Renderer::CheckMemoryPressure()
 	// Waiting for GPU retirement, trimming the driver and compacting the process
 	// heap are deliberately expensive. Repeating that sequence every present
 	// while usage remains inside the hysteresis band causes periodic frame stalls.
-	// Keep the 4096 MiB trigger, but repeat a heavy recovery only after meaningful
+	// Keep the coordinated process-memory trigger, but repeat a heavy recovery only after meaningful
 	// growth, at a slow maintenance interval, or at a guarded emergency cadence.
 	const uint32 framesSinceHeavyRecovery =
 		m_memoryCheckFrame - m_lastHeavyMemoryRecoveryFrame;
 	const bool commitGrewMaterially = m_lastHeavyMemoryRecoveryCommitMB == 0 ||
 		processCommitMB >= m_lastHeavyMemoryRecoveryCommitMB + 128;
-	const bool emergencyPressure = processCommitMB >= 4608;
+	const bool emergencyPressure = processCommitMB >= D3D11EmergencyMemoryMB;
 	const bool shouldRunHeavyRecovery = !m_memoryPressureActive ||
 		(framesSinceHeavyRecovery >= 10 && (commitGrewMaterially || emergencyPressure)) ||
 		framesSinceHeavyRecovery >= 300;

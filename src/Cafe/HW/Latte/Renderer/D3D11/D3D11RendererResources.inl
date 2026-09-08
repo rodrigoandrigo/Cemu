@@ -845,22 +845,70 @@ public:
 		auto* texture = static_cast<D3D11Texture*>(m_view->baseTexture);
 		m_view->PrepareForSampling();
 		texture->AllocateOnHost();
-		if (!texture->Texture2D())
-			throw std::runtime_error("D3D11 readback currently requires a 2D texture view");
-		D3D11_TEXTURE2D_DESC source{};
-		texture->Texture2D()->GetDesc(&source);
-		source.Width = (std::max)(1u, source.Width >> m_view->firstMip);
-		source.Height = (std::max)(1u, source.Height >> m_view->firstMip);
-		source.MipLevels = 1;
-		source.ArraySize = 1;
-		source.Usage = D3D11_USAGE_STAGING;
-		source.BindFlags = 0;
-		source.MiscFlags = 0;
-		source.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-		ThrowIfFailed(m_renderer->GetDevice()->CreateTexture2D(&source, nullptr, &m_staging), "Create readback texture");
 		const UINT subresource = D3D11CalcSubresource(m_view->firstMip, m_view->firstSlice,
 			texture->EffectiveMipLevels());
-		m_renderer->GetContext()->CopySubresourceRegion(m_staging.Get(), 0, 0, 0, 0, texture->Resource(), subresource, nullptr);
+		if (auto* sourceTexture = texture->Texture1D())
+		{
+			D3D11_TEXTURE1D_DESC desc{};
+			sourceTexture->GetDesc(&desc);
+			desc.Width = (std::max)(1u, desc.Width >> m_view->firstMip);
+			desc.MipLevels = desc.ArraySize = 1;
+			desc.Usage = D3D11_USAGE_STAGING;
+			desc.BindFlags = desc.MiscFlags = 0;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			ThrowIfFailed(m_renderer->GetDevice()->CreateTexture1D(&desc, nullptr, &m_staging1D),
+				"Create 1D readback texture");
+			m_staging = m_staging1D;
+			m_width = desc.Width;
+			m_height = m_depth = 1;
+		}
+		else if (auto* sourceTexture = texture->Texture2D())
+		{
+			D3D11_TEXTURE2D_DESC desc{};
+			sourceTexture->GetDesc(&desc);
+			desc.Width = (std::max)(1u, desc.Width >> m_view->firstMip);
+			desc.Height = (std::max)(1u, desc.Height >> m_view->firstMip);
+			desc.MipLevels = desc.ArraySize = 1;
+			desc.Usage = D3D11_USAGE_STAGING;
+			desc.BindFlags = desc.MiscFlags = 0;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			ThrowIfFailed(m_renderer->GetDevice()->CreateTexture2D(&desc, nullptr, &m_staging2D),
+				"Create 2D readback texture");
+			m_staging = m_staging2D;
+			m_width = desc.Width;
+			m_height = desc.Height;
+			m_depth = 1;
+		}
+		else if (auto* sourceTexture = texture->Texture3D())
+		{
+			D3D11_TEXTURE3D_DESC desc{};
+			sourceTexture->GetDesc(&desc);
+			desc.Width = (std::max)(1u, desc.Width >> m_view->firstMip);
+			desc.Height = (std::max)(1u, desc.Height >> m_view->firstMip);
+			const UINT sourceDepth = (std::max)(1u, desc.Depth >> m_view->firstMip);
+			if (m_view->firstSlice >= sourceDepth)
+				throw std::runtime_error("D3D11 readback 3D slice is outside the selected mip");
+			desc.Depth = 1;
+			desc.MipLevels = 1;
+			desc.Usage = D3D11_USAGE_STAGING;
+			desc.BindFlags = desc.MiscFlags = 0;
+			desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+			ThrowIfFailed(m_renderer->GetDevice()->CreateTexture3D(&desc, nullptr, &m_staging3D),
+				"Create 3D readback texture");
+			m_staging = m_staging3D;
+			m_width = desc.Width;
+			m_height = desc.Height;
+			m_depth = 1;
+			D3D11_BOX sliceBox{ 0, 0, m_view->firstSlice, desc.Width, desc.Height,
+				m_view->firstSlice + 1 };
+			m_renderer->GetContext()->CopySubresourceRegion(m_staging.Get(), 0, 0, 0, 0,
+				texture->Resource(), m_view->firstMip, &sliceBox);
+		}
+		else
+			throw std::runtime_error("D3D11 readback received an unsupported texture resource");
+		if (!texture->Texture3D())
+			m_renderer->GetContext()->CopySubresourceRegion(m_staging.Get(), 0, 0, 0, 0,
+				texture->Resource(), subresource, nullptr);
 		D3D11_QUERY_DESC queryDesc{ D3D11_QUERY_EVENT, 0 };
 		ThrowIfFailed(m_renderer->GetDevice()->CreateQuery(&queryDesc, &m_event), "Create readback event");
 		m_renderer->GetContext()->End(m_event.Get());
@@ -873,24 +921,38 @@ public:
 	}
 	void ForceFinish() override
 	{
-		while (m_started && m_renderer->GetContext()->GetData(m_event.Get(), nullptr, 0, 0) == S_FALSE) {}
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+		while (m_started)
+		{
+			const HRESULT status = m_renderer->GetContext()->GetData(m_event.Get(), nullptr, 0,
+				D3D11_ASYNC_GETDATA_DONOTFLUSH);
+			if (status == S_OK)
+				return;
+			if (status != S_FALSE)
+				ThrowIfFailed(status, "Wait for readback event");
+			if (std::chrono::steady_clock::now() >= deadline)
+				throw std::runtime_error("D3D11 texture readback timed out after 5 seconds");
+			std::this_thread::yield();
+		}
 	}
 	uint8* GetData() override
 	{
 		if (!m_started)
 			StartTransfer();
 		ForceFinish();
-		D3D11_TEXTURE2D_DESC desc{};
-		m_staging->GetDesc(&desc);
 		D3D11_MAPPED_SUBRESOURCE mapped{};
 		ThrowIfFailed(m_renderer->GetContext()->Map(m_staging.Get(), 0, D3D11_MAP_READ, 0, &mapped), "Map readback texture");
 		const FormatInfo info = GetFormatInfo(m_view->format, m_view->baseTexture->isDepth);
-		const uint32 rowSize = RowPitch(info, desc.Width);
-		const uint32 rows = RowCount(info, desc.Height);
-		m_data.resize(static_cast<size_t>(rowSize) * rows);
-		for (uint32 row = 0; row < rows; ++row)
-			std::memcpy(m_data.data() + static_cast<size_t>(row) * rowSize,
-				static_cast<const uint8*>(mapped.pData) + static_cast<size_t>(row) * mapped.RowPitch, rowSize);
+		const uint32 rowSize = RowPitch(info, m_width);
+		const uint32 rows = RowCount(info, m_height);
+		const size_t sliceSize = static_cast<size_t>(rowSize) * rows;
+		m_data.resize(sliceSize * m_depth);
+		for (uint32 slice = 0; slice < m_depth; ++slice)
+			for (uint32 row = 0; row < rows; ++row)
+				std::memcpy(m_data.data() + static_cast<size_t>(slice) * sliceSize +
+					static_cast<size_t>(row) * rowSize,
+					static_cast<const uint8*>(mapped.pData) + static_cast<size_t>(slice) * mapped.DepthPitch +
+					static_cast<size_t>(row) * mapped.RowPitch, rowSize);
 		m_renderer->GetContext()->Unmap(m_staging.Get(), 0);
 		return m_data.data();
 	}
@@ -899,7 +961,13 @@ private:
 	D3D11TextureView* m_view;
 	bool m_started{};
 	std::vector<uint8> m_data;
-	ComPtr<ID3D11Texture2D> m_staging;
+	UINT m_width{};
+	UINT m_height{};
+	UINT m_depth{};
+	ComPtr<ID3D11Resource> m_staging;
+	ComPtr<ID3D11Texture1D> m_staging1D;
+	ComPtr<ID3D11Texture2D> m_staging2D;
+	ComPtr<ID3D11Texture3D> m_staging3D;
 	ComPtr<ID3D11Query> m_event;
 };
 

@@ -20,7 +20,15 @@ public:
 	void PreponeCompilation(bool) override
 	{
 		if (m_compilationState.hasState(CompilationState::Done))
+		{
+			if (m_retryableCompilationFailure && !m_source.empty())
+			{
+				m_compilationState.setValue(CompilationState::Compiling);
+				CompileNow();
+				m_compilationState.setValue(CompilationState::Done);
+			}
 			return;
+		}
 		if (D3D11ShaderQueuePromote(this))
 		{
 			CompileNow();
@@ -118,6 +126,7 @@ private:
 		// This lock is shared by foreground promotion and low-priority cache work.
 		std::lock_guard pipelineLock(s_xboxShaderPipelineMutex);
 #endif
+		m_retryableCompilationFailure = false;
 		try
 		{
 			if (m_sourceIsHlsl)
@@ -140,8 +149,11 @@ private:
 		ReleaseTransientBytecode();
 		if (m_compiled.load(std::memory_order_acquire) && m_isGameShader && !m_isCacheRestore)
 			++g_compiled_shaders_total;
-		m_source.clear();
-		m_source.shrink_to_fit();
+		if (!m_retryableCompilationFailure)
+		{
+			m_source.clear();
+			m_source.shrink_to_fit();
+		}
 	}
 
 	struct PixelStreamoutCapturePass
@@ -418,6 +430,44 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 			maxVertices = static_cast<uint32>(std::strtoul(source.c_str() + maxMarker + 13, nullptr, 10));
 
 		std::string hlsl;
+		// Preserve every GLSL uniform block as its own HLSL constant buffer. The
+		// previous syntax path skipped blocks (it only copied scalar uniforms), so
+		// otherwise valid geometry programs lost their cbank data during conversion.
+		size_t blockCursor{};
+		UINT geometryBlockIndex{};
+		while ((blockCursor = source.find("UNIFORM_BUFFER_LAYOUT(", blockCursor)) !=
+			std::string::npos && blockCursor < inputMarker)
+		{
+			UINT glBinding{}, ignoredSet{}, ignoredBinding{};
+			if (std::sscanf(source.c_str() + blockCursor,
+				"UNIFORM_BUFFER_LAYOUT(%u, %u, %u)", &glBinding, &ignoredSet,
+				&ignoredBinding) != 3)
+			{
+				blockCursor += 22;
+				continue;
+			}
+			const size_t open = source.find('{', blockCursor);
+			const size_t close = open == std::string::npos ? std::string::npos :
+				source.find('}', open);
+			if (open == std::string::npos || close == std::string::npos || close > inputMarker)
+				break;
+			const UINT slot = UniformSlot(glBinding);
+			if (slot != InvalidSlot)
+			{
+				std::string declarations = source.substr(open + 1, close - open - 1);
+				static constexpr std::array<std::pair<std::string_view, std::string_view>, 12>
+					blockTypes = {{ { "vec2", "float2" }, { "vec3", "float3" },
+					{ "vec4", "float4" }, { "ivec2", "int2" }, { "ivec3", "int3" },
+					{ "ivec4", "int4" }, { "uvec2", "uint2" }, { "uvec3", "uint3" },
+					{ "uvec4", "uint4" }, { "mat2", "float2x2" },
+					{ "mat3", "float3x3" }, { "mat4", "float4x4" } }};
+				for (const auto& [glsl, hlslType] : blockTypes)
+					ReplaceToken(declarations, glsl, hlslType);
+				hlsl += fmt::format("cbuffer CemuGeometryBlock{} : register(b{})\n{{{}\n}};\n",
+					geometryBlockIndex++, slot, declarations);
+			}
+			blockCursor = close + 1;
+		}
 		struct GeometryTexture { std::string name; std::string dimension; std::string valueType; UINT slot{}; };
 		std::vector<GeometryTexture> geometryTextures;
 		size_t textureCursor{};
@@ -514,6 +564,9 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 		hlsl += "};\nstruct GeometryOutput\n{\n    float4 position : SV_Position;\n";
 		for (const auto& field : outputs)
 			hlsl += fmt::format("    {} {} : TEXCOORD{};\n", field.type, field.name, field.location);
+		const bool writesLayer = source.find("gl_Layer") != std::string::npos;
+		if (writesLayer)
+			hlsl += "    nointerpolation uint layer : SV_RenderTargetArrayIndex;\n";
 		hlsl += "};\nvoid CemuSetPosition(inout float4 target, float4 value) { target=value; target.z=(target.z+target.w)*0.5f; }\n";
 
 		std::string body = source.substr(generatedBodyStart);
@@ -532,6 +585,10 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 		for (const auto& [glsl, hlslName] : replacements)
 			ReplaceToken(body, glsl, hlslName);
 		ReplaceToken(body, "v2g", "inputVertices");
+		ReplaceToken(body, "gl_PrimitiveIDIn", "cemuPrimitiveId");
+		ReplaceToken(body, "gl_InvocationID", "cemuInvocationId");
+		if (writesLayer)
+			ReplaceToken(body, "gl_Layer", "cemuOutput.layer");
 		for (const auto& output : outputs)
 			ReplaceToken(body, output.name, "cemuOutput." + output.name);
 		for (const auto& texture : geometryTextures)
@@ -587,12 +644,24 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 			storageWrite += replacement.size();
 			translatedStreamoutWrites = true;
 		}
+		uint32 invocationCount = 1;
+		const bool usesInvocationId = source.find("gl_InvocationID") != std::string::npos;
+		const size_t invocationsMarker = source.find("invocations=");
+		if (invocationsMarker != std::string::npos)
+			invocationCount = (std::max)(1u, static_cast<uint32>(std::strtoul(
+				source.c_str() + invocationsMarker + 12, nullptr, 10)));
+		const std::string instanceAttribute = usesInvocationId && invocationCount > 1 ?
+			fmt::format("[instance({})]\n", invocationCount) : std::string{};
+		const std::string invocationParameter = usesInvocationId ?
+			", uint cemuInvocationId : SV_GSInstanceID" : std::string{};
 		const std::string signature = fmt::format(
-			"[maxvertexcount({})]\nvoid main({} GeometryInput inputVertices[{}], inout {}<GeometryOutput> outputStream)",
+			"{}[maxvertexcount({})]\nvoid main({} GeometryInput inputVertices[{}], "
+			"uint cemuPrimitiveId : SV_PrimitiveID{}, inout {}<GeometryOutput> outputStream)",
+			instanceAttribute,
 			maxVertices, inputPrimitive,
 			std::string_view(inputPrimitive) == "point" ? 1 : std::string_view(inputPrimitive) == "line" ? 2 :
 			std::string_view(inputPrimitive) == "lineadj" ? 4 : std::string_view(inputPrimitive) == "triangleadj" ? 6 : 3,
-			streamType);
+			invocationParameter, streamType);
 		body.replace(body.find("void main()"), 11, signature);
 		const size_t mainBrace = body.find('{', body.find(signature));
 		body.insert(mainBrace + 1, "\nGeometryOutput cemuOutput = (GeometryOutput)0;");
@@ -1367,6 +1436,8 @@ void main(point GeometryInput inputVertices[1],
 			}
 			if (FAILED(hr))
 			{
+				if (hr == E_OUTOFMEMORY)
+					throw std::bad_alloc{};
 				const char* message = errors ? static_cast<const char*>(errors->GetBufferPointer()) : "unknown HLSL error";
 				throw std::runtime_error(message);
 			}
@@ -1410,7 +1481,8 @@ void main(point GeometryInput inputVertices[1],
 			// On Xbox, D3D11On12, glslang and SPIRV-Cross share the title's
 			// constrained memory budget. Do not invoke the allocating logger here.
 			// The common cache will reject this uncompiled shader safely.
-			OutputDebugStringA("[Cemu/D3D11] Shader compilation skipped: out of memory\n");
+			OutputDebugStringA("[Cemu/D3D11] Shader compilation deferred: out of memory; source retained for retry\n");
+			m_retryableCompilationFailure = true;
 			m_compiled = false;
 		}
 		catch (const std::exception& ex)
@@ -1675,10 +1747,12 @@ struct CaptureInput
 			return false;
 
 #if defined(CEMU_UWP)
-		// Do not create a D3D11 stream-output function on Xbox. xbsc_xs accepts the
-		// object initially, then can remove the D3D12 device while materializing it
-		// on first use. The pixel-UAV replay below uses only FL 11.0 functionality.
-		return CreatePixelStreamoutCaptureShader(device, blocks);
+		// Vertex-only transform feedback uses the pixel-UAV replay. A title geometry
+		// shader cannot be replaced by that helper because its emitted vertices would
+		// be lost. Feature Level 11.0 natively supports geometry stream output, so a
+		// geometry stage continues into the corrected scalar/stride declaration below.
+		if (GetType() == ShaderType::kVertex)
+			return CreatePixelStreamoutCaptureShader(device, blocks);
 #endif
 
 		ComPtr<ID3D11ShaderReflection> reflection;
@@ -1767,6 +1841,7 @@ struct CaptureInput
 	UINT m_samplerSwizzleSlot{ InvalidSlot };
 	bool m_usesRuntimeSwizzle{};
 	bool m_usesStreamoutStorage{};
+	bool m_retryableCompilationFailure{};
 	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_pixelStreamoutCaptureStrides{};
 	std::vector<PixelStreamoutCapturePass> m_pixelStreamoutCapturePasses;
 };

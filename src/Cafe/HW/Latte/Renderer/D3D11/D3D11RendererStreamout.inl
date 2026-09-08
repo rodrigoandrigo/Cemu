@@ -39,6 +39,28 @@ void D3D11Renderer::streamout_begin()
 		m_streamoutActive = true;
 		return;
 	}
+	// A real title GS must remain the stage that emits the stream. Feature Level
+	// 11.0 supports native geometry stream output, and the scalar declaration built
+	// from reflection preserves the exact GX2 buffer strides.
+	if (gsContext && shader && shader->StreamoutGeometry() && hasOutputBuffer)
+	{
+		std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> buffers{};
+		bool hasNativeOutputBuffer = false;
+		for (UINT i = 0; i < buffers.size(); ++i)
+		{
+			buffers[i] = m_streamoutEnabled[i] ? m_streamoutBuffers[i].Get() : nullptr;
+			hasNativeOutputBuffer |= buffers[i] != nullptr;
+		}
+		if (hasNativeOutputBuffer)
+		{
+			m_context->GSSetShader(shader->StreamoutGeometry(), nullptr, 0);
+			m_context->SOSetTargets(static_cast<UINT>(buffers.size()), buffers.data(),
+				m_streamoutOffsets.data());
+			m_streamoutDataAvailable = true;
+			m_streamoutActive = true;
+			return;
+		}
+	}
 #if defined(CEMU_UWP)
 	if (!gsContext && shader && shader->HasPixelStreamoutCapture() && hasOutputBuffer &&
 		m_streamoutStorageBuffer && m_streamoutStorageUav && m_streamoutCaptureTargetView)
@@ -54,7 +76,7 @@ void D3D11Renderer::streamout_begin()
 	if (gsContext)
 	{
 		cemuLog_logOnce(LogType::Force,
-			"D3D11 Xbox stream-output geometry fallback unavailable; native stream output remains disabled");
+			"D3D11 Xbox could not create the reflected Feature Level 11.0 geometry stream-output shader");
 	}
 	else if (!shader || !shader->HasPixelStreamoutCapture())
 	{
@@ -231,6 +253,8 @@ bool D3D11Renderer::ExecutePixelStreamoutCapture(uint32 baseVertex, uint32 baseI
 
 	ID3D11RenderTargetView* target = m_streamoutCaptureTargetView.Get();
 	ID3D11UnorderedAccessView* streamoutUav = m_streamoutStorageUav.Get();
+	if (m_context1 && target)
+		m_context1->DiscardView(target);
 	m_context->OMSetRenderTargetsAndUnorderedAccessViews(1, &target, nullptr,
 		StreamoutPixelCaptureUavSlot, 1, &streamoutUav, nullptr);
 	const D3D11_VIEWPORT viewport{ 0.0f, 0.0f,

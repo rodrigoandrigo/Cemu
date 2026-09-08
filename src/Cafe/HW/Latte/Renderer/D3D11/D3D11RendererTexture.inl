@@ -24,7 +24,11 @@ TextureDecoder* D3D11Renderer::texture_chooseDecodedFormat(Latte::E_GX2SURFFMT f
 		if (format == F::D24_S8_FLOAT) return TextureDecoder_NullData64::getInstance();
 		if (format == F::D32_S8_FLOAT) return TextureDecoder_D32_S8_UINT_X24::getInstance();
 		if (format == F::D16_UNORM || format == F::R16_UNORM) return TextureDecoder_R16_UNORM::getInstance();
-		return TextureDecoder_R32_FLOAT::getInstance();
+		if (format == F::D32_FLOAT || format == F::R32_FLOAT) return TextureDecoder_R32_FLOAT::getInstance();
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 unsupported depth format 0x{:02X}; texture will be cleared instead of silently reinterpreted",
+			static_cast<uint32>(format));
+		return nullptr;
 	}
 	switch (format)
 	{
@@ -72,7 +76,11 @@ TextureDecoder* D3D11Renderer::texture_chooseDecodedFormat(Latte::E_GX2SURFFMT f
 	case F::R24_X8_UNORM: return TextureDecoder_R24_X8::getInstance();
 	case F::X24_G8_UINT: return TextureDecoder_X24_G8_UINT::getInstance();
 	case F::R24_X8_FLOAT: case F::R32_X8_FLOAT: return TextureDecoder_NullData64::getInstance();
-	default: return TextureDecoder_R8_G8_B8_A8::getInstance();
+	default:
+		cemuLog_logOnce(LogType::Force,
+			"D3D11 unsupported GX2 texture format 0x{:08X}; texture data will not be "
+			"silently reinterpreted as RGBA8", static_cast<uint32>(format));
+		return nullptr;
 	}
 }
 
@@ -301,8 +309,19 @@ ID3D11SamplerState* D3D11Renderer::GetSamplerState(LatteDecompilerShader* shader
 	if (found != m_samplerCache.end())
 		return found->second.Get();
 	ComPtr<ID3D11SamplerState> state;
-	if (FAILED(m_device->CreateSamplerState(&desc, &state)))
-		return m_presentSampler.Get();
+	const HRESULT createResult = m_device->CreateSamplerState(&desc, &state);
+	if (FAILED(createResult))
+	{
+		if (IsDeviceLostResult(createResult))
+			RecordDeviceLost(createResult, "CreateSamplerState");
+		else
+			cemuLog_log(LogType::Force,
+				"D3D11: CreateSamplerState failed with HRESULT 0x{:08X}; the requested sampler will remain unbound",
+				static_cast<uint32>(createResult));
+		// Never substitute the presentation sampler: its linear clamp state is not
+		// semantically equivalent to the GX2 sampler and causes silent corruption.
+		return nullptr;
+	}
 	return m_samplerCache.emplace(key, std::move(state)).first->second.Get();
 }
 
@@ -358,13 +377,20 @@ void D3D11Renderer::texture_setLatteTexture(LatteTextureView* textureView, uint3
 		}
 		ID3D11SamplerState* sampler = textureView ?
 			GetSamplerState(shader, textureIndex, textureView->baseTexture) : nullptr;
-		setResources(binding, &srv);
 		if (binding < m_boundShaderResources[stageIndex].size())
 		{
-			m_boundShaderResources[stageIndex][binding] = srv;
+			if (m_boundShaderResources[stageIndex][binding].Get() != srv)
+			{
+				setResources(binding, &srv);
+				m_boundShaderResources[stageIndex][binding] = srv;
+			}
 			m_logicalShaderResources[stageIndex][binding] = srv;
+			if (m_boundSamplers[stageIndex][binding].Get() != sampler)
+			{
+				setSamplers(binding, &sampler);
+				m_boundSamplers[stageIndex][binding] = sampler;
+			}
 		}
-		setSamplers(binding, &sampler);
 	};
 	if (unit < LATTE_CEMU_VS_TEX_UNIT_BASE)
 	{

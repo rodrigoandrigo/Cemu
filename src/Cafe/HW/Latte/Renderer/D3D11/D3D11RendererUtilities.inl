@@ -186,6 +186,15 @@ std::string ForceDynamicHlslLoops(const std::string& source)
 // same amount in the Series S process address space.
 constexpr uint64 D3D11ShaderCacheBudgetBytes = 512ull * 1024 * 1024;
 
+// Xbox grants the title roughly 5120 MiB. Keep the renderer's coordinated
+// process-memory guards below that hard boundary while allowing substantially
+// more of the available budget to be used.
+constexpr uint64 D3D11ProcessMemoryLimitMB = 5020;
+constexpr uint64 D3D11ShaderResumeMemoryMB = 4706;
+constexpr uint64 D3D11MemoryReleaseLimitMB = 4863;
+constexpr uint64 D3D11EmergencyMemoryMB = 5080;
+constexpr uint64 D3D11CompilerCompactMemoryMB = 3765;
+
 bool ValidateDxbcContainer(const void* data, size_t size)
 {
 	if (!data || size < 32 || size > D3D11ShaderCacheBudgetBytes)
@@ -381,18 +390,18 @@ HRESULT CompileHLSLCached(const void* source, size_t sourceSize, const char* pro
 	// slower than the compilation. Keep periodic compaction and immediately use it
 	// whenever commitment approaches the compiler's transient-risk range.
 	if (((++xboxCacheMissCount & 15u) == 1u) ||
-		preCompileCommitBytes >= 3072ull * 1024 * 1024)
+		preCompileCommitBytes >= D3D11CompilerCompactMemoryMB * 1024 * 1024)
 		HeapCompact(GetProcessHeap(), 0);
 	// A cache hit above remains safe and avoids invoking the Xbox compiler. For
 	// a cache miss, reserve ample space below the title cap for xbsc_xs.dll's
 	// transient working set. Series S traces showed one compilation interval grow
 	// PrivateUsage by well over 1 GiB before the compiler faulted.
-	constexpr uint64 shaderCompilerStopBytes = 4096ull * 1024 * 1024;
+	constexpr uint64 shaderCompilerStopBytes = D3D11ProcessMemoryLimitMB * 1024 * 1024;
 	if (QueryProcessPrivateCommitBytes() >= shaderCompilerStopBytes)
 	{
 		OutputDebugStringA(
-			"[Cemu/D3D11] HLSL compilation skipped to preserve Series S memory headroom\n");
-		return E_OUTOFMEMORY;
+			"[Cemu/D3D11] HLSL compilation continuing after emergency heap compaction; shader will not be discarded\n");
+		HeapCompact(GetProcessHeap(), 0);
 	}
 #endif
 

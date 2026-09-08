@@ -77,13 +77,47 @@ void D3D11Renderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 offset
 		static_cast<uint64>(offset) + static_cast<uint32>(size) > m_bufferCacheShadow.size())
 		return;
 	std::memcpy(m_bufferCacheShadow.data() + offset, buffer, size);
-	D3D11_BOX box{ offset, 0, 0, offset + static_cast<UINT>(size), 1, 1 };
+	UINT first = offset;
+	UINT last = offset + static_cast<UINT>(size);
+	// D3D11On12 records each UpdateSubresource as copy work. Merge overlapping or
+	// nearby writes in the CPU mirror and submit them immediately before the first
+	// GPU consumer instead of tokenizing every small Latte cache update.
+	// Do not bridge unwritten gaps: a gap may contain transform-feedback bytes
+	// that are authoritative only on the GPU and therefore stale in this mirror.
+	constexpr UINT mergeGap = 0;
+	for (auto it = m_bufferCacheDirtyRanges.begin(); it != m_bufferCacheDirtyRanges.end();)
 	{
-		D3D11_DRIVER_TRACE(fmt::format(
-			"UpdateSubresource buffer-cache offset={} size={} source={}",
-			offset, size, static_cast<const void*>(buffer)));
-		m_context->UpdateSubresource(m_bufferCache.Get(), 0, &box, buffer, 0, 0);
+		if (static_cast<uint64>(last) + mergeGap < it->first ||
+			static_cast<uint64>(it->second) + mergeGap < first)
+		{
+			++it;
+			continue;
+		}
+		first = (std::min)(first, it->first);
+		last = (std::max)(last, it->second);
+		it = m_bufferCacheDirtyRanges.erase(it);
 	}
+	m_bufferCacheDirtyRanges.emplace_back(first, last);
+	// Bound bookkeeping in pathological workloads without uploading untouched
+	// gaps whose GPU contents may have been produced by stream output.
+	if (m_bufferCacheDirtyRanges.size() > 64)
+		FlushBufferCacheUploads();
+}
+
+void D3D11Renderer::FlushBufferCacheUploads()
+{
+	if (!m_bufferCache || m_bufferCacheDirtyRanges.empty())
+		return;
+	std::sort(m_bufferCacheDirtyRanges.begin(), m_bufferCacheDirtyRanges.end());
+	for (const auto& [first, last] : m_bufferCacheDirtyRanges)
+	{
+		if (first >= last || last > m_bufferCacheShadow.size())
+			continue;
+		D3D11_BOX box{ first, 0, 0, last, 1, 1 };
+		m_context->UpdateSubresource(m_bufferCache.Get(), 0, &box,
+			m_bufferCacheShadow.data() + first, 0, 0);
+	}
+	m_bufferCacheDirtyRanges.clear();
 }
 
 void D3D11Renderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 size)
@@ -92,6 +126,7 @@ void D3D11Renderer::bufferCache_copy(uint32 srcOffset, uint32 dstOffset, uint32 
 		static_cast<uint64>(srcOffset) + size > m_bufferCacheShadow.size() ||
 		static_cast<uint64>(dstOffset) + size > m_bufferCacheShadow.size())
 		return;
+	FlushBufferCacheUploads();
 	if (!m_bufferCopyScratch || m_bufferCopyScratchCapacity < size)
 	{
 		UINT newCapacity = m_bufferCopyScratchCapacity ? m_bufferCopyScratchCapacity : 256u * 1024u;
@@ -139,6 +174,7 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 		static_cast<uint64>(src) + size > static_cast<uint32>(LatteStreamout_GetRingBufferSize()) ||
 		static_cast<uint64>(dst) + size > m_bufferCacheShadow.size())
 		return;
+	FlushBufferCacheUploads();
 	if (m_streamoutActive)
 	{
 		if (m_streamoutUsesStorage)
@@ -201,10 +237,16 @@ void D3D11Renderer::buffer_bindVertexBuffer(uint32 index, uint32 offset, uint32 
 		return;
 	const bool validRange = size != 0 &&
 		static_cast<uint64>(offset) + size <= m_bufferCacheShadow.size();
-	m_vertexBuffers[index] = validRange ? m_bufferCache : nullptr;
-	m_vertexOffsets[index] = offset;
 	const uint32* regs = LatteGPUState.contextRegister + mmSQ_VTX_ATTRIBUTE_BLOCK_START + index * 7;
-	m_vertexStrides[index] = (regs[2] >> 11) & 0xFFFF;
+	const UINT stride = (regs[2] >> 11) & 0xFFFF;
+	ID3D11Buffer* requestedBuffer = validRange ? m_bufferCache.Get() : nullptr;
+	if (m_vertexBindingValid[index] && m_vertexBuffers[index].Get() == requestedBuffer &&
+		m_vertexOffsets[index] == offset && m_vertexStrides[index] == stride)
+		return;
+	m_vertexBuffers[index] = requestedBuffer;
+	m_vertexOffsets[index] = offset;
+	m_vertexStrides[index] = stride;
+	m_vertexBindingValid[index] = true;
 	ID3D11Buffer* buffer = m_vertexBuffers[index].Get();
 	m_context->IASetVertexBuffers(index, 1, &buffer, &m_vertexStrides[index], &m_vertexOffsets[index]);
 }
@@ -283,9 +325,26 @@ void D3D11Renderer::buffer_bindUniformBuffer(LatteConst::ShaderType stage, uint3
 		nativeShader->UniformSlot(static_cast<UINT>(originalBinding)) : D3D11Shader::InvalidSlot;
 	if (binding == D3D11Shader::InvalidSlot)
 		return;
-	if (stage == LatteConst::ShaderType::Vertex) m_context->VSSetConstantBuffers(binding, 1, &native);
-	else if (stage == LatteConst::ShaderType::Pixel) m_context->PSSetConstantBuffers(binding, 1, &native);
-	else if (stage == LatteConst::ShaderType::Geometry) m_context->GSSetConstantBuffers(binding, 1, &native);
+	BindConstantBuffer(stage, binding, native);
+}
+
+void D3D11Renderer::BindConstantBuffer(LatteConst::ShaderType stage, UINT binding,
+	ID3D11Buffer* buffer)
+{
+	const uint32 stageIndex = static_cast<uint32>(stage);
+	if (stageIndex >= m_boundConstantBuffers.size() ||
+		binding >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT)
+		return;
+	auto& current = m_boundConstantBuffers[stageIndex][binding];
+	if (current.Get() == buffer)
+		return;
+	if (stage == LatteConst::ShaderType::Vertex)
+		m_context->VSSetConstantBuffers(binding, 1, &buffer);
+	else if (stage == LatteConst::ShaderType::Pixel)
+		m_context->PSSetConstantBuffers(binding, 1, &buffer);
+	else if (stage == LatteConst::ShaderType::Geometry)
+		m_context->GSSetConstantBuffers(binding, 1, &buffer);
+	current = buffer;
 }
 
 RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, uint64 baseHash,
@@ -314,24 +373,19 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 	{
 		if (m_deviceLost.load(std::memory_order_relaxed))
 			return nullptr;
-		constexpr uint64 resumeCompileMB = 3840;
-		constexpr uint64 stopCompileMB = 4096;
+		constexpr uint64 stopCompileMB = D3D11ProcessMemoryLimitMB;
 		uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
-		if (m_shaderCompilationBlocked.load(std::memory_order_relaxed))
-		{
-			if (commitMB < resumeCompileMB)
-				m_shaderCompilationBlocked.store(false, std::memory_order_relaxed);
-			else
-				return nullptr;
-		}
 		if (commitMB >= stopCompileMB)
 		{
 			cemuLog_log(LogType::Force,
-				"D3D11 Series S shader compilation paused at {} MB process commit "
-				"after {} compiled shaders",
+				"D3D11 Series S shader compilation reached {} MB process commit "
+				"after {} compiled shaders; retiring GPU work and trimming before compilation",
 				commitMB, m_compiledShaderCount.load(std::memory_order_relaxed));
-			m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
-			return nullptr;
+			RecoverFromMemoryPressure("shader", false);
+			HeapCompact(GetProcessHeap(), 0);
+			// Never turn memory pressure into a permanently missing renderer shader.
+			// The current draw may be retried by the common shader layer if the actual
+			// allocation still fails, but reaching the guard alone no longer drops it.
 		}
 	}
 #endif
@@ -364,9 +418,8 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 	{
 #if defined(CEMU_UWP)
 		HeapCompact(GetProcessHeap(), 0);
-		m_shaderCompilationBlocked.store(true, std::memory_order_relaxed);
 #endif
-		OutputDebugStringA("[Cemu/D3D11] Shader creation skipped: out of memory\n");
+		OutputDebugStringA("[Cemu/D3D11] Shader creation deferred after allocation failure; it remains eligible for retry\n");
 		return nullptr;
 	}
 	catch (const std::exception& ex)
@@ -393,30 +446,3 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 	}
 }
 
-void D3D11Renderer::RecordDeviceLost(HRESULT result, const char* operation)
-{
-	bool expected = false;
-	if (!m_deviceLost.compare_exchange_strong(expected, true, std::memory_order_relaxed))
-		return;
-	const HRESULT reason = m_device ? m_device->GetDeviceRemovedReason() : result;
-	cemuLog_log(LogType::Force,
-		"D3D11 Series S device removed during {} (HRESULT 0x{:08X}, reason 0x{:08X}); "
-		"stopping further driver calls; active shaders VS {:016x}_{:016x}, "
-		"PS {:016x}_{:016x}, GS {:016x}_{:016x}",
-		operation ? operation : "GPU operation", static_cast<uint32>(result),
-		static_cast<uint32>(FAILED(reason) ? reason : result),
-		m_lastVertexShaderBase, m_lastVertexShaderAux,
-		m_lastPixelShaderBase, m_lastPixelShaderAux,
-		m_lastGeometryShaderBase, m_lastGeometryShaderAux);
-}
-
-bool D3D11Renderer::CheckDeviceHealth(const char* operation)
-{
-	if (m_deviceLost.load(std::memory_order_relaxed))
-		return false;
-	const HRESULT reason = m_device->GetDeviceRemovedReason();
-	if (SUCCEEDED(reason))
-		return true;
-	RecordDeviceLost(reason, operation);
-	return false;
-}

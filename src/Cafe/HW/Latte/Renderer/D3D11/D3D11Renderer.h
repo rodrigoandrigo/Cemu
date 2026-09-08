@@ -3,6 +3,7 @@
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d11sdklayers.h>
 #include <dxgi1_4.h>
 #include <wrl/client.h>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 class D3D11Renderer final : public Renderer
@@ -113,6 +115,7 @@ private:
 	void UpdateSamplerSwizzleBuffer(class LatteDecompilerShader* shader);
 	bool UpdateDynamicConstantBuffer(Microsoft::WRL::ComPtr<ID3D11Buffer>& buffer,
 		UINT& capacity, const void* data, UINT size);
+	void BindConstantBuffer(LatteConst::ShaderType stage, UINT binding, ID3D11Buffer* buffer);
 	void ApplyPipelineState();
 	void HandleSpecialState5();
 	void CheckDebugMessages(const char* scope);
@@ -124,6 +127,7 @@ private:
 		ID3D11DepthStencilView* depth);
 	void InvalidateNativePipelineState();
 	void RecoverFromMemoryPressure(const char* resourceName, bool evictIndexCache);
+	void FlushBufferCacheUploads();
 	void CheckMemoryPressure();
 	bool WaitForGpuIdle();
 	bool CheckDeviceHealth(const char* operation);
@@ -146,10 +150,13 @@ private:
 
 	Microsoft::WRL::ComPtr<ID3D11Device> m_device;
 	Microsoft::WRL::ComPtr<ID3D11DeviceContext> m_context;
+	Microsoft::WRL::ComPtr<ID3D11DeviceContext1> m_context1;
 	Microsoft::WRL::ComPtr<ID3D11InfoQueue> m_infoQueue;
 	Microsoft::WRL::ComPtr<IDXGISwapChain> m_swapChain;
 	Microsoft::WRL::ComPtr<ID3D11Texture2D> m_backBuffer;
 	Microsoft::WRL::ComPtr<ID3D11RenderTargetView> m_backBufferView;
+	UINT m_backBufferWidth{};
+	UINT m_backBufferHeight{};
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCache;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_bufferCopyScratch;
 	Microsoft::WRL::ComPtr<ID3D11Buffer> m_indexRingBuffer;
@@ -166,10 +173,15 @@ private:
 	UINT m_streamoutCaptureConstantsCapacity{};
 	UINT m_streamoutCaptureRecordMapCapacity{};
 	std::vector<uint8> m_bufferCacheShadow;
+	std::vector<std::pair<UINT, UINT>> m_bufferCacheDirtyRanges;
 	std::vector<uint8> m_uploadBuffer;
 	std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>, Latte::GPU_LIMITS::NUM_TEXTURES_PER_STAGE * 3> m_boundTextures{};
 	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>,
 		D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3> m_boundShaderResources{};
+	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11SamplerState>,
+		D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT>, 3> m_boundSamplers{};
+	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>,
+		D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT>, 3> m_boundConstantBuffers{};
 	// Keep the emulated binding separate from the physical SRV installed on the
 	// immediate context. Feedback-loop resolution may temporarily bind a snapshot;
 	// overwriting the logical entry made subsequent draws keep sampling stale data.
@@ -178,6 +190,7 @@ private:
 	std::array<UINT, 16> m_vertexOffsets{};
 	std::array<UINT, 16> m_vertexStrides{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 16> m_vertexBuffers{};
+	std::array<bool, 16> m_vertexBindingValid{};
 	std::array<std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBuffers{};
 	std::array<std::array<UINT, LATTE_NUM_MAX_UNIFORM_BUFFERS>, 3> m_uniformBufferCapacity{};
 	std::array<Microsoft::WRL::ComPtr<ID3D11Buffer>, 3> m_uniformVarsBuffers{};
@@ -263,7 +276,6 @@ private:
 	std::atomic<uint32> m_compiledShaderCount{};
 	std::atomic_bool m_deviceLost{};
 	bool m_memoryPressureActive{};
-	std::atomic_bool m_shaderCompilationBlocked{};
 	bool m_inputLayoutKeyValid{};
 	bool m_imguiInitialized{};
 	bool m_debugModeEnabled{};

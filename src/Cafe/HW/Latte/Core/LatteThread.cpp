@@ -300,6 +300,11 @@ void Latte_Stop()
 	sLatteThread.join();
 }
 
+void Latte_RequestStopFromGPU()
+{
+	sLatteThreadRunning.store(false, std::memory_order_release);
+}
+
 bool Latte_GetStopSignal()
 {
 	return !sLatteThreadRunning;

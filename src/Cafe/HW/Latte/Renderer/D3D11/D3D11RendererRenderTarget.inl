@@ -84,6 +84,12 @@ void D3D11Renderer::InvalidateNativePipelineState()
 	m_appliedPrimitiveTopology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
 	m_appliedViewportValid = false;
 	m_appliedScissorValid = false;
+	// Internal presentation/copy passes bind their own samplers. Forget the
+	// filtered application state so the next GX2 rebuild emits the real bindings.
+	for (auto& stage : m_boundSamplers)
+		stage.fill(nullptr);
+	for (auto& stage : m_boundConstantBuffers)
+		stage.fill(nullptr);
 }
 
 bool D3D11Renderer::ResolveTextureFeedbackLoops(
@@ -117,7 +123,7 @@ bool D3D11Renderer::ResolveTextureFeedbackLoops(
 	// A feedback snapshot duplicates the complete native texture. Under pressure,
 	// let D3D11 null the conflicting SRV when the output merger is rebound. A
 	// localized missing sample is preferable to crossing the Series S title cap.
-	constexpr uint64 feedbackSnapshotStopBytes = 4096ull * 1024 * 1024;
+	constexpr uint64 feedbackSnapshotStopBytes = D3D11ProcessMemoryLimitMB * 1024 * 1024;
 	if (QueryProcessPrivateCommitBytes() >= feedbackSnapshotStopBytes)
 	{
 		m_feedbackSnapshots.clear();
@@ -239,7 +245,8 @@ bool D3D11Renderer::ResolveTextureFeedbackLoops(
 			if (!conflict)
 			{
 				ID3D11ShaderResourceView* original = logical.Get();
-				setResources(slot, &original);
+				if (physicalStage[slot].Get() != original)
+					setResources(slot, &original);
 				physicalStage[slot] = logical;
 				continue;
 			}

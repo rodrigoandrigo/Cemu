@@ -208,15 +208,25 @@ bool D3D11Renderer::UpdateDynamicConstantBuffer(ComPtr<ID3D11Buffer>& buffer,
 		desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 		ComPtr<ID3D11Buffer> replacement;
-		if (FAILED(m_device->CreateBuffer(&desc, nullptr, &replacement)))
+		const HRESULT createResult = m_device->CreateBuffer(&desc, nullptr, &replacement);
+		if (FAILED(createResult))
+		{
+			if (IsDeviceLostResult(createResult))
+				RecordDeviceLost(createResult, "Create dynamic constant buffer");
 			return false;
+		}
 		buffer = std::move(replacement);
 		capacity = newCapacity;
 	}
 
 	D3D11_MAPPED_SUBRESOURCE mapped{};
-	if (FAILED(m_context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+	const HRESULT mapResult = m_context->Map(buffer.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+	if (FAILED(mapResult))
+	{
+		if (IsDeviceLostResult(mapResult))
+			RecordDeviceLost(mapResult, "Map dynamic constant buffer");
 		return false;
+	}
 	std::memcpy(mapped.pData, data, size);
 	if (required > size)
 		std::memset(static_cast<uint8*>(mapped.pData) + size, 0, required - size);
@@ -328,9 +338,7 @@ void D3D11Renderer::UpdateUniformVars(LatteDecompilerShader* shader, uint32 vert
 		nativeShader->UniformSlot(static_cast<UINT>(originalBinding)) : D3D11Shader::InvalidSlot;
 	if (binding == D3D11Shader::InvalidSlot)
 		return;
-	if (shader->shaderType == LatteConst::ShaderType::Vertex) m_context->VSSetConstantBuffers(binding, 1, &buffer);
-	else if (shader->shaderType == LatteConst::ShaderType::Pixel) m_context->PSSetConstantBuffers(binding, 1, &buffer);
-	else if (shader->shaderType == LatteConst::ShaderType::Geometry) m_context->GSSetConstantBuffers(binding, 1, &buffer);
+	BindConstantBuffer(shader->shaderType, binding, buffer);
 }
 
 void D3D11Renderer::UpdateSamplerSwizzleBuffer(LatteDecompilerShader* shader)
@@ -355,12 +363,7 @@ void D3D11Renderer::UpdateSamplerSwizzleBuffer(LatteDecompilerShader* shader)
 		m_samplerSwizzleUploaded[stage] = true;
 	}
 	ID3D11Buffer* buffer = m_samplerSwizzleBuffers[stage].Get();
-	if (shader->shaderType == LatteConst::ShaderType::Vertex)
-		m_context->VSSetConstantBuffers(binding, 1, &buffer);
-	else if (shader->shaderType == LatteConst::ShaderType::Pixel)
-		m_context->PSSetConstantBuffers(binding, 1, &buffer);
-	else if (shader->shaderType == LatteConst::ShaderType::Geometry)
-		m_context->GSSetConstantBuffers(binding, 1, &buffer);
+	BindConstantBuffer(shader->shaderType, binding, buffer);
 }
 
 bool D3D11Renderer::UpdateInputLayout()
@@ -821,6 +824,7 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		drawcallContext.isFirst ? 0xFFFFFFFF : drawcallContext.psUniformBufferDirtyMask,
 		drawcallContext.isFirst ? 0xFFFFFFFF : drawcallContext.gsUniformBufferDirtyMask,
 		stageUniformModifiedMask, !drawcallContext.isFirst);
+	FlushBufferCacheUploads();
 	LatteRenderTarget_updateViewport();
 	LatteRenderTarget_updateScissorBox();
 	if (!rebuildGraphicsState && m_activeFbo && m_activeFeedbackLoop)

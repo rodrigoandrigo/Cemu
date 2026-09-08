@@ -80,20 +80,12 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 
 	if (m_indexRingOffset > m_indexRingCapacity - alignedSize)
 	{
-		// D3D11 permits DISCARD to rename the allocation, but the Xbox D3D11On12
-		// path can still have translated draws consuming the previous backing store.
-		// Retire that work before reusing offset zero; otherwise a quad can combine
-		// new and old indices and expand into the long triangles seen in gameplay.
+		// D3D11On12 implements WRITE_DISCARD as RenameAndMapBuffer: preceding draws
+		// retain the old backing allocation while this map receives fresh storage.
+		// Invalidate Cemu's offset cache because its entries refer to the previous
+		// generation, but never serialize the entire GPU merely to wrap the ring.
 		m_context->IASetIndexBuffer(nullptr, DXGI_FORMAT_UNKNOWN, 0);
 		LatteIndices_invalidateAll();
-		if (!WaitForGpuIdle())
-		{
-			cemuLog_log(LogType::Force,
-				"D3D11 index upload skipped: GPU did not retire before ring wrap");
-			delete data;
-			allocation = {};
-			return;
-		}
 		m_indexRingOffset = 0;
 		++m_indexRingWrapCount;
 	}
@@ -104,6 +96,8 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 	const HRESULT mapResult = m_context->Map(m_indexRingBuffer.Get(), 0, mapMode, 0, &mapped);
 	if (FAILED(mapResult))
 	{
+		if (IsDeviceLostResult(mapResult))
+			RecordDeviceLost(mapResult, "Map index ring buffer");
 		cemuLog_log(LogType::Force,
 			"D3D11 index upload skipped: ring Map failed with HRESULT 0x{:08X} for {} bytes",
 			static_cast<uint32>(mapResult), dataSize);
@@ -126,5 +120,7 @@ void D3D11Renderer::indexData_uploadIndexMemory(IndexAllocation& allocation)
 
 LatteQueryObject* D3D11Renderer::occlusionQuery_create() { return new D3D11Query(m_device.Get(), m_context.Get()); }
 void D3D11Renderer::occlusionQuery_destroy(LatteQueryObject* query) { delete query; }
-void D3D11Renderer::occlusionQuery_flush() { Flush(true); }
+// Submission is sufficient: GetData polls the individual query. Waiting for
+// every unrelated command defeats D3D11On12's batched query resolution.
+void D3D11Renderer::occlusionQuery_flush() { Flush(false); }
 void D3D11Renderer::occlusionQuery_updateState() {}

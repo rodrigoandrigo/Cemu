@@ -1243,10 +1243,11 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetSurface(CemuEmbedInstanc
 	const auto state = instance->state.load(std::memory_order_acquire);
 	if (state == CEMU_EMBED_STATE_STOPPING || state == CEMU_EMBED_STATE_STOPPED || state == CEMU_EMBED_STATE_FAILED)
 		return CEMU_EMBED_INVALID_STATE;
-	if (state == CEMU_EMBED_STATE_CREATED)
-		WindowSystem::SetEmbeddedSurface(surface->window, surface->canvas, surface->width, surface->height, surface->dpi_scale);
-	else
-		WindowSystem::ResizeEmbeddedSurface(surface->width, surface->height, surface->dpi_scale);
+	// Republish the opaque canvas as well as its dimensions. Device-loss recovery
+	// replaces the host-owned D3D11 surface while the embedded instance remains
+	// alive; merely resizing here left the renderer pointing at the removed device.
+	WindowSystem::SetEmbeddedSurface(surface->window, surface->canvas, surface->width,
+		surface->height, surface->dpi_scale);
 	instance->surfaceConfigured.store(true, std::memory_order_release);
 	return CEMU_EMBED_OK;
 }
@@ -2752,6 +2753,18 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ImportKeys(
 }
 extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_Pump(CemuEmbedInstance* instance) {
 	if (!instance) return CEMU_EMBED_INVALID_ARGUMENT;
+	std::string deviceLostMessage;
+	if (CemuRuntime::ConsumeGraphicsDeviceLost(deviceLostMessage)) {
+		// Complete the normal title teardown on the host thread after the Latte
+		// thread has stopped itself. The embedded instance remains reusable; once
+		// the host republishes its replacement surface, the next launch constructs
+		// a fresh renderer and reloads every GPU resource.
+		if (CafeSystem::IsTitleRunning())
+			CafeSystem::ShutdownTitle();
+		ReportError(instance, CEMU_EMBED_LAUNCH_FAILED, deviceLostMessage.c_str());
+		SetState(instance, CEMU_EMBED_STATE_READY);
+		return CEMU_EMBED_OK;
+	}
 	if (CemuRuntime::HasOutOfMemory()) {
 		ReportError(instance, CEMU_EMBED_INITIALIZATION_FAILED,
 			"Cemu exhausted the Xbox shared memory budget while running the title.");

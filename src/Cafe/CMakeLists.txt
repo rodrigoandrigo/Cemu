@@ -686,14 +686,15 @@ if (ENABLE_D3D11)
     HW/Latte/Renderer/D3D11/D3D11RendererDraw.inl
     HW/Latte/Renderer/D3D11/D3D11RendererQuery.inl
   )
-  # These sections intentionally form one translation unit. Native D3D11
-  # resource types are shared through an anonymous namespace, so compiling the
-  # sections independently would create different C++ types in each object.
+  # Resource/shader implementation sections still share internal types, while
+  # independent renderer services are compiled as real translation units.
   set_source_files_properties(${D3D11_RENDERER_IMPLEMENTATION}
     PROPERTIES HEADER_FILE_ONLY TRUE
   )
   target_sources(CemuCafe PRIVATE
     HW/Latte/Renderer/D3D11/D3D11Renderer.cpp
+    HW/Latte/Renderer/D3D11/D3D11RendererDiagnostics.cpp
+    HW/Latte/Renderer/D3D11/D3D11RendererSynchronization.cpp
     HW/Latte/Renderer/D3D11/D3D11Renderer.h
     ${D3D11_RENDERER_IMPLEMENTATION}
   )

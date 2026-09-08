@@ -183,5 +183,8 @@ void LatteRenderTarget_updateViewport();
 // Latte emulation control
 void Latte_Start();
 void Latte_Stop();
+// May be called by the GPU thread itself. Unlike Latte_Stop(), this only
+// publishes the stop signal and never attempts to join the current thread.
+void Latte_RequestStopFromGPU();
 bool Latte_GetStopSignal(); // returns true if stop was requested or if in stopped state
 void LatteThread_Exit();
