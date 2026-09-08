@@ -1,6 +1,7 @@
 #include "Cemu/CemuEmbed.h"
 
 #include "Cemu/Logging/CemuLogging.h"
+#include "Cemu/FileCache/FileCache.h"
 #include "config/ActiveSettings.h"
 #include "config/CemuConfig.h"
 #include "config/NetworkSettings.h"
@@ -12,6 +13,7 @@
 #include "Cafe/OS/libs/nsyshid/Dimensions.h"
 #include "Cafe/Filesystem/FST/KeyCache.h"
 #include "Cafe/Filesystem/fscDeviceBrokered.h"
+#include "Cafe/Filesystem/fsc.h"
 #include "Common/CemuRuntime.h"
 #include "Common/FileStream.h"
 #include "Common/VirtualFile.h"
@@ -20,6 +22,7 @@
 #include "input/api/Controller.h"
 #include "input/api/UWP/UWPGamepadController.h"
 #include "interface/WindowSystem.h"
+#include "util/helpers/helpers.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1565,6 +1568,18 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateInstalledTitles(
 		const auto aoc = gameInfo.GetAOC();
 		const auto [compatibleGraphicPacks, enabledGraphicPacks] =
 			CountGraphicPacksForTitle(baseTitleId);
+		std::optional<std::vector<uint8>> iconData;
+		const std::string iconMountPath = TitleInfo::GetUniqueTempMountingPath();
+		if (base.Mount(iconMountPath, "", FSC_PRIORITY_BASE)) {
+			iconData = fsc_extractFile((iconMountPath + "/meta/iconTex.tga").c_str());
+			if (!iconData) {
+				auto compressedIcon = fsc_extractFile(
+					(iconMountPath + "/meta/iconTex.tga.gz").c_str());
+				if (compressedIcon)
+					iconData = zlibDecompress(*compressedIcon, 70 * 1024);
+			}
+			base.Unmount(iconMountPath);
+		}
 		CemuEmbedInstalledTitle record{
 			sizeof(CemuEmbedInstalledTitle),
 			CEMU_EMBED_LIBRARY_VERSION,
@@ -1578,7 +1593,9 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_EnumerateInstalledTitles(
 			name.c_str(),
 			region.c_str(),
 			compatibleGraphicPacks,
-			enabledGraphicPacks
+			enabledGraphicPacks,
+			iconData && !iconData->empty() ? iconData->data() : nullptr,
+			iconData ? static_cast<uint32_t>(iconData->size()) : 0
 		};
 		const auto result = callback(userData, &record);
 		if (result != CEMU_EMBED_OK)
@@ -2150,6 +2167,28 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetGraphicPacksEnabledForTi
 		*affectedPackCount = affected;
 	cemuLog_log(LogType::Force, "{} {} compatible graphic pack(s) for title {:016x}",
 		enabled ? "Enabled" : "Disabled", affected, baseTitleId);
+	return CEMU_EMBED_OK;
+}
+
+extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetShaderCount(
+	CemuEmbedInstance* instance, uint64_t baseTitleId, uint32_t* shaderCount) {
+	if (!instance || !baseTitleId || !shaderCount)
+		return CEMU_EMBED_INVALID_ARGUMENT;
+	*shaderCount = 0;
+	if (instance->state.load(std::memory_order_acquire) != CEMU_EMBED_STATE_READY)
+		return CEMU_EMBED_INVALID_STATE;
+
+	baseTitleId = TitleIdParser::MakeBaseTitleId(baseTitleId);
+	const fs::path cachePath = ActiveSettings::GetCachePath(
+		"shaderCache/transferable/{:016x}_shaders.bin", baseTitleId);
+	std::error_code error;
+	if (!fs::exists(cachePath, error))
+		return error ? CEMU_EMBED_STORAGE_FAILED : CEMU_EMBED_OK;
+	std::unique_ptr<FileCache> cache(FileCache::Open(cachePath));
+	if (!cache)
+		return CEMU_EMBED_STORAGE_FAILED;
+	const sint32 count = cache->GetFileCount();
+	*shaderCount = count > 0 ? static_cast<uint32_t>(count) : 0;
 	return CEMU_EMBED_OK;
 }
 

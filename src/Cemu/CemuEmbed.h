@@ -176,6 +176,10 @@ typedef struct CemuEmbedInstalledTitle {
 	const char* region_utf8;
 	uint32_t compatible_graphic_pack_count;
 	uint32_t enabled_graphic_pack_count;
+	// Encoded iconTex.tga data supplied by the title. The bytes remain valid
+	// only for the duration of the enumeration callback.
+	const uint8_t* icon_tga_data;
+	uint32_t icon_tga_size;
 } CemuEmbedInstalledTitle;
 
 typedef CemuEmbedResult (CEMU_EMBED_CALL *CemuEmbedInstalledTitleCallback)(
@@ -354,6 +358,10 @@ CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallDownloadedGraphi
 // needed by the title. This never removes games, saves, settings or packs.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_ClearShaderCaches(
 	CemuEmbedInstance* instance, uint32_t* removed_entry_count);
+// Returns the number of transferable shader entries stored for one base title.
+// A missing cache is valid and reports zero.
+CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetShaderCount(
+	CemuEmbedInstance* instance, uint64_t base_title_id, uint32_t* shader_count);
 // Imports Cemu-format graphic packs (rules.txt plus patches/shaders) from a
 // brokered graphicPacks folder into the persistent user-data directory.
 CEMU_EMBED_API CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_InstallGraphicPacksFromBrokeredFolder(
