@@ -498,6 +498,7 @@ void RendererOutputShader::InitializeStatic()
 	{
 #ifdef ENABLE_D3D11
 	case RendererAPI::D3D11:
+	case RendererAPI::D3D12:
 	{
 		// D3D11 translates the common GLSL sources through Vulkan-flavoured
 		// SPIR-V and SPIRV-Cross. Use the Vulkan built-ins (gl_VertexIndex)

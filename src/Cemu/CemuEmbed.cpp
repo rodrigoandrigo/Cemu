@@ -105,7 +105,12 @@ void SetState(CemuEmbedInstance* instance, CemuEmbedState state) {
 	if (instance->callbacks.state_changed) instance->callbacks.state_changed(instance->callbacks.user_data, state);
 }
 void ReportError(CemuEmbedInstance* instance, CemuEmbedResult result, const char* message) {
-	if (instance->callbacks.error) instance->callbacks.error(instance->callbacks.user_data, result, message);
+	// The embedding error callback feeds the host UI, but it is not a persistent
+	// diagnostic channel. Always mirror the exact result and message to log.txt so
+	// errors shown by the UWP host remain available after the title or app closes.
+	const char* safeMessage = message && *message ? message : "Cemu reported an error without a message.";
+	cemuLog_log(LogType::Force, "[Cemu error {}] {}", static_cast<int>(result), safeMessage);
+	if (instance->callbacks.error) instance->callbacks.error(instance->callbacks.user_data, result, safeMessage);
 }
 bool HasRequiredConfig(const CemuEmbedConfig* config) {
 	return config && config->struct_size >= sizeof(CemuEmbedConfig) && config->abi_version == CEMU_EMBED_ABI_VERSION &&
@@ -2494,6 +2499,7 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_GetSettings(
 	const auto playerOne = InputManager::instance().get_controller(0);
 	settings->emulated_controller_type = playerOne ?
 		static_cast<int32_t>(playerOne->type()) : static_cast<int32_t>(EmulatedController::Type::VPAD);
+	settings->graphics_api = static_cast<int32_t>(c.graphic_api.GetValue());
 	return CEMU_EMBED_OK;
 }
 
@@ -2553,6 +2559,9 @@ extern "C" CemuEmbedResult CEMU_EMBED_CALL CemuEmbed_SetSettings(
 		}
 	}
 	auto& c = GetConfig();
+	const int32_t requestedGraphicsApi = (std::clamp)(settings->graphics_api,
+		static_cast<int32_t>(GraphicAPI::kD3D11), static_cast<int32_t>(GraphicAPI::kD3D12));
+	c.graphic_api.SetValue(static_cast<GraphicAPI>(requestedGraphicsApi));
 	c.cpu_mode.SetValue(static_cast<CPUMode>((std::clamp)(settings->cpu_mode, 0, 4)));
 	c.console_language.SetValue(static_cast<CafeConsoleLanguage>((std::clamp)(settings->console_language, 0, 11)));
 	c.vsync.SetValue((std::clamp)(settings->vsync, 0, 4));

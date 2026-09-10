@@ -67,6 +67,7 @@ VKFUNC_INSTANCE(vkDeviceWaitIdle);
 
 // instance debug functions
 VKFUNC_INSTANCE(vkCreateDebugReportCallbackEXT);
+VKFUNC_INSTANCE(vkDestroyDebugReportCallbackEXT);
 
 VKFUNC_INSTANCE(vkGetPhysicalDeviceToolPropertiesEXT);
 VKFUNC_INSTANCE(vkSetDebugUtilsObjectNameEXT);
@@ -126,6 +127,7 @@ VKFUNC_DEVICE(vkDestroyPipelineCache);
 VKFUNC_DEVICE(vkCreatePipelineLayout);
 VKFUNC_DEVICE(vkDestroyPipelineLayout);
 VKFUNC_DEVICE(vkCreateGraphicsPipelines);
+VKFUNC_DEVICE(vkCreateComputePipelines);
 VKFUNC_DEVICE(vkDestroyPipeline);
 VKFUNC_DEVICE(vkCmdBindPipeline);
 
@@ -169,6 +171,7 @@ VKFUNC_DEVICE(vkCmdClearAttachments);
 VKFUNC_DEVICE(vkCmdBindIndexBuffer);
 VKFUNC_DEVICE(vkCmdBindVertexBuffers);
 VKFUNC_DEVICE(vkCmdDrawIndexed);
+VKFUNC_DEVICE(vkCmdDispatch);
 VKFUNC_DEVICE(vkCmdSetViewport);
 VKFUNC_DEVICE(vkCmdSetScissor);
 VKFUNC_DEVICE(vkCmdBindDescriptorSets);
@@ -198,6 +201,7 @@ VKFUNC_DEVICE(vkWaitForPresentKHR);
 // query
 VKFUNC_DEVICE(vkCreateQueryPool);
 VKFUNC_DEVICE(vkDestroyQueryPool);
+VKFUNC_DEVICE(vkGetQueryPoolResults);
 VKFUNC_DEVICE(vkCmdResetQueryPool);
 VKFUNC_DEVICE(vkCmdBeginQuery);
 VKFUNC_DEVICE(vkCmdEndQuery);

@@ -119,12 +119,11 @@ void LatteShaderCache_updateCompileQueue(sint32 maxRemainingEntries)
 		auto shader = shaderCompileQueue.entry[0].shader;
 		if (shader)
 		{
-			// D3D11 restores cached shaders on its own single low-priority worker.
-			// Waiting here turns cache discovery back into a full foreground shader
-			// compilation pass and delays the first frame by several seconds. The
-			// renderer promotes an active entry synchronously before it is bound.
-			if (g_renderer->GetType() != RendererAPI::D3D11)
-				LatteShader_FinishCompilation(shader);
+			// Complete native shader creation while the loading screen is visible.
+			// D3D11 used to remove these entries without waiting, which moved the
+			// expensive D3D11On12/Xbox compilation into gameplay and caused long
+			// stalls plus steadily increasing process commitment after the first frame.
+			LatteShader_FinishCompilation(shader);
 		}
 		LatteShaderCache_removeFromCompileQueue(0);
 	}
@@ -495,6 +494,14 @@ void LatteShaderCache_Load()
 			cemuLog_log(LogType::Force, "Shader cache entry {} invalid, deleting...", loadIndex);
 			s_shaderCacheGeneric->DeleteFile({name1, name2 });
 		}
+		if (g_renderer->GetType() == RendererAPI::D3D11)
+		{
+			// D3D11On12 performs substantial native work after the transferable
+			// entry has been decoded. Finish every shader belonging to this entry
+			// before advancing the visible counter, so the startup bar represents
+			// completed native shaders and no tail remains after it reaches 100%.
+			LatteShaderCache_updateCompileQueue(0);
+		}
 		numLoadedShaders++;
 		loadIndex++;
 		return true;
@@ -514,7 +521,7 @@ void LatteShaderCache_Load()
 	if (g_renderer->GetType() == RendererAPI::D3D11)
 	{
 		cemuLog_log(LogType::Force,
-			"D3D11 shader cache indexed {} shaders. Commited mem {}MB. Took {}ms; native restoration continues in the background",
+			"D3D11 shader cache loaded and native compilation completed for {} shaders. Committed mem {}MB. Took {}ms",
 			numLoadedShaders, (sint32)(memCommited / 1024 / 1024), timeLoad);
 	}
 	else
@@ -567,7 +574,11 @@ void LatteShaderCache_ShowProgress(const std::function <bool(void)>& loadUpdateF
 	const auto kPopupFlags = ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_AlwaysAutoResize;
 	const auto textColor = 0xFF888888;
 
-	auto lastFrameUpdate = tick_cached();
+	// Force the first cache entry to produce a visible frame. Starting this at
+	// tick_cached() allowed a fast indexing pass to finish before the 50 ms UI
+	// interval elapsed, so the host showed only shader notifications even though
+	// native compilation was running and blocking title startup.
+	auto lastFrameUpdate = tick_cached() - std::chrono::seconds(1);
 
 	while (true)
 	{

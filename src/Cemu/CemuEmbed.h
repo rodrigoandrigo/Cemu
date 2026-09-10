@@ -22,12 +22,12 @@ extern "C" {
 
 #define CEMU_EMBED_ABI_VERSION 1u
 #define CEMU_EMBED_BROKERED_STORAGE_VERSION 4u
-#define CEMU_EMBED_D3D11_SURFACE_VERSION 1u
+#define CEMU_EMBED_D3D11_SURFACE_VERSION 3u
 #define CEMU_EMBED_LIBRARY_VERSION 2u
 #define CEMU_EMBED_ACCOUNT_VERSION 1u
 #define CEMU_EMBED_GAMEPAD_VERSION 1u
 #define CEMU_EMBED_DIMENSIONS_VERSION 1u
-#define CEMU_EMBED_SETTINGS_VERSION 2u
+#define CEMU_EMBED_SETTINGS_VERSION 3u
 #define CEMU_EMBED_GRAPHIC_PACK_VERSION 1u
 typedef struct CemuEmbedInstance CemuEmbedInstance;
 
@@ -78,6 +78,11 @@ typedef struct CemuEmbedD3D11Surface {
 	void* immediate_context;  // ID3D11DeviceContext
 	void* swap_chain;         // IDXGISwapChain
 	void* render_target_view; // ID3D11RenderTargetView
+	void* composition_panel;  // IInspectable (XAML SwapChainPanel), required by the experimental D3D12 swapchain
+	// Associates an IDXGISwapChain with the composition panel on the host's UI
+	// thread. Returns an HRESULT as int32_t.
+	int32_t (*set_composition_swap_chain)(void* user_data, void* swap_chain);
+	void* set_composition_swap_chain_user_data;
 } CemuEmbedD3D11Surface;
 
 // Host-fed Xbox/Windows.Gaming.Input state. Buttons use the SDL gamepad
@@ -261,6 +266,10 @@ typedef struct CemuEmbedSettings {
 	// Player one's emulated Wii U controller: 0=GamePad, 1=Pro Controller,
 	// 2=Classic Controller, 3=Wii Remote.
 	int32_t emulated_controller_type;
+	// 0=OpenGL, 1=Vulkan, 2=Metal, 3=Direct3D 11,
+	// 4=Direct3D 12 (experimental internal Vulkan-command translation).
+	// Embedded UWP hosts expose only values 3 and 4.
+	int32_t graphics_api;
 } CemuEmbedSettings;
 
 typedef enum CemuEmbedDimensionsFigureType {

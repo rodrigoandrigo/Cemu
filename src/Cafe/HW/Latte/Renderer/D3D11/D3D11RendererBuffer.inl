@@ -71,6 +71,36 @@ void D3D11Renderer::bufferCache_init(const sint32 size)
 		buffer = m_bufferCache;
 }
 
+bool D3D11Renderer::EnsureNativeStreamoutBuffers()
+{
+	D3D11_BUFFER_DESC desc{};
+	desc.ByteWidth = LatteStreamout_GetRingBufferSize();
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+	for (UINT index = 0; index < m_streamoutBuffers.size(); ++index)
+	{
+		if (!m_streamoutEnabled[index] || m_streamoutBuffers[index])
+			continue;
+		HRESULT hr = m_device->CreateBuffer(&desc, nullptr, &m_streamoutBuffers[index]);
+		if (hr == E_OUTOFMEMORY)
+		{
+			RecoverFromMemoryPressure("native stream-output ring buffer", true);
+			hr = m_device->CreateBuffer(&desc, nullptr, &m_streamoutBuffers[index]);
+		}
+		if (FAILED(hr))
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 native stream-output buffer {} creation failed (0x{:08X})",
+				index, static_cast<uint32>(hr));
+			if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET ||
+				hr == DXGI_ERROR_DEVICE_HUNG)
+				RecordDeviceLost(hr, "native stream-output buffer creation");
+			return false;
+		}
+	}
+	return true;
+}
+
 void D3D11Renderer::bufferCache_upload(uint8* buffer, sint32 size, uint32 offset)
 {
 	if (!m_bufferCache || !buffer || size <= 0 ||

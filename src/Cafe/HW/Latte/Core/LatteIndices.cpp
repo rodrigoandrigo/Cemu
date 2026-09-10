@@ -138,7 +138,7 @@ uint32 LatteIndices_calculateIndexOutputSize(LattePrimitiveMode primitiveMode, L
 	}
 	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN &&
 		(g_renderer->GetType() == RendererAPI::Metal ||
-			g_renderer->GetType() == RendererAPI::D3D11))
+			IsD3DRendererAPI(g_renderer->GetType())))
 	{
 		if (indexType == LatteIndexType::AUTO)
 		{
@@ -863,7 +863,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 	}
 	else if (primitiveMode == LattePrimitiveMode::TRIANGLE_FAN &&
 		(g_renderer->GetType() == RendererAPI::Metal ||
-			g_renderer->GetType() == RendererAPI::D3D11))
+			IsD3DRendererAPI(g_renderer->GetType())))
 	{
         if (indexType == LatteIndexType::AUTO)
     	{
@@ -950,7 +950,7 @@ void LatteIndices_decode(const void* indexData, LatteIndexType indexType, uint32
 		primitiveMode == LattePrimitiveMode::TRIANGLE_STRIP ||
 		primitiveMode == LattePrimitiveMode::TRIANGLE_STRIP_ADJACENT ||
 		(primitiveMode == LattePrimitiveMode::TRIANGLE_FAN &&
-			g_renderer->GetType() == RendererAPI::D3D11);
+			IsD3DRendererAPI(g_renderer->GetType()));
 	if (hostUsesStripCut && indexType != LatteIndexType::AUTO &&
 		indexAllocation.mem && outputCount)
 	{

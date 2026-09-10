@@ -162,6 +162,7 @@ option(ENABLE_OPENGL "Enables the OpenGL backend" ${ENABLE_OPENGL_DEFAULT})
 option(ENABLE_VULKAN "Enables the Vulkan backend" ON)
 option(ENABLE_METAL "Enables the Metal backend" ${ENABLE_METAL_DEFAULT})
 option(ENABLE_D3D11 "Enables the native Direct3D 11 backend" OFF)
+option(ENABLE_D3D12 "Enables the experimental Direct3D 12 backend" OFF)
 option(ENABLE_DISCORD_RPC "Enables the Discord Rich Presence feature" ON)
 
 if (ENABLE_METAL AND NOT APPLE)
@@ -219,8 +220,11 @@ if(CEMU_UWP)
 	endif()
 	set(ENABLE_DISCORD_RPC OFF CACHE BOOL "" FORCE)
 	set(ENABLE_OPENGL OFF CACHE BOOL "" FORCE)
-	set(ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
+	# The experimental D3D12 backend reuses the Vulkan renderer front-end but
+	# replaces its loader dispatch with the in-process D3D12 translation layer.
+	set(ENABLE_VULKAN ON CACHE BOOL "" FORCE)
 	set(ENABLE_D3D11 ON CACHE BOOL "" FORCE)
+	set(ENABLE_D3D12 ON CACHE BOOL "" FORCE)
 	add_compile_definitions(CEMU_UWP)
 endif()
 
@@ -329,6 +333,16 @@ endif()
 
 if (ENABLE_D3D11)
 	add_compile_definitions(ENABLE_D3D11)
+endif()
+
+if (ENABLE_D3D12 AND NOT WIN32)
+	message(FATAL_ERROR "The experimental Direct3D 12 backend is only supported on Windows")
+endif()
+if (ENABLE_D3D12 AND NOT ENABLE_D3D11)
+	message(FATAL_ERROR "The experimental Direct3D 12 backend currently requires the in-tree D3D11 translation layer")
+endif()
+if (ENABLE_D3D12)
+	add_compile_definitions(ENABLE_D3D12)
 endif()
 
 if (ENABLE_OPENGL)

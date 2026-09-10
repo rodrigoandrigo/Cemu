@@ -121,6 +121,10 @@ GraphicAPI ActiveSettings::GetGraphicsAPI()
 		return api;
 	fallbackAPI = kD3D11;
 #endif
+#ifdef ENABLE_D3D12
+	if (api == kD3D12)
+		return api;
+#endif
 #ifdef ENABLE_VULKAN
 	if (g_vulkan_available)
 	{

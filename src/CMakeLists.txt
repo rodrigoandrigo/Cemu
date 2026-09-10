@@ -6,6 +6,14 @@ if(CEMU_CXX_FLAGS)
 	add_compile_options(${CEMU_CXX_FLAGS})
 endif()
 
+# Emit debug information for optimized Cemu Release objects. Keep these flags
+# inside src so bundled dependencies such as SDL retain their own /GL and PCH
+# settings. /DEBUG:FULL below turns this information into Cemu_release.pdb.
+if(MSVC)
+	add_compile_options($<$<CONFIG:Release>:/Zi>)
+	add_compile_options($<$<CONFIG:Release>:/Zo>)
+endif()
+
 if(NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
 	message( FATAL_ERROR "Pointers are not 64bit" )
 endif()
@@ -44,9 +52,11 @@ endif()
 
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
-# on msvc we can reuse the PCH from CemuCommon, on other platforms it's not straight forward to reuse the PCH so we opt out of it
+# Desktop MSVC can reuse CemuCommon's PCH. UWP projects generate their own PCH:
+# Visual Studio may otherwise consider CemuCommon.lib current while the shared
+# cmake_pch.pch is absent, making every consumer fail with C1083.
 function(cemu_use_precompiled_header target_name)
-	if(MSVC)
+	if(MSVC AND NOT CEMU_UWP)
 		target_precompile_headers(${target_name} REUSE_FROM CemuCommon)
 	else()
 		target_precompile_headers(${target_name} PRIVATE "${CMAKE_SOURCE_DIR}/src/Common/precompiled.h")
@@ -218,6 +228,20 @@ set_target_properties(CemuBin PROPERTIES
 	ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../bin/$<1:>"
 	OUTPUT_NAME "${OUTPUT_NAME}"
 )
+
+# Keep full native symbols for optimized MSVC/UWP builds. The experimental
+# renderer runs on LatteThread, where an access violation otherwise leaves only
+# ASLR-dependent DLL addresses. Emit Cemu_<config>.pdb beside the DLL so Visual
+# Studio can resolve the optimized call stack without changing the binary name.
+if(MSVC)
+	target_link_options(CemuBin PRIVATE
+		"$<$<CONFIG:Release>:/DEBUG:FULL>"
+	)
+	set_target_properties(CemuBin PROPERTIES
+		PDB_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../bin/$<1:>"
+		PDB_NAME "${OUTPUT_NAME}"
+	)
+endif()
 
 if(ENABLE_SDL)
 	target_link_libraries(CemuBin PRIVATE SDL3::SDL3)

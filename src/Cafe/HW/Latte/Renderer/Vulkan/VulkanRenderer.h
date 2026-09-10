@@ -186,7 +186,7 @@ public:
 	};
 
 	static std::vector<DeviceInfo> GetDevices();
-	VulkanRenderer();
+	explicit VulkanRenderer(RendererAPI api = RendererAPI::Vulkan);
 	virtual ~VulkanRenderer();
 
 	static VulkanRenderer* GetInstance();

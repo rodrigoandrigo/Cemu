@@ -35,9 +35,15 @@ enum class RendererAPI
 	Vulkan,
 	Metal,
 	D3D11,
+	D3D12,
 
 	MAX
 };
+
+inline constexpr bool IsD3DRendererAPI(RendererAPI api)
+{
+	return api == RendererAPI::D3D11 || api == RendererAPI::D3D12;
+}
 
 using ImTextureID = void*;
 

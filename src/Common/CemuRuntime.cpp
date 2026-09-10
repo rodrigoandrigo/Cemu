@@ -1,4 +1,5 @@
 #include "CemuRuntime.h"
+#include "Cemu/Logging/CemuLogging.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -50,6 +51,9 @@ bool ConsumeGraphicsDeviceLost(std::string& message)
 
 [[noreturn]] void RaiseFatalError(std::string message, int desktopExitCode)
 {
+	// Some fatal paths terminate the desktop process directly and therefore never
+	// cross the embedded host's ReportError boundary. Persist the cause first.
+	cemuLog_log(LogType::Force, "[Cemu fatal error] {}", message);
 	if (IsEmbeddingMode())
 	{
 		RecordFatalError(message);

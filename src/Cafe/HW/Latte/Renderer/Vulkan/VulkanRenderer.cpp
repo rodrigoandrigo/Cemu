@@ -494,11 +494,15 @@ static void LinuxBreathOfTheWildWorkaround(VkInstance& instance, const VkInstanc
 
 #endif
 
-VulkanRenderer::VulkanRenderer() : Renderer(RendererAPI::Vulkan)
+VulkanRenderer::VulkanRenderer(RendererAPI api) : Renderer(api)
 {
+	if (api != RendererAPI::Vulkan && api != RendererAPI::D3D12)
+		throw std::invalid_argument("VulkanRenderer supports only Vulkan or the internal D3D12 translation backend");
 	glslang::InitializeProcess();
 
-	cemuLog_log(LogType::Force, "------- Init Vulkan graphics backend -------");
+	cemuLog_log(LogType::Force, api == RendererAPI::D3D12 ?
+		"------- Init internal Vulkan-to-Direct3D 12 experimental backend -------" :
+		"------- Init Vulkan graphics backend -------");
 
 	const bool useValidationLayer = cemuLog_isLoggingEnabled(LogType::VulkanValidation);
 	if (useValidationLayer)
@@ -970,7 +974,8 @@ VulkanRenderer::~VulkanRenderer()
 
 VulkanRenderer* VulkanRenderer::GetInstance()
 {
-	cemu_assert_debug(g_renderer->GetType() == RendererAPI::Vulkan);
+	cemu_assert_debug(g_renderer->GetType() == RendererAPI::Vulkan ||
+		g_renderer->GetType() == RendererAPI::D3D12);
 	return static_cast<VulkanRenderer*>(g_renderer.get());
 }
 
@@ -1812,6 +1817,9 @@ void VulkanRenderer::DeleteNullObjects()
 
 void VulkanRenderer::ImguiInit()
 {
+	if (!m_mainSwapchainInfo || m_mainSwapchainInfo->m_swapchainImages.empty())
+		throw std::runtime_error("Cannot initialize ImGui before the main swapchain");
+
 	VkRenderPass prevRenderPass = m_imguiRenderPass;
 
 	VkAttachmentDescription colorAttachment = {};
@@ -1864,6 +1872,15 @@ void VulkanRenderer::Initialize()
 	Renderer::Initialize();
 	InitFirstCommandBuffer();
 	CreatePipelineCache();
+	// The desktop Vulkan canvas creates its surface before Latte starts. The
+	// embedded UWP host has no VulkanCanvas, so the internal D3D12 translation
+	// backend must create its composition swapchain here before ImGui reads it.
+	if (GetType() == RendererAPI::D3D12 && !m_mainSwapchainInfo)
+	{
+		Vector2i size;
+		WindowSystem::GetWindowPhysSize(size.x, size.y);
+		InitializeSurface({std::max(size.x, 1), std::max(size.y, 1)}, true);
+	}
 	ImguiInit();
 	CreateNullObjects();
 }

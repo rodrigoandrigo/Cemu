@@ -942,12 +942,11 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		D3D11_DEBUG_CHECK("non-indexed GX2 draw");
 	}
 
-	// Native D3D11 stream output uses a geometry shader created with
-	// D3D11_SO_NO_RASTERIZED_STREAM and therefore needs a raster replay. The
-	// The Feature Level 11.0 UWP pixel-UAV path writes feedback in a dedicated
-	// capture pass; native D3D11 stream output still needs this raster replay.
+	// A native object using rasterized stream zero captures and renders in this
+	// draw. Only the no-raster compatibility object needs the old replay.
 	const bool needsRasterReplay = drawIssued && m_streamoutActive &&
-		!m_streamoutUsesStorage && !m_streamoutUsesPixelCapture;
+		!m_streamoutUsesStorage && !m_streamoutUsesPixelCapture &&
+		!m_streamoutNativeRasterized;
 	// Present reports removal every frame. On Xbox, sample at the first draw of
 	// each frame as well, retaining early diagnostics without calling through
 	// D3D11On12 after every individual draw. Keep desktop behavior unchanged.
@@ -1012,8 +1011,8 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		m_context->OMSetRenderTargets(nativeFbo->targetCount,
 			nativeFbo->targets.data(), nativeFbo->depth);
 	}
-	// Stream-output shaders use D3D11_SO_NO_RASTERIZED_STREAM, so a GX2 operation
-	// requesting feedback and rasterization needs an ordinary second draw.
+	// Replay only when creation of the combined rasterized stream-output object
+	// failed and the no-raster compatibility object was used.
 	bool rasterDrawIssued = drawIssued && !needsRasterReplay;
 	if (needsRasterReplay && !rasterizerKilled && !bothFacesCulled)
 	{

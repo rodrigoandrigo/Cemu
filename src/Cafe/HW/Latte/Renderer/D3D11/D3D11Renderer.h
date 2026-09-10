@@ -130,6 +130,7 @@ private:
 	void FlushBufferCacheUploads();
 	void CheckMemoryPressure();
 	bool WaitForGpuIdle();
+	bool EnsureNativeStreamoutBuffers();
 	bool CheckDeviceHealth(const char* operation);
 	bool ExecutePixelStreamoutCapture(uint32 baseVertex, uint32 baseInstance,
 		uint32 instanceCount, uint32 vertexCount, uint32 indexCount,
@@ -212,6 +213,7 @@ private:
 	bool m_streamoutActive{};
 	bool m_streamoutUsesStorage{};
 	bool m_streamoutUsesPixelCapture{};
+	bool m_streamoutNativeRasterized{};
 	bool m_streamoutDataAvailable{};
 	bool m_keepIndexStagingForPixelStreamout{};
 	RendererShader* m_streamoutPixelCaptureShader{};

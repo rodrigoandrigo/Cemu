@@ -351,7 +351,7 @@ void LatteShader_CreateRendererShader(LatteDecompilerShader* shader, bool compil
 	std::string shaderSrc;
 
 	const bool usesSpirvShaderSource = g_renderer->GetType() == RendererAPI::Vulkan ||
-		g_renderer->GetType() == RendererAPI::D3D11;
+		IsD3DRendererAPI(g_renderer->GetType());
 	const std::string* customShaderSrc = GraphicPack2::FindCustomShaderSource(shader->baseHash,
 		shader->auxHash, gpShaderType, usesSpirvShaderSource, g_renderer->GetType() == RendererAPI::Metal);
 	if (customShaderSrc)
@@ -754,6 +754,7 @@ LatteDecompilerShader* LatteShader_CreateShaderFromDecompilerOutput(LatteDecompi
 		break;
 	case RendererAPI::Vulkan:
 	case RendererAPI::D3D11:
+	case RendererAPI::D3D12:
 		shader->resourceMapping = decompilerOutput.resourceMappingVK;
 		break;
 	case RendererAPI::Metal:

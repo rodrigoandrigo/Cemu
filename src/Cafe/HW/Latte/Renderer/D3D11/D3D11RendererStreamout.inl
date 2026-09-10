@@ -18,6 +18,7 @@ void D3D11Renderer::streamout_begin()
 {
 	m_streamoutUsesStorage = false;
 	m_streamoutUsesPixelCapture = false;
+	m_streamoutNativeRasterized = false;
 	m_streamoutDataAvailable = false;
 	m_streamoutPixelCaptureShader = nullptr;
 	auto* gsContext = LatteSHRC_GetActiveGeometryShader();
@@ -28,22 +29,20 @@ void D3D11Renderer::streamout_begin()
 		shader->PreponeCompilation(true);
 	const bool hasOutputBuffer = std::any_of(m_streamoutEnabled.begin(),
 		m_streamoutEnabled.end(), [](bool enabled) { return enabled; });
-	if (shader && shader->UsesStreamoutStorage() && hasOutputBuffer && m_streamoutStorageUav)
-	{
-		ID3D11UnorderedAccessView* uav = m_streamoutStorageUav.Get();
-		m_context->OMSetRenderTargetsAndUnorderedAccessViews(
-			D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
-			StreamoutUavSlot, 1, &uav, nullptr);
-		m_streamoutUsesStorage = true;
-		m_streamoutDataAvailable = true;
-		m_streamoutActive = true;
-		return;
-	}
 	// A real title GS must remain the stage that emits the stream. Feature Level
 	// 11.0 supports native geometry stream output, and the scalar declaration built
 	// from reflection preserves the exact GX2 buffer strides.
-	if (gsContext && shader && shader->StreamoutGeometry() && hasOutputBuffer)
+	if (gsContext && shader && shader->StreamoutGeometry() && hasOutputBuffer &&
+		EnsureNativeStreamoutBuffers())
 	{
+		const bool rasterizerKilled =
+			LatteGPUState.contextNew.PA_CL_CLIP_CNTL.get_DX_RASTERIZATION_KILL() &&
+			LatteGPUState.contextNew.PA_CL_VTE_CNTL.get_VPORT_X_OFFSET_ENA();
+		const bool bothFacesCulled =
+			LatteGPUState.contextNew.PA_SU_SC_MODE_CNTL.get_CULL_FRONT() &&
+			LatteGPUState.contextNew.PA_SU_SC_MODE_CNTL.get_CULL_BACK();
+		const bool wantsRaster = !rasterizerKilled && !bothFacesCulled;
+		ID3D11GeometryShader* streamoutGeometry = shader->StreamoutGeometry(wantsRaster);
 		std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> buffers{};
 		bool hasNativeOutputBuffer = false;
 		for (UINT i = 0; i < buffers.size(); ++i)
@@ -53,13 +52,30 @@ void D3D11Renderer::streamout_begin()
 		}
 		if (hasNativeOutputBuffer)
 		{
-			m_context->GSSetShader(shader->StreamoutGeometry(), nullptr, 0);
+			m_streamoutNativeRasterized = wantsRaster &&
+				shader->HasRasterizedStreamoutGeometry();
+			m_context->GSSetShader(streamoutGeometry, nullptr, 0);
 			m_context->SOSetTargets(static_cast<UINT>(buffers.size()), buffers.data(),
 				m_streamoutOffsets.data());
 			m_streamoutDataAvailable = true;
 			m_streamoutActive = true;
 			return;
 		}
+	}
+	// Prefer native stream output for a real geometry stage. Besides capturing the
+	// actual emitted vertices, it avoids the all-stage UAV slot used by the shader
+	// storage path, which is not portable at Feature Level 11.0.
+	if (!gsContext && shader && shader->UsesStreamoutStorage() && hasOutputBuffer &&
+		m_streamoutStorageUav)
+	{
+		ID3D11UnorderedAccessView* uav = m_streamoutStorageUav.Get();
+		m_context->OMSetRenderTargetsAndUnorderedAccessViews(
+			D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
+			StreamoutUavSlot, 1, &uav, nullptr);
+		m_streamoutUsesStorage = true;
+		m_streamoutDataAvailable = true;
+		m_streamoutActive = true;
+		return;
 	}
 #if defined(CEMU_UWP)
 	if (!gsContext && shader && shader->HasPixelStreamoutCapture() && hasOutputBuffer &&
@@ -138,6 +154,7 @@ void D3D11Renderer::streamout_rendererFinishDrawcall()
 	}
 	m_streamoutUsesStorage = false;
 	m_streamoutUsesPixelCapture = false;
+	m_streamoutNativeRasterized = false;
 	m_streamoutDataAvailable = false;
 	m_streamoutPixelCaptureShader = nullptr;
 	m_streamoutEnabled.fill(false);
@@ -276,42 +293,121 @@ bool D3D11Renderer::ExecutePixelStreamoutCapture(uint32 baseVertex, uint32 baseI
 	m_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_POINTLIST);
 
 	bool captured = true;
-	for (UINT pass = 0; pass < captureShader->PixelStreamoutCapturePassCount(); ++pass)
+	const UINT passCount = captureShader->PixelStreamoutCapturePassCount();
+	if (m_context1)
 	{
-		auto* geometry = captureShader->PixelStreamoutCaptureGeometry(pass);
-		auto* pixel = captureShader->PixelStreamoutCapturePixel(pass);
-		if (!geometry || !pixel)
+		// A D3D11 constant buffer is limited to 4096 16-byte constants. Each
+		// instance consumes three. Upload a whole batch once, then select the
+		// appropriate three-constant range for every draw with the D3D11.1 API.
+		// D3D11.1 requires subranges to start on a 16-constant (256-byte)
+		// boundary when the runtime has to emulate range binding.
+		constexpr UINT constantsPerInstance = 16;
+		struct CaptureConstantSlot
 		{
-			captured = false;
-			break;
-		}
-		m_context->GSSetShader(geometry, nullptr, 0);
-		m_context->PSSetShader(pixel, nullptr, 0);
-		for (uint32 instance = 0; instance < instanceCount; ++instance)
+			CaptureConstants value{};
+			std::array<uint8, constantsPerInstance * 16 - sizeof(CaptureConstants)> padding{};
+		};
+		static_assert(sizeof(CaptureConstantSlot) == constantsPerInstance * 16);
+		constexpr UINT instancesPerBatch = D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT /
+			constantsPerInstance;
+		std::vector<CaptureConstantSlot> instanceConstants;
+		instanceConstants.reserve((std::min)(instanceCount, instancesPerBatch));
+		for (UINT batchStart = 0; captured && batchStart < instanceCount;
+			batchStart += instancesPerBatch)
 		{
-			const uint64 recordBase = static_cast<uint64>(instance) * vertexCount +
-				(indexed ? 0u : baseVertex);
-			if (recordBase >= recordLimit || recordBase >= StreamoutPixelCaptureCapacity)
+			const UINT batchCount = (std::min)(instanceCount - batchStart, instancesPerBatch);
+			instanceConstants.clear();
+			for (UINT local = 0; local < batchCount; ++local)
+			{
+				const uint64 recordBase = static_cast<uint64>(batchStart + local) * vertexCount +
+					(indexed ? 0u : baseVertex);
+				if (recordBase >= recordLimit || recordBase >= StreamoutPixelCaptureCapacity)
+					break;
+				CaptureConstantSlot current{};
+				current.value = constants;
+				current.value.recordState[0] = static_cast<uint32>(recordBase);
+				current.value.recordState[1] = recordLimit;
+				current.value.recordState[2] = indexed ? 1u : 0u;
+				instanceConstants.emplace_back(current);
+			}
+			if (instanceConstants.empty())
 				break;
-			constants.recordState[0] = static_cast<uint32>(recordBase);
-			constants.recordState[1] = recordLimit;
-			constants.recordState[2] = indexed ? 1u : 0u;
 			if (!UpdateDynamicConstantBuffer(m_streamoutCaptureConstants,
-				m_streamoutCaptureConstantsCapacity, &constants, sizeof(constants)))
+				m_streamoutCaptureConstantsCapacity, instanceConstants.data(),
+				static_cast<UINT>(instanceConstants.size() * sizeof(CaptureConstantSlot))))
 			{
 				captured = false;
 				break;
 			}
 			ID3D11Buffer* constantsBuffer = m_streamoutCaptureConstants.Get();
-			m_context->GSSetConstantBuffers(0, 1, &constantsBuffer);
-			m_context->PSSetConstantBuffers(0, 1, &constantsBuffer);
-			if (!indexed)
-				m_context->DrawInstanced(vertexCount, 1, baseVertex, baseInstance + instance);
-			else
-				m_context->DrawIndexedInstanced(indexCount, 1, 0, baseVertex, baseInstance + instance);
+			for (UINT pass = 0; captured && pass < passCount; ++pass)
+			{
+				auto* geometry = captureShader->PixelStreamoutCaptureGeometry(pass);
+				auto* pixel = captureShader->PixelStreamoutCapturePixel(pass);
+				if (!geometry || !pixel)
+				{
+					captured = false;
+					break;
+				}
+				m_context->GSSetShader(geometry, nullptr, 0);
+				m_context->PSSetShader(pixel, nullptr, 0);
+				for (UINT local = 0; local < instanceConstants.size(); ++local)
+				{
+					const UINT firstConstant = local * constantsPerInstance;
+					const UINT constantCount = constantsPerInstance;
+					m_context1->GSSetConstantBuffers1(0, 1, &constantsBuffer,
+						&firstConstant, &constantCount);
+					m_context1->PSSetConstantBuffers1(0, 1, &constantsBuffer,
+						&firstConstant, &constantCount);
+					const UINT instance = batchStart + local;
+					if (!indexed)
+						m_context->DrawInstanced(vertexCount, 1, baseVertex, baseInstance + instance);
+					else
+						m_context->DrawIndexedInstanced(indexCount, 1, 0, baseVertex,
+							baseInstance + instance);
+				}
+			}
 		}
-		if (!captured)
-			break;
+	}
+	else
+	{
+		// Desktop systems without ID3D11DeviceContext1 retain the portable path.
+		for (UINT pass = 0; captured && pass < passCount; ++pass)
+		{
+			auto* geometry = captureShader->PixelStreamoutCaptureGeometry(pass);
+			auto* pixel = captureShader->PixelStreamoutCapturePixel(pass);
+			if (!geometry || !pixel)
+			{
+				captured = false;
+				break;
+			}
+			m_context->GSSetShader(geometry, nullptr, 0);
+			m_context->PSSetShader(pixel, nullptr, 0);
+			for (uint32 instance = 0; instance < instanceCount; ++instance)
+			{
+				const uint64 recordBase = static_cast<uint64>(instance) * vertexCount +
+					(indexed ? 0u : baseVertex);
+				if (recordBase >= recordLimit || recordBase >= StreamoutPixelCaptureCapacity)
+					break;
+				constants.recordState[0] = static_cast<uint32>(recordBase);
+				constants.recordState[1] = recordLimit;
+				constants.recordState[2] = indexed ? 1u : 0u;
+				if (!UpdateDynamicConstantBuffer(m_streamoutCaptureConstants,
+					m_streamoutCaptureConstantsCapacity, &constants, sizeof(constants)))
+				{
+					captured = false;
+					break;
+				}
+				ID3D11Buffer* constantsBuffer = m_streamoutCaptureConstants.Get();
+				m_context->GSSetConstantBuffers(0, 1, &constantsBuffer);
+				m_context->PSSetConstantBuffers(0, 1, &constantsBuffer);
+				if (!indexed)
+					m_context->DrawInstanced(vertexCount, 1, baseVertex, baseInstance + instance);
+				else
+					m_context->DrawIndexedInstanced(indexCount, 1, 0, baseVertex,
+						baseInstance + instance);
+			}
+		}
 	}
 	ID3D11UnorderedAccessView* emptyUav{};
 	m_context->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,

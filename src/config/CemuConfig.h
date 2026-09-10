@@ -71,6 +71,7 @@ enum GraphicAPI
 	kVulkan,
 	kMetal,
 	kD3D11,
+	kD3D12,
 	COUNT
 };
 

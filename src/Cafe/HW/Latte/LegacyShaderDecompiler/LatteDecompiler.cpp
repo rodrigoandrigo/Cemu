@@ -1073,7 +1073,7 @@ void _LatteDecompiler_Process(LatteDecompilerShaderContext* shaderContext, uint8
 	{
 		if (g_renderer->GetType() == RendererAPI::OpenGL ||
 			g_renderer->GetType() == RendererAPI::Vulkan ||
-			g_renderer->GetType() == RendererAPI::D3D11)
+			IsD3DRendererAPI(g_renderer->GetType()))
 		{
 #if defined(ENABLE_OPENGL) || defined(ENABLE_VULKAN) || defined(ENABLE_D3D11)
 			LatteDecompiler_emitGLSLShader(shaderContext, shaderContext->shader);

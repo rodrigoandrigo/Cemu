@@ -709,6 +709,17 @@ if (ENABLE_D3D11)
   )
 endif()
 
+if (ENABLE_D3D12)
+	find_package(spirv_cross_core CONFIG REQUIRED)
+	find_package(spirv_cross_hlsl CONFIG REQUIRED)
+	target_sources(CemuCafe PRIVATE
+		HW/Latte/Renderer/D3D12/D3D12Renderer.h
+		HW/Latte/Renderer/D3D12/VulkanD3D12API.cpp
+		HW/Latte/Renderer/D3D12/VulkanD3D12API.h
+	)
+	target_link_libraries(CemuCafe PRIVATE spirv-cross-core spirv-cross-hlsl d3d12 dxgi d3dcompiler)
+endif()
+
 if (ENABLE_WAYLAND)
 	# PUBLIC because wayland-client.h is included in VulkanAPI.h
   target_link_libraries(CemuCafe PUBLIC Wayland::Client)

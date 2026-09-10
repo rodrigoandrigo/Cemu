@@ -1,6 +1,11 @@
 #include "interface/WindowSystem.h"
 #include "Cafe/HW/Latte/Renderer/Renderer.h"
 #include "Cafe/HW/Latte/Renderer/D3D11/D3D11Renderer.h"
+#if defined(ENABLE_D3D12)
+#include "Cafe/HW/Latte/Renderer/D3D12/D3D12Renderer.h"
+#include "Cafe/HW/Latte/Renderer/D3D12/VulkanD3D12API.h"
+#endif
+#include "config/ActiveSettings.h"
 
 namespace
 {
@@ -21,7 +26,17 @@ void WindowSystem::Create()
 	// objects. The renderer takes COM references to those objects.
 	if (g_renderer)
 		return;
-	g_renderer = std::make_unique<D3D11Renderer>();
+#if defined(ENABLE_D3D12)
+	if (ActiveSettings::GetGraphicsAPI() == GraphicAPI::kD3D12)
+	{
+		VulkanD3D12::SelectInternalDriver(true);
+		if (!InitializeGlobalVulkan())
+			throw std::runtime_error("Unable to initialize the internal Vulkan-to-D3D12 driver");
+		g_renderer = std::make_unique<D3D12Renderer>();
+	}
+	else
+#endif
+		g_renderer = std::make_unique<D3D11Renderer>();
 }
 
 void WindowSystem::SetEmbeddedSurface(void* window, void* canvas, int width, int height, double dpiScale)

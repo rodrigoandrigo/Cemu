@@ -2,6 +2,9 @@
 #define VKFUNC_DEFINE
 #include "Cafe/HW/Latte/Renderer/Vulkan/VulkanAPI.h"
 #include <numeric> // for std::iota
+#if defined(ENABLE_D3D12)
+#include "Cafe/HW/Latte/Renderer/D3D12/VulkanD3D12API.h"
+#endif
 
 #if BOOST_OS_LINUX || BOOST_OS_MACOS || BOOST_OS_BSD
 #include <dlfcn.h>
@@ -88,6 +91,13 @@ void VulkanBenchmarkPrintResults()
 
 bool InitializeGlobalVulkan()
 {
+#if defined(ENABLE_D3D12)
+	if (VulkanD3D12::IsInternalDriverSelected())
+	{
+		g_vulkan_available = VulkanD3D12::InitializeGlobalDispatch();
+		return g_vulkan_available;
+	}
+#endif
 	if(g_vulkan_available)
 		return true;
 
@@ -122,6 +132,10 @@ bool InitializeGlobalVulkan()
 
 bool InitializeInstanceVulkan(VkInstance instance)
 {
+#if defined(ENABLE_D3D12)
+	if (VulkanD3D12::IsInternalDriverSelected())
+		return VulkanD3D12::InitializeInstanceDispatch(instance);
+#endif
 	// The loader was opened by InitializeGlobalVulkan. GetModuleHandle is
 	// sufficient here and avoids loading a second copy of the packaged DLL.
 	const auto hmodule = GetModuleHandleA("vulkan-1.dll");
@@ -136,6 +150,10 @@ bool InitializeInstanceVulkan(VkInstance instance)
 
 bool InitializeDeviceVulkan(VkDevice device)
 {
+#if defined(ENABLE_D3D12)
+	if (VulkanD3D12::IsInternalDriverSelected())
+		return VulkanD3D12::InitializeDeviceDispatch(device);
+#endif
 	const auto hmodule = GetModuleHandleA("vulkan-1.dll");
 	if (hmodule == nullptr)
 		return false;

@@ -52,7 +52,12 @@ public:
 	ID3D11VertexShader* Vertex() const { return m_vs.Get(); }
 	ID3D11PixelShader* Pixel() const { return m_ps.Get(); }
 	ID3D11GeometryShader* Geometry() const { return m_gs.Get(); }
-	ID3D11GeometryShader* StreamoutGeometry() const { return m_streamoutGs.Get(); }
+	ID3D11GeometryShader* StreamoutGeometry(bool rasterized = false) const
+	{
+		return rasterized && m_streamoutRasterizedGs ?
+			m_streamoutRasterizedGs.Get() : m_streamoutGs.Get();
+	}
+	bool HasRasterizedStreamoutGeometry() const { return m_streamoutRasterizedGs != nullptr; }
 	bool UsesStreamoutStorage() const { return m_usesStreamoutStorage; }
 	bool HasPixelStreamoutCapture() const
 	{
@@ -1807,8 +1812,10 @@ struct CaptureInput
 					static_cast<BYTE>(block.slot) });
 			}
 		}
-		if (declarations.empty() ||
-			declarations.size() > D3D11_SO_STREAM_COUNT * D3D11_SO_OUTPUT_COMPONENT_COUNT)
+		// All declarations above belong to stream zero. Multiplying the limit by
+		// the number of streams accepted declarations that the active stream alone
+		// cannot represent and deferred the failure to D3D11On12's first draw.
+		if (declarations.empty() || declarations.size() > D3D11_SO_OUTPUT_COMPONENT_COUNT)
 			return false;
 		const HRESULT hr = device->CreateGeometryShaderWithStreamOutput(
 			m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(),
@@ -1819,6 +1826,20 @@ struct CaptureInput
 			cemuLog_log(LogType::Force, "D3D11 stream-output shader creation failed (0x{:08X})",
 				static_cast<uint32>(hr));
 			return false;
+		}
+		// When the GX2 draw also rasterizes, use stream zero as the rasterized
+		// stream. This captures and renders in one invocation instead of running
+		// the complete shader a second time. Keep the no-raster object above for
+		// rasterizer-kill/cull and as a compatibility fallback.
+		const HRESULT rasterizedHr = device->CreateGeometryShaderWithStreamOutput(
+			m_bytecode->GetBufferPointer(), m_bytecode->GetBufferSize(),
+			declarations.data(), static_cast<UINT>(declarations.size()),
+			strides.data(), strideCount, 0, nullptr, &m_streamoutRasterizedGs);
+		if (FAILED(rasterizedHr))
+		{
+			cemuLog_log(LogType::Force,
+				"D3D11 rasterized stream-output shader unavailable (0x{:08X}); using replay",
+				static_cast<uint32>(rasterizedHr));
 		}
 		return true;
 	}
@@ -1834,6 +1855,7 @@ struct CaptureInput
 	ComPtr<ID3D11PixelShader> m_ps;
 	ComPtr<ID3D11GeometryShader> m_gs;
 	ComPtr<ID3D11GeometryShader> m_streamoutGs;
+	ComPtr<ID3D11GeometryShader> m_streamoutRasterizedGs;
 	ComPtr<ID3D11VertexShader> m_pixelStreamoutCaptureVs;
 	ComPtr<ID3DBlob> m_pixelStreamoutCaptureBytecode;
 	std::array<UINT, 256> m_textureSlots{};
@@ -1949,7 +1971,13 @@ private:
 			D3D11Shader* shader{};
 			{
 				std::unique_lock lock(m_mutex);
-				m_condition.wait(lock, [this]() { return !m_running || !m_queue.empty(); });
+				m_condition.wait(lock, [this]() {
+					// Speculative native restoration is allowed only while Cemu is on the
+					// shader-loading screen. Once gameplay begins, queued shaders remain
+					// dormant until PreponeCompilation promotes one for the current draw.
+					return !m_running ||
+						(!m_queue.empty() && LatteShaderCache_IsLoading());
+				});
 				if (!m_running)
 					return;
 				shader = m_queue.front();
@@ -1961,9 +1989,8 @@ private:
 				++g_compiled_shaders_async;
 			shader->m_compilationState.setValue(D3D11Shader::CompilationState::Done);
 #if defined(CEMU_UWP)
-			// Give the emulation/render threads a scheduling window between cache
-			// entries. A foreground shader can still promote immediately, but a long
-			// cache restores no longer monopolizes the Series S compiler path.
+			// Keep the loading UI responsive between startup cache entries. Once the
+			// loading scope ends, the wait predicate above suspends speculative work.
 			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 #endif
 		}

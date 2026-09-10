@@ -6,6 +6,7 @@ struct CopyShaderPushConstantData_t
 	float vertexOffsets[4 * 2];
 	sint32 srcTexelOffset[2];
 };
+static_assert(sizeof(CopyShaderPushConstantData_t) == 40);
 
 struct CopySurfacePipelineInfo
 {
@@ -158,7 +159,7 @@ RendererShaderVk* _vkGenSurfaceCopyShader_vs()
 		"#version 450\r\n"
 		"layout(location = 0) out ivec2 passSrcTexelOffset;\r\n"
 		"layout(push_constant) uniform pushConstants {\r\n"
-		"vec2 vertexOffsets[4];\r\n"
+		"vec4 vertexOffsetsPacked[2];\r\n"
 		"ivec2 srcTexelOffset;\r\n"
 		"}uf_pushConstants;\r\n"
 		"\r\n"
@@ -168,12 +169,12 @@ RendererShaderVk* _vkGenSurfaceCopyShader_vs()
 		"switch(gl_VertexIndex)"
 		"{\r\n"
 		// AMD driver has issues with indexed push constant access, therefore use this workaround
-		"case 0: tPOS = uf_pushConstants.vertexOffsets[0].xy; break;\r\n"
-		"case 1: tPOS = uf_pushConstants.vertexOffsets[1].xy; break;\r\n"
-		"case 2: tPOS = uf_pushConstants.vertexOffsets[3].xy; break;\r\n"
-		"case 3: tPOS = uf_pushConstants.vertexOffsets[0].xy; break;\r\n"
-		"case 4: tPOS = uf_pushConstants.vertexOffsets[2].xy; break;\r\n"
-		"case 5: tPOS = uf_pushConstants.vertexOffsets[3].xy; break;\r\n"
+		"case 0: tPOS = uf_pushConstants.vertexOffsetsPacked[0].xy; break;\r\n"
+		"case 1: tPOS = uf_pushConstants.vertexOffsetsPacked[0].zw; break;\r\n"
+		"case 2: tPOS = uf_pushConstants.vertexOffsetsPacked[1].zw; break;\r\n"
+		"case 3: tPOS = uf_pushConstants.vertexOffsetsPacked[0].xy; break;\r\n"
+		"case 4: tPOS = uf_pushConstants.vertexOffsetsPacked[1].xy; break;\r\n"
+		"case 5: tPOS = uf_pushConstants.vertexOffsetsPacked[1].zw; break;\r\n"
 		"}"
 		"passSrcTexelOffset = uf_pushConstants.srcTexelOffset;\r\n"
 		"gl_Position = vec4(tPOS, 0, 1.0);\r\n"
