@@ -5,6 +5,12 @@
 
 #include <fmt/format.h>
 
+bool D3D11Renderer::IsDeviceLostResult(HRESULT result)
+{
+	return result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
+		result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
+}
+
 void D3D11Renderer::RecordDeviceLost(HRESULT result, const char* operation)
 {
 	bool expected = false;

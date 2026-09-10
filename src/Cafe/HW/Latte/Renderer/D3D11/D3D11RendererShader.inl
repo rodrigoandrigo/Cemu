@@ -58,7 +58,6 @@ public:
 			m_streamoutRasterizedGs.Get() : m_streamoutGs.Get();
 	}
 	bool HasRasterizedStreamoutGeometry() const { return m_streamoutRasterizedGs != nullptr; }
-	bool UsesStreamoutStorage() const { return m_usesStreamoutStorage; }
 	bool HasPixelStreamoutCapture() const
 	{
 		return m_pixelStreamoutCaptureVs && !m_pixelStreamoutCapturePasses.empty();
@@ -625,30 +624,6 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 			body.replace(scan, 13, "outputStream.Append(cemuOutput);");
 		while ((scan = body.find("EndPrimitive();")) != std::string::npos)
 			body.replace(scan, 15, "outputStream.RestartStrip();");
-		bool translatedStreamoutWrites = false;
-		size_t storageWrite{};
-		while ((storageWrite = body.find("sb_buffer[", storageWrite)) != std::string::npos)
-		{
-			const size_t addressBegin = storageWrite + 10;
-			const size_t addressEnd = body.find(']', addressBegin);
-			const size_t equals = addressEnd == std::string::npos ? std::string::npos :
-				body.find('=', addressEnd);
-			const size_t semicolon = equals == std::string::npos ? std::string::npos :
-				body.find(';', equals);
-			if (addressEnd == std::string::npos || equals == std::string::npos ||
-				semicolon == std::string::npos)
-				break;
-			const std::string address = body.substr(addressBegin, addressEnd - addressBegin);
-			const size_t valueBegin = body.find_first_not_of(" \t\r\n", equals + 1);
-			if (valueBegin == std::string::npos || valueBegin >= semicolon)
-				break;
-			const std::string value = body.substr(valueBegin, semicolon - valueBegin);
-			const std::string replacement = fmt::format(
-				"cemuStreamout.Store(({}) * 4, asuint({}));", address, value);
-			body.replace(storageWrite, semicolon - storageWrite + 1, replacement);
-			storageWrite += replacement.size();
-			translatedStreamoutWrites = true;
-		}
 		uint32 invocationCount = 1;
 		const bool usesInvocationId = source.find("gl_InvocationID") != std::string::npos;
 		const size_t invocationsMarker = source.find("invocations=");
@@ -670,12 +645,6 @@ uint4 CemuApplySamplerSwizzleU(uint4 v, uint4 s) {{ return uint4(CemuSwizzleComp
 		body.replace(body.find("void main()"), 11, signature);
 		const size_t mainBrace = body.find('{', body.find(signature));
 		body.insert(mainBrace + 1, "\nGeometryOutput cemuOutput = (GeometryOutput)0;");
-		if (translatedStreamoutWrites)
-		{
-			hlsl = fmt::format("RWByteAddressBuffer cemuStreamout : register(u{});\n",
-				StreamoutUavSlot) + hlsl;
-			m_usesStreamoutStorage = true;
-		}
 		hlsl += body;
 		UINT samplerSwizzleSlot{};
 		for (UINT slot : m_uniformSlots)
@@ -1292,21 +1261,9 @@ void main(point GeometryInput inputVertices[1],
 					m_uniformSlots[originalBinding] = uniformSlot;
 				uniformSlot += count;
 			}
-			UINT uavSlot{ StreamoutUavSlot };
-			for (const auto& resource : resources.storage_buffers)
-			{
-				const UINT count = descriptorCount(resource);
-				if (count > D3D11_PS_CS_UAV_REGISTER_COUNT - uavSlot)
-					throw std::runtime_error("shader requires more Feature Level 11.0 UAV slots than available");
-				spirv_cross::HLSLResourceBinding binding{};
-				binding.stage = executionModel;
-				binding.desc_set = compiler.get_decoration(resource.id, spv::DecorationDescriptorSet);
-				binding.binding = compiler.get_decoration(resource.id, spv::DecorationBinding);
-				binding.uav.register_binding = uavSlot;
-				compiler.add_hlsl_resource_binding(binding);
-				uavSlot += count;
-				m_usesStreamoutStorage = true;
-			}
+			if (!resources.storage_buffers.empty())
+				throw std::runtime_error(
+					"shader-storage buffers are unavailable at Direct3D Feature Level 11.0");
 			// SPIRV-Cross' HLSL backend recognizes geometry-stage reflection but
 			// cannot emit its entry point or stream operations. Calling compile()
 			// therefore throws CompilerError("Unsupported shader stage"). Keep the
@@ -1314,11 +1271,8 @@ void main(point GeometryInput inputVertices[1],
 			// shader instead of losing the stage (or stopping in the debugger).
 			if (executionModel == spv::ExecutionModelGeometry)
 			{
-				// The generic HLSL backend cannot emit a geometry entry point. Reset the
-				// reflected storage flag here; the syntax translator enables it again only
-				// after it has successfully lowered the sb_buffer writes to ByteAddressBuffer
-				// stores in the generated geometry shader.
-				m_usesStreamoutStorage = false;
+				// The generic HLSL backend cannot emit a geometry entry point. The syntax
+				// translator below lowers the geometry entry point explicitly.
 				DumpUnsupportedGeometrySource(source, spirv);
 				if (CompileKnownGeometryShader(device))
 				{
@@ -1862,7 +1816,6 @@ struct CaptureInput
 	std::array<UINT, 256> m_uniformSlots{};
 	UINT m_samplerSwizzleSlot{ InvalidSlot };
 	bool m_usesRuntimeSwizzle{};
-	bool m_usesStreamoutStorage{};
 	bool m_retryableCompilationFailure{};
 	std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> m_pixelStreamoutCaptureStrides{};
 	std::vector<PixelStreamoutCapturePass> m_pixelStreamoutCapturePasses;

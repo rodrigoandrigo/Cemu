@@ -7,39 +7,27 @@ void D3D11Renderer::bufferCache_init(const sint32 size)
 	desc.BindFlags = D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER;
 	ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &m_bufferCache), "Create buffer cache");
 	desc.ByteWidth = LatteStreamout_GetRingBufferSize();
-	// Xbox FL 11.0 uses the same raw ring buffer as the normal shader-storage
-	// path, but populates it from a pixel-UAV replay rather than VS/GS UAV stores.
-	// Keep this resource independent from UseTFViaSSBO(): the latter deliberately
-	// remains false on FL 11.0 so the decompiler emits the reflected XFB values
-	// consumed by the replay geometry shader.
-	const bool needsStreamoutStorageBuffer =
+	// Xbox FL 11.0 populates a raw ring buffer from the pixel-UAV replay. Desktop
+	// D3D11 uses native stream-output buffers instead.
 #if defined(CEMU_UWP)
-		true;
+	desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+	desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
+	ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &m_streamoutStorageBuffer),
+		"Create shader stream-output ring buffer");
+	D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
+	uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
+	uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
+	uavDesc.Buffer.NumElements = desc.ByteWidth / sizeof(uint32);
+	uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
+	ThrowIfFailed(m_device->CreateUnorderedAccessView(m_streamoutStorageBuffer.Get(),
+		&uavDesc, &m_streamoutStorageUav), "Create shader stream-output UAV");
 #else
-		UseTFViaSSBO();
+	desc.BindFlags = D3D11_BIND_STREAM_OUTPUT;
+	desc.MiscFlags = 0;
+	for (auto& streamoutBuffer : m_streamoutBuffers)
+		ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &streamoutBuffer),
+			"Create stream-output ring buffer");
 #endif
-	if (needsStreamoutStorageBuffer)
-	{
-		desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-		desc.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_ALLOW_RAW_VIEWS;
-		ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &m_streamoutStorageBuffer),
-			"Create shader stream-output ring buffer");
-		D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc{};
-		uavDesc.Format = DXGI_FORMAT_R32_TYPELESS;
-		uavDesc.ViewDimension = D3D11_UAV_DIMENSION_BUFFER;
-		uavDesc.Buffer.NumElements = desc.ByteWidth / sizeof(uint32);
-		uavDesc.Buffer.Flags = D3D11_BUFFER_UAV_FLAG_RAW;
-		ThrowIfFailed(m_device->CreateUnorderedAccessView(m_streamoutStorageBuffer.Get(),
-			&uavDesc, &m_streamoutStorageUav), "Create shader stream-output UAV");
-	}
-	else
-	{
-		desc.BindFlags = D3D11_BIND_STREAM_OUTPUT;
-		desc.MiscFlags = 0;
-		for (auto& streamoutBuffer : m_streamoutBuffers)
-			ThrowIfFailed(m_device->CreateBuffer(&desc, nullptr, &streamoutBuffer),
-				"Create stream-output ring buffer");
-	}
 #if defined(CEMU_UWP)
 	D3D11_TEXTURE2D_DESC captureTargetDesc{};
 	captureTargetDesc.Width = StreamoutPixelCaptureWidth;
@@ -207,14 +195,7 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 	FlushBufferCacheUploads();
 	if (m_streamoutActive)
 	{
-		if (m_streamoutUsesStorage)
-		{
-			ID3D11UnorderedAccessView* empty{};
-			m_context->OMSetRenderTargetsAndUnorderedAccessViews(
-				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
-				StreamoutUavSlot, 1, &empty, nullptr);
-		}
-		else if (!m_streamoutUsesPixelCapture)
+		if (!m_streamoutUsesPixelCapture)
 		{
 			std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
 			std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
@@ -222,8 +203,8 @@ void D3D11Renderer::bufferCache_copyStreamoutToMainBuffer(uint32 src, uint32 dst
 		}
 		m_streamoutActive = false;
 	}
-	ID3D11Buffer* sourceBuffer = m_streamoutDataAvailable &&
-		(m_streamoutUsesStorage || m_streamoutUsesPixelCapture) ? m_streamoutStorageBuffer.Get() : nullptr;
+	ID3D11Buffer* sourceBuffer = m_streamoutDataAvailable && m_streamoutUsesPixelCapture ?
+		m_streamoutStorageBuffer.Get() : nullptr;
 	for (UINT i = 0; !sourceBuffer && i < m_streamoutBuffers.size(); ++i)
 	{
 		if (m_streamoutEnabled[i] && m_streamoutOffsets[i] == src)
@@ -404,7 +385,7 @@ RendererShader* D3D11Renderer::shader_create(RendererShader::ShaderType type, ui
 		if (m_deviceLost.load(std::memory_order_relaxed))
 			return nullptr;
 		constexpr uint64 stopCompileMB = D3D11ProcessMemoryLimitMB;
-		uint64 commitMB = QueryProcessCommitBytes() / (1024 * 1024);
+		uint64 commitMB = QueryProcessPrivateCommitBytes() / (1024 * 1024);
 		if (commitMB >= stopCompileMB)
 		{
 			cemuLog_log(LogType::Force,

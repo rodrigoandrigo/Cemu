@@ -16,7 +16,6 @@ void D3D11Renderer::streamout_setupXfbBuffer(uint32 index, sint32 ringBufferOffs
 
 void D3D11Renderer::streamout_begin()
 {
-	m_streamoutUsesStorage = false;
 	m_streamoutUsesPixelCapture = false;
 	m_streamoutNativeRasterized = false;
 	m_streamoutDataAvailable = false;
@@ -61,21 +60,6 @@ void D3D11Renderer::streamout_begin()
 			m_streamoutActive = true;
 			return;
 		}
-	}
-	// Prefer native stream output for a real geometry stage. Besides capturing the
-	// actual emitted vertices, it avoids the all-stage UAV slot used by the shader
-	// storage path, which is not portable at Feature Level 11.0.
-	if (!gsContext && shader && shader->UsesStreamoutStorage() && hasOutputBuffer &&
-		m_streamoutStorageUav)
-	{
-		ID3D11UnorderedAccessView* uav = m_streamoutStorageUav.Get();
-		m_context->OMSetRenderTargetsAndUnorderedAccessViews(
-			D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
-			StreamoutUavSlot, 1, &uav, nullptr);
-		m_streamoutUsesStorage = true;
-		m_streamoutDataAvailable = true;
-		m_streamoutActive = true;
-		return;
 	}
 #if defined(CEMU_UWP)
 	if (!gsContext && shader && shader->HasPixelStreamoutCapture() && hasOutputBuffer &&
@@ -137,14 +121,7 @@ void D3D11Renderer::streamout_rendererFinishDrawcall()
 {
 	if (m_streamoutActive)
 	{
-		if (m_streamoutUsesStorage)
-		{
-			ID3D11UnorderedAccessView* empty{};
-			m_context->OMSetRenderTargetsAndUnorderedAccessViews(
-				D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL, nullptr, nullptr,
-				StreamoutUavSlot, 1, &empty, nullptr);
-		}
-		else if (!m_streamoutUsesPixelCapture)
+		if (!m_streamoutUsesPixelCapture)
 		{
 			std::array<ID3D11Buffer*, LATTE_NUM_STREAMOUT_BUFFER> empty{};
 			std::array<UINT, LATTE_NUM_STREAMOUT_BUFFER> offsets{};
@@ -152,7 +129,6 @@ void D3D11Renderer::streamout_rendererFinishDrawcall()
 		}
 		m_streamoutActive = false;
 	}
-	m_streamoutUsesStorage = false;
 	m_streamoutUsesPixelCapture = false;
 	m_streamoutNativeRasterized = false;
 	m_streamoutDataAvailable = false;

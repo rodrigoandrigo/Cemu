@@ -788,8 +788,7 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	// normal upload. Force a fresh cached allocation here and retain its tiny CPU
 	// staging copy just until the replay has converted it into a GPU record map.
 	m_keepIndexStagingForPixelStreamout = false;
-	if (indices && !UseTFViaSSBO() &&
-		LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0 &&
+	if (indices && LatteGPUState.contextRegister[mmVGT_STRMOUT_EN] != 0 &&
 		!LatteSHRC_GetActiveGeometryShader())
 	{
 		auto* vertexContext = LatteSHRC_GetActiveVertexShader();
@@ -876,24 +875,13 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 		LatteGPUState.contextNew.PA_SU_SC_MODE_CNTL.get_CULL_BACK();
 	const bool skipRasterDraw =
 		(rasterizerKilled || bothFacesCulled) && !m_streamoutActive;
-	const bool suppressStorageRaster =
-		(rasterizerKilled || bothFacesCulled) && m_streamoutActive && m_streamoutUsesStorage;
 	const bool skipPixelCaptureRaster =
 		(rasterizerKilled || bothFacesCulled) && m_streamoutActive && m_streamoutUsesPixelCapture;
-	if (suppressStorageRaster)
-	{
-		// The UAV shader must still execute to produce transform feedback, but GX2
-		// requested no raster output. Remove RTV/DSV bindings for this draw while
-		// retaining the stream-out UAV; the active cached FBO is restored below.
-		ID3D11UnorderedAccessView* uav = m_streamoutStorageUav.Get();
-		m_context->OMSetRenderTargetsAndUnorderedAccessViews(0, nullptr, nullptr,
-			StreamoutUavSlot, 1, &uav, nullptr);
-	}
-	else if (skipPixelCaptureRaster)
+	if (skipPixelCaptureRaster)
 	{
 		// Pixel-UAV capture is replayed below with a private target. Unlike the
-		// shader-storage path, the title draw itself has no feedback work left to
-		// execute, so honoring GX2 raster discard avoids a redundant full draw.
+		// The title draw itself has no feedback work left to execute, so honoring
+		// GX2 raster discard avoids a redundant full draw.
 		m_context->OMSetRenderTargets(0, nullptr, nullptr);
 	}
 
@@ -945,7 +933,7 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	// A native object using rasterized stream zero captures and renders in this
 	// draw. Only the no-raster compatibility object needs the old replay.
 	const bool needsRasterReplay = drawIssued && m_streamoutActive &&
-		!m_streamoutUsesStorage && !m_streamoutUsesPixelCapture &&
+		!m_streamoutUsesPixelCapture &&
 		!m_streamoutNativeRasterized;
 	// Present reports removal every frame. On Xbox, sample at the first draw of
 	// each frame as well, retaining early diagnostics without calling through
@@ -1005,7 +993,7 @@ void D3D11Renderer::draw_execute(uint32 baseVertex, uint32 baseInstance, uint32 
 	}
 	// This also unbinds SO and restores the title/rectangle geometry shader.
 	LatteStreamout_FinishDrawcall(false);
-	if ((suppressStorageRaster || skipPixelCaptureRaster) && m_activeFbo)
+	if (skipPixelCaptureRaster && m_activeFbo)
 	{
 		auto* nativeFbo = static_cast<D3D11CachedFBO*>(m_activeFbo);
 		m_context->OMSetRenderTargets(nativeFbo->targetCount,

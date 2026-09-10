@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <cmath>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <string_view>
@@ -47,6 +48,8 @@ struct VkDevice_T
 	ComPtr<ID3D12DescriptorHeap> dsvHeap;
 	ComPtr<ID3D12RootSignature> blitRoot;
 	ComPtr<ID3D12PipelineState> blitPipeline;
+	ComPtr<ID3D12RootSignature> vertexConvertRoot;
+	ComPtr<ID3D12PipelineState> vertexConvertPipeline;
 	UINT resourceStride{}, samplerStride{}, rtvStride{}, dsvStride{};
 	std::atomic_uint32_t resourceCursor{}, samplerCursor{}, rtvCursor{}, dsvCursor{};
 	std::mutex viewDescriptorMutex;
@@ -85,6 +88,16 @@ struct VkImage_T
 struct VkFence_T { ComPtr<ID3D12Fence> native; uint64_t value{1}; HANDLE eventHandle{}; };
 struct VkSemaphore_T { ComPtr<ID3D12Fence> native; std::atomic_uint64_t value{0}; };
 struct VkCommandPool_T { VkDevice device{}; };
+struct ConvertedVertexBuffer
+{
+	VkPipeline pipeline{};
+	VkBuffer source{};
+	VkDeviceSize bindingOffset{};
+	uint32_t conversionIndex{};
+	uint32_t capacity{};
+	ComPtr<ID3D12Resource> resource;
+	D3D12_RESOURCE_STATES state{D3D12_RESOURCE_STATE_COMMON};
+};
 struct VkCommandBuffer_T
 {
 	VkDevice device{};
@@ -94,8 +107,18 @@ struct VkCommandBuffer_T
 	VkRenderPass activeRenderPass{};
 	VkFramebuffer activeFramebuffer{};
 	VkPipeline activePipeline{};
+	ComPtr<ID3D12PipelineState> activeNativeState;
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC activeGraphicsDesc{};
+	uint32_t boundRtvCount{};
+	bool boundDsv{};
+	std::array<DXGI_FORMAT,8> boundRtvFormats{};
+	DXGI_FORMAT boundDsvFormat{DXGI_FORMAT_UNKNOWN};
+	std::array<VkBuffer,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBuffers{};
+	std::array<VkDeviceSize,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBufferOffsets{};
+	uint32_t vertexBufferCount{};
 	std::vector<ComPtr<ID3D12PipelineState>> transientStates;
 	std::vector<ComPtr<ID3D12Resource>> transientResources;
+	std::vector<ConvertedVertexBuffer> convertedVertexBuffers;
 	std::vector<const char*> operationTrace;
 };
 struct VkDebugUtilsMessengerEXT_T
@@ -125,7 +148,14 @@ struct VkDescriptorSet_T
 };
 struct VkDescriptorPool_T { std::vector<VkDescriptorSet> sets; };
 struct VkPipelineLayout_T { ComPtr<ID3D12RootSignature> root; uint32_t setCount{}; uint32_t pushRootIndex{UINT32_MAX}; uint32_t pushDwords{}; };
-struct VkPipeline_T { ComPtr<ID3D12PipelineState> state; ComPtr<ID3DBlob> vertexShader,pixelShader,geometryShader; VkPipelineLayout layout{}; D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsDesc{}; std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements; D3D12_PRIMITIVE_TOPOLOGY topology{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST}; bool compute{}; };
+struct VertexConversion
+{
+	uint32_t sourceBinding{},sourceOffset{},sourceStride{},sourceBytes{};
+	uint32_t outputSlot{},outputStride{},alphaValue{};
+	D3D12_INPUT_CLASSIFICATION inputClass{D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA};
+	uint32_t instanceStepRate{};
+};
+struct VkPipeline_T { ComPtr<ID3D12PipelineState> state; ComPtr<ID3DBlob> vertexShader,pixelShader,geometryShader; VkPipelineLayout layout{}; D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsDesc{}; std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements; std::vector<VertexConversion> vertexConversions; std::array<uint32_t,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexStrides{}; D3D12_PRIMITIVE_TOPOLOGY topology{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST}; bool compute{}; };
 struct VkRenderPass_T
 {
 	std::vector<VkAttachmentDescription> attachments;
@@ -319,6 +349,38 @@ DXGI_FORMAT ToDxgiFormat(VkFormat format)
 	}
 }
 
+DXGI_FORMAT ToDxgiVertexFormat(VkFormat format)
+{
+	switch(format)
+	{
+	case VK_FORMAT_R8G8B8_UNORM:return DXGI_FORMAT_R8G8B8A8_UNORM;
+	case VK_FORMAT_R8G8B8_SNORM:return DXGI_FORMAT_R8G8B8A8_SNORM;
+	case VK_FORMAT_R8G8B8_UINT:return DXGI_FORMAT_R8G8B8A8_UINT;
+	case VK_FORMAT_R8G8B8_SINT:return DXGI_FORMAT_R8G8B8A8_SINT;
+	case VK_FORMAT_R16G16B16_UNORM:return DXGI_FORMAT_R16G16B16A16_UNORM;
+	case VK_FORMAT_R16G16B16_SNORM:return DXGI_FORMAT_R16G16B16A16_SNORM;
+	case VK_FORMAT_R16G16B16_UINT:return DXGI_FORMAT_R16G16B16A16_UINT;
+	case VK_FORMAT_R16G16B16_SINT:return DXGI_FORMAT_R16G16B16A16_SINT;
+	case VK_FORMAT_R16G16B16_SFLOAT:return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	default:return ToDxgiFormat(format);
+	}
+}
+
+bool GetVertexConversion(VkFormat format,uint32_t& sourceBytes,uint32_t& outputStride,uint32_t& alphaValue)
+{
+	switch(format)
+	{
+	case VK_FORMAT_R8G8B8_UNORM:sourceBytes=3;outputStride=4;alphaValue=0xff;return true;
+	case VK_FORMAT_R8G8B8_SNORM:sourceBytes=3;outputStride=4;alphaValue=0x7f;return true;
+	case VK_FORMAT_R8G8B8_UINT:case VK_FORMAT_R8G8B8_SINT:sourceBytes=3;outputStride=4;alphaValue=1;return true;
+	case VK_FORMAT_R16G16B16_UNORM:sourceBytes=6;outputStride=8;alphaValue=0xffff;return true;
+	case VK_FORMAT_R16G16B16_SNORM:sourceBytes=6;outputStride=8;alphaValue=0x7fff;return true;
+	case VK_FORMAT_R16G16B16_UINT:case VK_FORMAT_R16G16B16_SINT:sourceBytes=6;outputStride=8;alphaValue=1;return true;
+	case VK_FORMAT_R16G16B16_SFLOAT:sourceBytes=6;outputStride=8;alphaValue=0x3c00;return true;
+	default:return false;
+	}
+}
+
 DXGI_FORMAT ToDxgiResourceFormat(VkFormat format)
 {
 	switch(format)
@@ -328,6 +390,19 @@ DXGI_FORMAT ToDxgiResourceFormat(VkFormat format)
 	case VK_FORMAT_D32_SFLOAT: return DXGI_FORMAT_R32_TYPELESS;
 	case VK_FORMAT_D32_SFLOAT_S8_UINT: return DXGI_FORMAT_R32G8X24_TYPELESS;
 	default: return ToDxgiFormat(format);
+	}
+}
+
+bool IsBlockCompressedFormat(VkFormat format)
+{
+	switch(format)
+	{
+	case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:case VK_FORMAT_BC1_RGBA_SRGB_BLOCK:
+	case VK_FORMAT_BC2_UNORM_BLOCK:case VK_FORMAT_BC2_SRGB_BLOCK:
+	case VK_FORMAT_BC3_UNORM_BLOCK:case VK_FORMAT_BC3_SRGB_BLOCK:
+	case VK_FORMAT_BC4_UNORM_BLOCK:case VK_FORMAT_BC4_SNORM_BLOCK:
+	case VK_FORMAT_BC5_UNORM_BLOCK:case VK_FORMAT_BC5_SNORM_BLOCK:return true;
+	default:return false;
 	}
 }
 
@@ -383,6 +458,30 @@ bool CreateBlitPipeline(VkDevice_T* device)
 	static constexpr char shader[]="Texture2D<float4> S:register(t0);RWTexture2D<float4> D:register(u0);cbuffer C:register(b0){int2 so;int2 ss;int2 do_;int2 ds;}[numthreads(8,8,1)]void main(uint3 id:SV_DispatchThreadID){if(any(id.xy>=uint2(ds)))return;float2 q=(float2(id.xy)+.5)*float2(ss)/float2(ds)-.5;int2 p=clamp(int2(round(q))+so,so,so+ss-1);D[do_+int2(id.xy)]=S.Load(int3(p,0));}";ComPtr<ID3DBlob> code;if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"main","cs_5_1",D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL1,0,&code,&error)))return false;D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=device->blitRoot.Get();pd.CS={code->GetBufferPointer(),code->GetBufferSize()};return SUCCEEDED(device->native->CreateComputePipelineState(&pd,IID_PPV_ARGS(&device->blitPipeline)));
 }
 
+bool CreateVertexConvertPipeline(VkDevice_T* device)
+{
+	D3D12_ROOT_PARAMETER params[3]{};
+	params[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_SRV;params[0].Descriptor={0,0};
+	params[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_UAV;params[1].Descriptor={0,0};
+	params[2].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;params[2].Constants={0,0,7};
+	for(auto& param:params)param.ShaderVisibility=D3D12_SHADER_VISIBILITY_ALL;
+	D3D12_ROOT_SIGNATURE_DESC rootDesc{};rootDesc.NumParameters=3;rootDesc.pParameters=params;
+	ComPtr<ID3DBlob> root,error;
+	if(FAILED(D3D12SerializeRootSignature(&rootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&root,&error))||
+		FAILED(device->native->CreateRootSignature(0,root->GetBufferPointer(),root->GetBufferSize(),IID_PPV_ARGS(&device->vertexConvertRoot))))return false;
+	static constexpr char shader[]=
+		"ByteAddressBuffer S:register(t0);RWByteAddressBuffer D:register(u0);"
+		"cbuffer C:register(b0){uint srcBase;uint srcStride;uint dstStride;uint count;uint srcBytes;uint alphaValue;uint unused;}"
+		"uint B(uint a){uint w=S.Load(a&~3u);return(w>>((a&3u)*8u))&255u;}"
+		"[numthreads(64,1,1)]void main(uint3 tid:SV_DispatchThreadID){uint i=tid.x;if(i>=count)return;"
+		"uint s=srcBase+i*srcStride,d=i*dstStride;uint x=B(s)|(B(s+1)<<8)|(B(s+2)<<16);"
+		"if(srcBytes==3)D.Store(d,x|(alphaValue<<24));else{D.Store(d,x|B(s+3)<<24);uint y=B(s+4)|(B(s+5)<<8)|(alphaValue<<16);D.Store(d+4,y);}}";
+	ComPtr<ID3DBlob> code;
+	if(FAILED(D3DCompile(shader,sizeof(shader)-1,nullptr,nullptr,nullptr,"main","cs_5_1",D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL1,0,&code,&error)))return false;
+	D3D12_COMPUTE_PIPELINE_STATE_DESC pipelineDesc{};pipelineDesc.pRootSignature=device->vertexConvertRoot.Get();pipelineDesc.CS={code->GetBufferPointer(),code->GetBufferSize()};
+	return SUCCEEDED(device->native->CreateComputePipelineState(&pipelineDesc,IID_PPV_ARGS(&device->vertexConvertPipeline)));
+}
+
 constexpr std::array<VkExtensionProperties, 3> kInstanceExtensions{{
 	{VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
 	{VK_KHR_WIN32_SURFACE_EXTENSION_NAME, VK_KHR_WIN32_SURFACE_SPEC_VERSION},
@@ -409,14 +508,15 @@ VkResult Enumerate(const std::array<T, N>& source, uint32_t* count, T* output)
 
 VkResult CreatePhysical(VkInstance_T* instance)
 {
-	ComPtr<IDXGIFactory6> factory;
+	ComPtr<IDXGIFactory2> factory;
 	if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
 		return VK_ERROR_INITIALIZATION_FAILED;
 	ComPtr<IDXGIAdapter1> adapter;
-	for (UINT i = 0; ; ++i)
+	ComPtr<IDXGIFactory6> factory6;
+	if (SUCCEEDED(factory.As(&factory6))) for (UINT i = 0; ; ++i)
 	{
 		ComPtr<IDXGIAdapter1> candidate;
-		const HRESULT hr = factory->EnumAdapterByGpuPreference(i,
+		const HRESULT hr = factory6->EnumAdapterByGpuPreference(i,
 			DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&candidate));
 		if (hr == DXGI_ERROR_NOT_FOUND) break;
 		if (FAILED(hr)) continue;
@@ -427,6 +527,15 @@ VkResult CreatePhysical(VkInstance_T* instance)
 				__uuidof(ID3D12Device), nullptr)))
 		{ adapter = candidate; break; }
 	}
+	if (!adapter) for (UINT i = 0; ; ++i)
+	{
+		ComPtr<IDXGIAdapter1> candidate;
+		const HRESULT hr=factory->EnumAdapters1(i,&candidate);
+		if(hr==DXGI_ERROR_NOT_FOUND)break;
+		if(FAILED(hr))continue;
+		DXGI_ADAPTER_DESC1 desc{};candidate->GetDesc1(&desc);
+		if(!(desc.Flags&DXGI_ADAPTER_FLAG_SOFTWARE)&&SUCCEEDED(D3D12CreateDevice(candidate.Get(),D3D_FEATURE_LEVEL_11_0,__uuidof(ID3D12Device),nullptr))){adapter=candidate;break;}
+	}
 	if (!adapter) return VK_ERROR_INCOMPATIBLE_DRIVER;
 	auto physical = std::make_unique<VkPhysicalDevice_T>();
 	physical->instance = instance;
@@ -435,7 +544,9 @@ VkResult CreatePhysical(VkInstance_T* instance)
 	if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
 		IID_PPV_ARGS(&physical->native))))
 		return VK_ERROR_INCOMPATIBLE_DRIVER;
+	#if !defined(CEMU_UWP)
 	ConfigureValidationMessageFilter(physical->native.Get());
+	#endif
 	instance->physical = std::move(physical);
 	return VK_SUCCESS;
 }
@@ -544,7 +655,7 @@ VKAPI_ATTR void VKAPI_CALL IGetPhysicalDeviceMemoryProperties(VkPhysicalDevice p
 }
 VKAPI_ATTR void VKAPI_CALL IGetPhysicalDeviceFormatProperties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties* out)
 {
-		if (!out) return; *out = {};const DXGI_FORMAT nativeFormat=ToDxgiFormat(format);if(!physical||format==VK_FORMAT_UNDEFINED||nativeFormat==DXGI_FORMAT_UNKNOWN)return;D3D12_FEATURE_DATA_FORMAT_SUPPORT support{nativeFormat};if(FAILED(physical->native->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&support,sizeof(support))))return;
+		if (!out) return; *out = {};if(!physical||format==VK_FORMAT_UNDEFINED)return;uint32_t sourceBytes{},outputStride{},alphaValue{};if(GetVertexConversion(format,sourceBytes,outputStride,alphaValue))out->bufferFeatures|=VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;const DXGI_FORMAT nativeFormat=ToDxgiFormat(format);if(nativeFormat==DXGI_FORMAT_UNKNOWN)return;D3D12_FEATURE_DATA_FORMAT_SUPPORT support{nativeFormat};if(FAILED(physical->native->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,&support,sizeof(support))))return;
 		const bool copySupported=(support.Support1&D3D12_FORMAT_SUPPORT1_TEXTURE1D)||(support.Support1&D3D12_FORMAT_SUPPORT1_TEXTURE2D)||(support.Support1&D3D12_FORMAT_SUPPORT1_TEXTURE3D);if(copySupported)out->optimalTilingFeatures|=VK_FORMAT_FEATURE_TRANSFER_SRC_BIT|VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
 		if(support.Support1&D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE)out->optimalTilingFeatures|=VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT|VK_FORMAT_FEATURE_BLIT_SRC_BIT;
 		if(support.Support1&D3D12_FORMAT_SUPPORT1_RENDER_TARGET)out->optimalTilingFeatures|=VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_BLIT_DST_BIT;
@@ -570,7 +681,7 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreateDevice(VkPhysicalDevice physical, const Vk
 		!CreateDescriptorHeap(device.get(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2048,
 			D3D12_DESCRIPTOR_HEAP_FLAG_NONE, device->dsvHeap, device->dsvStride))
 		return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-	if(!CreateBlitPipeline(device.get()))return VK_ERROR_INITIALIZATION_FAILED;
+	if(!CreateBlitPipeline(device.get())||!CreateVertexConvertPipeline(device.get()))return VK_ERROR_INITIALIZATION_FAILED;
 	device->queue.device = device.get(); *out = device.release(); return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL IDestroyDevice(VkDevice device, const VkAllocationCallbacks*) { delete device; }
@@ -649,7 +760,7 @@ VKAPI_ATTR void VKAPI_CALL IDestroyCommandPool(VkDevice,VkCommandPool pool,const
 VKAPI_ATTR VkResult VKAPI_CALL IAllocateCommandBuffers(VkDevice device,const VkCommandBufferAllocateInfo* info,VkCommandBuffer* out)
 {if(!device||!info||!out)return VK_ERROR_INITIALIZATION_FAILED;for(uint32_t i=0;i<info->commandBufferCount;i++){auto c=std::make_unique<VkCommandBuffer_T>();c->device=device;if(FAILED(device->native->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&c->allocator)))||FAILED(device->native->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,c->allocator.Get(),nullptr,IID_PPV_ARGS(&c->list))))return VK_ERROR_OUT_OF_HOST_MEMORY;c->list->Close();out[i]=c.release();}return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL IFreeCommandBuffers(VkDevice,VkCommandPool,uint32_t count,const VkCommandBuffer* buffers){for(uint32_t i=0;i<count;i++)delete buffers[i];}
-VKAPI_ATTR VkResult VKAPI_CALL IBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo*){if(!c)return VK_ERROR_INITIALIZATION_FAILED;c->transientStates.clear();c->transientResources.clear();c->operationTrace.clear();c->activePipeline=VK_NULL_HANDLE;c->activeRenderPass=VK_NULL_HANDLE;c->activeFramebuffer=VK_NULL_HANDLE;if(FAILED(c->allocator->Reset())||FAILED(c->list->Reset(c->allocator.Get(),nullptr)))return VK_ERROR_DEVICE_LOST;c->recording=true;TraceOperation(c,"BeginCommandBuffer");return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL IBeginCommandBuffer(VkCommandBuffer c,const VkCommandBufferBeginInfo*){if(!c)return VK_ERROR_INITIALIZATION_FAILED;c->transientStates.clear();c->transientResources.clear();c->convertedVertexBuffers.clear();c->operationTrace.clear();c->activePipeline=VK_NULL_HANDLE;c->activeNativeState.Reset();c->activeGraphicsDesc={};c->activeRenderPass=VK_NULL_HANDLE;c->activeFramebuffer=VK_NULL_HANDLE;c->boundRtvCount=0;c->boundDsv=false;c->boundRtvFormats.fill(DXGI_FORMAT_UNKNOWN);c->boundDsvFormat=DXGI_FORMAT_UNKNOWN;c->vertexBuffers.fill(VK_NULL_HANDLE);c->vertexBufferOffsets.fill(0);c->vertexBufferCount=0;if(FAILED(c->allocator->Reset())||FAILED(c->list->Reset(c->allocator.Get(),nullptr)))return VK_ERROR_DEVICE_LOST;c->recording=true;TraceOperation(c,"BeginCommandBuffer");return VK_SUCCESS;}
 VKAPI_ATTR VkResult VKAPI_CALL IEndCommandBuffer(VkCommandBuffer c){if(!c||!c->recording)return VK_ERROR_INITIALIZATION_FAILED;TraceOperation(c,"EndCommandBuffer");c->recording=false;return SUCCEEDED(c->list->Close())?VK_SUCCESS:VK_ERROR_DEVICE_LOST;}
 VKAPI_ATTR VkResult VKAPI_CALL IResetCommandBuffer(VkCommandBuffer c,VkCommandBufferResetFlags){return IBeginCommandBuffer(c,nullptr)==VK_SUCCESS?(c->list->Close(),c->recording=false,VK_SUCCESS):VK_ERROR_DEVICE_LOST;}
 VKAPI_ATTR VkResult VKAPI_CALL ICreateFence(VkDevice device,const VkFenceCreateInfo* info,const VkAllocationCallbacks*,VkFence* out)
@@ -669,7 +780,7 @@ VKAPI_ATTR VkResult VKAPI_CALL IGetEventStatus(VkDevice,VkEvent event){return ev
 VKAPI_ATTR void VKAPI_CALL ICmdSetEvent(VkCommandBuffer,VkEvent event,VkPipelineStageFlags){if(event)event->signaled.store(true);}
 VKAPI_ATTR void VKAPI_CALL ICmdWaitEvents(VkCommandBuffer c,uint32_t count,const VkEvent* events,VkPipelineStageFlags,VkPipelineStageFlags,uint32_t,const VkMemoryBarrier*,uint32_t,const VkBufferMemoryBarrier*,uint32_t imageCount,const VkImageMemoryBarrier* images){if(!c)return;for(uint32_t i=0;i<count;i++)if(events[i])(void)events[i]->signaled.load();ICmdPipelineBarrier(c,0,0,0,0,nullptr,0,nullptr,imageCount,images);}
 VKAPI_ATTR VkResult VKAPI_CALL IQueueSubmit(VkQueue q,uint32_t count,const VkSubmitInfo* submits,VkFence fence)
-{if(!q)return VK_ERROR_DEVICE_LOST;for(uint32_t s=0;s<count;s++){for(uint32_t i=0;i<submits[s].waitSemaphoreCount;i++){auto sem=submits[s].pWaitSemaphores[i];if(FAILED(q->native->Wait(sem->native.Get(),sem->value.load()))){LogCommandBufferTrace(submits[s]);LogDeviceRemovedDiagnostics(q->device,"queue wait");return VK_ERROR_DEVICE_LOST;}}std::vector<ID3D12CommandList*> lists;for(uint32_t i=0;i<submits[s].commandBufferCount;i++)if(submits[s].pCommandBuffers[i]&&submits[s].pCommandBuffers[i]->list)lists.push_back(submits[s].pCommandBuffers[i]->list.Get());if(!lists.empty())q->native->ExecuteCommandLists(static_cast<UINT>(lists.size()),lists.data());for(uint32_t i=0;i<submits[s].signalSemaphoreCount;i++){auto sem=submits[s].pSignalSemaphores[i];const auto value=sem->value.fetch_add(1)+1;if(FAILED(q->native->Signal(sem->native.Get(),value))){LogCommandBufferTrace(submits[s]);LogDeviceRemovedDiagnostics(q->device,"queue semaphore signal");return VK_ERROR_DEVICE_LOST;}}const HRESULT removed=q->device->native->GetDeviceRemovedReason();if(FAILED(removed)){LogCommandBufferTrace(submits[s]);LogDeviceRemovedDiagnostics(q->device,"queue submission");return VK_ERROR_DEVICE_LOST;}}if(fence&&FAILED(q->native->Signal(fence->native.Get(),fence->value))){if(count)LogCommandBufferTrace(submits[count-1]);LogDeviceRemovedDiagnostics(q->device,"queue fence signal");return VK_ERROR_DEVICE_LOST;}return VK_SUCCESS;}
+{if(!q)return VK_ERROR_DEVICE_LOST;for(uint32_t s=0;s<count;s++){for(uint32_t i=0;i<submits[s].waitSemaphoreCount;i++){auto sem=submits[s].pWaitSemaphores[i];if(FAILED(q->native->Wait(sem->native.Get(),sem->value.load()))){LogCommandBufferTrace(submits[s]);LogDeviceRemovedDiagnostics(q->device,"queue wait");return VK_ERROR_DEVICE_LOST;}}std::vector<ID3D12CommandList*> lists;for(uint32_t i=0;i<submits[s].commandBufferCount;i++)if(submits[s].pCommandBuffers[i]&&submits[s].pCommandBuffers[i]->list)lists.push_back(submits[s].pCommandBuffers[i]->list.Get());if(!lists.empty()){q->native->ExecuteCommandLists(static_cast<UINT>(lists.size()),lists.data());static std::atomic_bool firstSubmitLogged{false};if(!firstSubmitLogged.exchange(true))cemuLog_log(LogType::Force,"D3D12 diagnostic: first command-list submission executed");}for(uint32_t i=0;i<submits[s].signalSemaphoreCount;i++){auto sem=submits[s].pSignalSemaphores[i];const auto value=sem->value.fetch_add(1)+1;if(FAILED(q->native->Signal(sem->native.Get(),value))){LogCommandBufferTrace(submits[s]);LogDeviceRemovedDiagnostics(q->device,"queue semaphore signal");return VK_ERROR_DEVICE_LOST;}}const HRESULT removed=q->device->native->GetDeviceRemovedReason();if(FAILED(removed)){LogCommandBufferTrace(submits[s]);LogDeviceRemovedDiagnostics(q->device,"queue submission");return VK_ERROR_DEVICE_LOST;}}if(fence&&FAILED(q->native->Signal(fence->native.Get(),fence->value))){if(count)LogCommandBufferTrace(submits[count-1]);LogDeviceRemovedDiagnostics(q->device,"queue fence signal");return VK_ERROR_DEVICE_LOST;}return VK_SUCCESS;}
 D3D12_RESOURCE_STATES StateForLayout(VkImage image,VkImageLayout layout)
 {
 	if(layout==VK_IMAGE_LAYOUT_GENERAL&&image&&image->resource)
@@ -687,14 +798,53 @@ void TransitionBuffer(VkCommandBuffer c,VkBuffer buffer,D3D12_RESOURCE_STATES ta
 	if(!c||!buffer||!buffer->resource||buffer->state==target||buffer->memory&&buffer->memory->type==1)return;
 	D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barrier.Transition={buffer->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,buffer->state,target};c->list->ResourceBarrier(1,&barrier);buffer->state=target;
 }
+VkDeviceSize NativeBufferOffset(VkBuffer buffer)
+{
+	return buffer&&buffer->memory&&buffer->memory->type!=0?buffer->memoryOffset:0;
+}
 void TransitionImage(VkCommandBuffer c,VkImage image,D3D12_RESOURCE_STATES target)
 {
 	if(!c||!image||!image->resource||image->state==target)return;D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barrier.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&barrier);image->state=target;
 }
-VKAPI_ATTR void VKAPI_CALL ICmdPipelineBarrier(VkCommandBuffer c,VkPipelineStageFlags,VkPipelineStageFlags,VkDependencyFlags,uint32_t,const VkMemoryBarrier*,uint32_t,const VkBufferMemoryBarrier*,uint32_t imageCount,const VkImageMemoryBarrier* images)
-{if(!c)return;std::vector<D3D12_RESOURCE_BARRIER> barriers;for(uint32_t i=0;i<imageCount;i++){auto image=images[i].image;if(!image||!image->resource)continue;auto target=StateForLayout(image,images[i].newLayout);if(target==image->state)continue;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=image->resource.Get();b.Transition.StateBefore=image->state;b.Transition.StateAfter=target;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;barriers.push_back(b);image->state=target;}if(!barriers.empty())c->list->ResourceBarrier(static_cast<UINT>(barriers.size()),barriers.data());}
+D3D12_RESOURCE_STATES StateForBufferAccess(VkAccessFlags2 access)
+{
+	if(access&(VK_ACCESS_2_SHADER_WRITE_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT))return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	if(access&VK_ACCESS_2_TRANSFER_WRITE_BIT)return D3D12_RESOURCE_STATE_COPY_DEST;
+	D3D12_RESOURCE_STATES state=D3D12_RESOURCE_STATE_COMMON;
+	if(access&VK_ACCESS_2_TRANSFER_READ_BIT)state|=D3D12_RESOURCE_STATE_COPY_SOURCE;
+	if(access&(VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT|VK_ACCESS_2_UNIFORM_READ_BIT))state|=D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+	if(access&VK_ACCESS_2_INDEX_READ_BIT)state|=D3D12_RESOURCE_STATE_INDEX_BUFFER;
+	if(access&VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT)state|=D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+	if(access&(VK_ACCESS_2_SHADER_READ_BIT|VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT))state|=D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	return state;
+}
+VKAPI_ATTR void VKAPI_CALL ICmdPipelineBarrier(VkCommandBuffer c,VkPipelineStageFlags,VkPipelineStageFlags,VkDependencyFlags,uint32_t memoryCount,const VkMemoryBarrier*,uint32_t bufferCount,const VkBufferMemoryBarrier* buffers,uint32_t imageCount,const VkImageMemoryBarrier* images)
+{
+	if(!c)return;
+	std::vector<D3D12_RESOURCE_BARRIER> barriers;
+	for(uint32_t i=0;i<bufferCount;i++)
+	{
+		auto buffer=buffers[i].buffer;if(!buffer||!buffer->resource||buffer->memory&&buffer->memory->type==1)continue;
+		const auto target=StateForBufferAccess(buffers[i].dstAccessMask);if(target==buffer->state)continue;
+		D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={buffer->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,buffer->state,target};barriers.push_back(b);buffer->state=target;
+	}
+	for(uint32_t i=0;i<imageCount;i++){auto image=images[i].image;if(!image||!image->resource)continue;auto target=StateForLayout(image,images[i].newLayout);if(target==image->state)continue;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=image->resource.Get();b.Transition.StateBefore=image->state;b.Transition.StateAfter=target;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;barriers.push_back(b);image->state=target;}
+	if(memoryCount){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;b.UAV.pResource=nullptr;barriers.push_back(b);}
+	if(!barriers.empty())c->list->ResourceBarrier(static_cast<UINT>(barriers.size()),barriers.data());
+}
 VKAPI_ATTR void VKAPI_CALL ICmdPipelineBarrier2KHR(VkCommandBuffer c,const VkDependencyInfoKHR* info)
-{if(!c||!info)return;std::vector<D3D12_RESOURCE_BARRIER> barriers;for(uint32_t i=0;i<info->imageMemoryBarrierCount;i++){auto image=info->pImageMemoryBarriers[i].image;if(!image||!image->resource)continue;const auto target=StateForLayout(image,info->pImageMemoryBarriers[i].newLayout);if(target==image->state)continue;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};barriers.push_back(b);image->state=target;}if(info->memoryBarrierCount||info->bufferMemoryBarrierCount){D3D12_RESOURCE_BARRIER u{};u.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;u.UAV.pResource=nullptr;barriers.push_back(u);}if(!barriers.empty())c->list->ResourceBarrier(static_cast<UINT>(barriers.size()),barriers.data());}
+{
+	if(!c||!info)return;std::vector<D3D12_RESOURCE_BARRIER> barriers;
+	for(uint32_t i=0;i<info->bufferMemoryBarrierCount;i++)
+	{
+		auto buffer=info->pBufferMemoryBarriers[i].buffer;if(!buffer||!buffer->resource||buffer->memory&&buffer->memory->type==1)continue;
+		const auto target=StateForBufferAccess(info->pBufferMemoryBarriers[i].dstAccessMask);if(target==buffer->state)continue;
+		D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={buffer->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,buffer->state,target};barriers.push_back(b);buffer->state=target;
+	}
+	for(uint32_t i=0;i<info->imageMemoryBarrierCount;i++){auto image=info->pImageMemoryBarriers[i].image;if(!image||!image->resource)continue;const auto target=StateForLayout(image,info->pImageMemoryBarriers[i].newLayout);if(target==image->state)continue;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};barriers.push_back(b);image->state=target;}
+	if(info->memoryBarrierCount){D3D12_RESOURCE_BARRIER u{};u.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;u.UAV.pResource=nullptr;barriers.push_back(u);}
+	if(!barriers.empty())c->list->ResourceBarrier(static_cast<UINT>(barriers.size()),barriers.data());
+}
 VKAPI_ATTR void VKAPI_CALL ICmdCopyBuffer(VkCommandBuffer c,VkBuffer src,VkBuffer dst,uint32_t count,const VkBufferCopy* regions)
 {
 	if(!c||!src||!dst||!src->resource||!dst->resource||!regions)return;
@@ -709,7 +859,7 @@ VKAPI_ATTR void VKAPI_CALL ICmdCopyBuffer(VkCommandBuffer c,VkBuffer src,VkBuffe
 			D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
 			D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=regions[i].size;desc.Height=1;desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 			ComPtr<ID3D12Resource> temporary;
-			if(FAILED(c->device->native->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&temporary))))
+			if(FAILED(c->device->native->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&temporary))))
 			{
 				cemuLog_log(LogType::Force,"D3D12 failed to allocate temporary buffer for CopyBufferRegion between aliases");
 				return;
@@ -718,12 +868,13 @@ VKAPI_ATTR void VKAPI_CALL ICmdCopyBuffer(VkCommandBuffer c,VkBuffer src,VkBuffe
 			{
 				D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barrier.Transition={src->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,nativeState,D3D12_RESOURCE_STATE_COPY_SOURCE};c->list->ResourceBarrier(1,&barrier);
 			}
-			c->list->CopyBufferRegion(temporary.Get(),0,src->resource.Get(),src->memoryOffset+regions[i].srcOffset,regions[i].size);
+			D3D12_RESOURCE_BARRIER prepareTemporary{};prepareTemporary.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;prepareTemporary.Transition={temporary.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_COMMON,D3D12_RESOURCE_STATE_COPY_DEST};c->list->ResourceBarrier(1,&prepareTemporary);
+			c->list->CopyBufferRegion(temporary.Get(),0,src->resource.Get(),NativeBufferOffset(src)+regions[i].srcOffset,regions[i].size);
 			D3D12_RESOURCE_BARRIER barriers[2]{};
 			barriers[0].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barriers[0].Transition={temporary.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE};
 			barriers[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barriers[1].Transition={src->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_COPY_SOURCE,D3D12_RESOURCE_STATE_COPY_DEST};
 			c->list->ResourceBarrier(2,barriers);
-			c->list->CopyBufferRegion(dst->resource.Get(),dst->memoryOffset+regions[i].dstOffset,temporary.Get(),0,regions[i].size);
+			c->list->CopyBufferRegion(dst->resource.Get(),NativeBufferOffset(dst)+regions[i].dstOffset,temporary.Get(),0,regions[i].size);
 			c->transientResources.push_back(std::move(temporary));
 			nativeState=D3D12_RESOURCE_STATE_COPY_DEST;
 		}
@@ -731,20 +882,117 @@ VKAPI_ATTR void VKAPI_CALL ICmdCopyBuffer(VkCommandBuffer c,VkBuffer src,VkBuffe
 		return;
 	}
 	TransitionBuffer(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);
-	for(uint32_t i=0;i<count;i++)c->list->CopyBufferRegion(dst->resource.Get(),dst->memoryOffset+regions[i].dstOffset,src->resource.Get(),src->memoryOffset+regions[i].srcOffset,regions[i].size);
+	for(uint32_t i=0;i<count;i++)c->list->CopyBufferRegion(dst->resource.Get(),NativeBufferOffset(dst)+regions[i].dstOffset,src->resource.Get(),NativeBufferOffset(src)+regions[i].srcOffset,regions[i].size);
 }
 VKAPI_ATTR void VKAPI_CALL ICmdBindIndexBuffer(VkCommandBuffer c,VkBuffer b,VkDeviceSize offset,VkIndexType type)
-{if(!c||!b||!b->resource)return;TransitionBuffer(c,b,D3D12_RESOURCE_STATE_INDEX_BUFFER);D3D12_INDEX_BUFFER_VIEW v{};v.BufferLocation=b->resource->GetGPUVirtualAddress()+b->memoryOffset+offset;v.SizeInBytes=static_cast<UINT>(b->size-offset);v.Format=type==VK_INDEX_TYPE_UINT16?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT;c->list->IASetIndexBuffer(&v);}
+{if(!c||!b||!b->resource)return;TransitionBuffer(c,b,D3D12_RESOURCE_STATE_INDEX_BUFFER);D3D12_INDEX_BUFFER_VIEW v{};v.BufferLocation=b->resource->GetGPUVirtualAddress()+NativeBufferOffset(b)+offset;v.SizeInBytes=static_cast<UINT>(b->size-offset);v.Format=type==VK_INDEX_TYPE_UINT16?DXGI_FORMAT_R16_UINT:DXGI_FORMAT_R32_UINT;c->list->IASetIndexBuffer(&v);}
+void ApplyVertexBufferViews(VkCommandBuffer c)
+{
+	if(!c||!c->vertexBufferCount)return;
+	std::array<D3D12_VERTEX_BUFFER_VIEW,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> views{};
+	for(uint32_t slot=0;slot<c->vertexBufferCount;slot++)
+	{
+		auto buffer=c->vertexBuffers[slot];if(!buffer||!buffer->resource)continue;
+		TransitionBuffer(c,buffer,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		const auto offset=c->vertexBufferOffsets[slot];if(offset>=buffer->size)continue;
+		views[slot].BufferLocation=buffer->resource->GetGPUVirtualAddress()+NativeBufferOffset(buffer)+offset;
+		views[slot].SizeInBytes=static_cast<UINT>((std::min)(buffer->size-offset,static_cast<VkDeviceSize>(UINT_MAX)));
+		views[slot].StrideInBytes=c->activePipeline&&!c->activePipeline->compute?c->activePipeline->vertexStrides[slot]:0;
+	}
+	c->list->IASetVertexBuffers(0,c->vertexBufferCount,views.data());
+}
+void PrepareConvertedVertexBuffers(VkCommandBuffer c,uint32_t vertexCount,uint32_t instanceCount,bool indexed)
+{
+	if(!c||!c->activePipeline||c->activePipeline->compute||c->activePipeline->vertexConversions.empty())return;
+	for(uint32_t conversionIndex=0;conversionIndex<c->activePipeline->vertexConversions.size();conversionIndex++)
+	{
+		const auto& conversion=c->activePipeline->vertexConversions[conversionIndex];
+		if(conversion.sourceBinding>=c->vertexBuffers.size())continue;
+		auto source=c->vertexBuffers[conversion.sourceBinding];
+		if(!source||!source->resource)continue;
+		const VkDeviceSize bindingOffset=c->vertexBufferOffsets[conversion.sourceBinding];
+		if(bindingOffset>=source->size||conversion.sourceOffset>=source->size-bindingOffset)continue;
+		const VkDeviceSize available=source->size-bindingOffset-conversion.sourceOffset;
+		uint32_t count{};
+		if(conversion.sourceStride)
+		{
+			if(available<conversion.sourceBytes)continue;
+			const VkDeviceSize records=1+(available-conversion.sourceBytes)/conversion.sourceStride;
+			count=static_cast<uint32_t>((std::min)(records,static_cast<VkDeviceSize>(UINT_MAX)));
+			if(!indexed)
+			{
+				const uint32_t needed=conversion.inputClass==D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA?instanceCount:vertexCount;
+				count=(std::min)(count,needed);
+			}
+		}
+		else count=(std::max)(1u,conversion.inputClass==D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA?instanceCount:vertexCount);
+		if(!count)continue;
+		auto cached=std::find_if(c->convertedVertexBuffers.begin(),c->convertedVertexBuffers.end(),[&](const ConvertedVertexBuffer& item){return item.pipeline==c->activePipeline&&item.source==source&&item.bindingOffset==bindingOffset&&item.conversionIndex==conversionIndex;});
+		if(cached==c->convertedVertexBuffers.end())
+		{
+			c->convertedVertexBuffers.push_back({c->activePipeline,source,bindingOffset,conversionIndex});
+			cached=std::prev(c->convertedVertexBuffers.end());
+		}
+		if(!cached->resource||cached->capacity<count)
+		{
+			if(cached->resource)c->transientResources.push_back(cached->resource);
+			D3D12_HEAP_PROPERTIES heap{};heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+			D3D12_RESOURCE_DESC desc{};desc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;desc.Width=(std::max)(VkDeviceSize(4),VkDeviceSize(count)*conversion.outputStride);desc.Height=1;desc.DepthOrArraySize=1;desc.MipLevels=1;desc.SampleDesc.Count=1;desc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;desc.Flags=D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+			cached->resource.Reset();
+			if(FAILED(c->device->native->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&desc,D3D12_RESOURCE_STATE_COMMON,nullptr,IID_PPV_ARGS(&cached->resource))))continue;
+			cached->capacity=count;cached->state=D3D12_RESOURCE_STATE_COMMON;
+		}
+		TransitionBuffer(c,source,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+		if(cached->state!=D3D12_RESOURCE_STATE_UNORDERED_ACCESS){D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barrier.Transition={cached->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,cached->state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};c->list->ResourceBarrier(1,&barrier);cached->state=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;}
+		c->list->SetComputeRootSignature(c->device->vertexConvertRoot.Get());c->list->SetPipelineState(c->device->vertexConvertPipeline.Get());
+		c->list->SetComputeRootShaderResourceView(0,source->resource->GetGPUVirtualAddress());c->list->SetComputeRootUnorderedAccessView(1,cached->resource->GetGPUVirtualAddress());
+		const uint32_t constants[7]={static_cast<uint32_t>(NativeBufferOffset(source)+bindingOffset+conversion.sourceOffset),conversion.sourceStride,conversion.outputStride,count,conversion.sourceBytes,conversion.alphaValue,0};
+		c->list->SetComputeRoot32BitConstants(2,7,constants,0);c->list->Dispatch((count+63)/64,1,1);
+		D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barrier.Transition={cached->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER};c->list->ResourceBarrier(1,&barrier);cached->state=D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+		TransitionBuffer(c,source,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);
+		D3D12_VERTEX_BUFFER_VIEW view{};view.BufferLocation=cached->resource->GetGPUVirtualAddress();view.SizeInBytes=static_cast<UINT>((std::min)(VkDeviceSize(count)*conversion.outputStride,static_cast<VkDeviceSize>(UINT_MAX)));view.StrideInBytes=conversion.outputStride;c->list->IASetVertexBuffers(conversion.outputSlot,1,&view);
+	}
+	c->list->SetPipelineState(c->activeNativeState?c->activeNativeState.Get():c->activePipeline->state.Get());c->list->IASetPrimitiveTopology(c->activePipeline->topology);
+}
+void EnsureRenderTargetCompatiblePipeline(VkCommandBuffer c)
+{
+	if(!c||!c->activePipeline||c->activePipeline->compute)return;
+	auto desc=c->activeGraphicsDesc;
+	bool changed=desc.NumRenderTargets!=c->boundRtvCount||desc.DSVFormat!=(c->boundDsv?c->boundDsvFormat:DXGI_FORMAT_UNKNOWN);
+	for(uint32_t slot=0;slot<8;slot++)
+	{
+		const DXGI_FORMAT format=slot<c->boundRtvCount?c->boundRtvFormats[slot]:DXGI_FORMAT_UNKNOWN;
+		if(desc.RTVFormats[slot]!=format){desc.RTVFormats[slot]=format;changed=true;}
+	}
+	if(!changed)return;
+	desc.NumRenderTargets=c->boundRtvCount;desc.DSVFormat=c->boundDsv?c->boundDsvFormat:DXGI_FORMAT_UNKNOWN;
+	if(c->boundDsv)desc.DepthStencilState=c->activePipeline->graphicsDesc.DepthStencilState;else{desc.DepthStencilState.DepthEnable=FALSE;desc.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO;desc.DepthStencilState.StencilEnable=FALSE;}
+	ComPtr<ID3D12PipelineState> variant;
+	if(FAILED(c->device->native->CreateGraphicsPipelineState(&desc,IID_PPV_ARGS(&variant))))
+	{
+		cemuLog_log(LogType::Force,"D3D12 failed to specialize graphics pipeline for the bound framebuffer formats");
+		return;
+	}
+	c->activeGraphicsDesc=desc;c->activeNativeState=variant;c->list->SetPipelineState(variant.Get());c->transientStates.push_back(std::move(variant));
+}
 VKAPI_ATTR void VKAPI_CALL ICmdBindVertexBuffers(VkCommandBuffer c,uint32_t first,uint32_t count,const VkBuffer* buffers,const VkDeviceSize* offsets)
-{if(!c)return;std::vector<D3D12_VERTEX_BUFFER_VIEW> views(count);for(uint32_t i=0;i<count;i++)if(buffers[i]&&buffers[i]->resource){TransitionBuffer(c,buffers[i],D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);views[i].BufferLocation=buffers[i]->resource->GetGPUVirtualAddress()+buffers[i]->memoryOffset+offsets[i];views[i].SizeInBytes=static_cast<UINT>(buffers[i]->size-offsets[i]);}c->list->IASetVertexBuffers(first,count,views.data());}
+{if(!c||!buffers||!offsets||first>=D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)return;count=(std::min)(count,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT-first);for(uint32_t i=0;i<count;i++){c->vertexBuffers[first+i]=buffers[i];c->vertexBufferOffsets[first+i]=offsets[i];if(buffers[i]&&buffers[i]->resource)TransitionBuffer(c,buffers[i],D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);}c->vertexBufferCount=(std::max)(c->vertexBufferCount,first+count);ApplyVertexBufferViews(c);}
 VKAPI_ATTR void VKAPI_CALL ICmdSetViewport(VkCommandBuffer c,uint32_t first,uint32_t count,const VkViewport* v)
 {if(!c||first!=0)return;std::vector<D3D12_VIEWPORT> out(count);for(uint32_t i=0;i<count;i++){const float height=std::abs(v[i].height);const float y=v[i].height<0?v[i].y+v[i].height:v[i].y;out[i]={v[i].x,y,v[i].width,height,v[i].minDepth,v[i].maxDepth};}c->list->RSSetViewports(count,out.data());}
 VKAPI_ATTR void VKAPI_CALL ICmdSetScissor(VkCommandBuffer c,uint32_t first,uint32_t count,const VkRect2D* r)
 {if(!c||first!=0)return;std::vector<D3D12_RECT> out(count);for(uint32_t i=0;i<count;i++)out[i]={r[i].offset.x,r[i].offset.y,r[i].offset.x+static_cast<LONG>(r[i].extent.width),r[i].offset.y+static_cast<LONG>(r[i].extent.height)};c->list->RSSetScissorRects(count,out.data());}
 VKAPI_ATTR void VKAPI_CALL ICmdSetBlendConstants(VkCommandBuffer c,const float values[4]){if(c&&values)c->list->OMSetBlendFactor(values);}
-VKAPI_ATTR void VKAPI_CALL ICmdSetDepthBias(VkCommandBuffer c,float constant,float clamp,float slope){if(!c||!c->activePipeline||c->activePipeline->compute)return;auto d=c->activePipeline->graphicsDesc;d.RasterizerState.DepthBias=static_cast<INT>(constant);d.RasterizerState.DepthBiasClamp=clamp;d.RasterizerState.SlopeScaledDepthBias=slope;ComPtr<ID3D12PipelineState> variant;if(SUCCEEDED(c->device->native->CreateGraphicsPipelineState(&d,IID_PPV_ARGS(&variant)))){c->list->SetPipelineState(variant.Get());c->transientStates.push_back(std::move(variant));}}
-VKAPI_ATTR void VKAPI_CALL ICmdDraw(VkCommandBuffer c,uint32_t vertices,uint32_t instances,uint32_t firstVertex,uint32_t firstInstance){if(c){TraceOperation(c,"Draw");c->list->DrawInstanced(vertices,instances,firstVertex,firstInstance);}}
-VKAPI_ATTR void VKAPI_CALL ICmdDrawIndexed(VkCommandBuffer c,uint32_t indices,uint32_t instances,uint32_t firstIndex,int32_t vertexOffset,uint32_t firstInstance){if(c){TraceOperation(c,"DrawIndexed");c->list->DrawIndexedInstanced(indices,instances,firstIndex,vertexOffset,firstInstance);}}
+VKAPI_ATTR void VKAPI_CALL ICmdSetDepthBias(VkCommandBuffer c,float constant,float clamp,float slope){if(!c||!c->activePipeline||c->activePipeline->compute)return;auto d=c->activeGraphicsDesc;d.RasterizerState.DepthBias=static_cast<INT>(constant);d.RasterizerState.DepthBiasClamp=clamp;d.RasterizerState.SlopeScaledDepthBias=slope;ComPtr<ID3D12PipelineState> variant;if(SUCCEEDED(c->device->native->CreateGraphicsPipelineState(&d,IID_PPV_ARGS(&variant)))){c->list->SetPipelineState(variant.Get());c->activeGraphicsDesc=d;c->activeNativeState=variant;c->transientStates.push_back(std::move(variant));}}
+void LogFirstDraw(VkCommandBuffer c,const char* kind,uint32_t count,uint32_t instances)
+{
+	static std::atomic_bool logged{false};
+	if(!c||logged.exchange(true))return;
+	const auto p=c->activePipeline;
+	const auto graphics=p&&!p->compute;
+	cemuLog_log(LogType::Force,fmt::format("D3D12 diagnostic: first {} count {}, instances {}, pipeline {}, PS {}, PSO RTVs {}, PSO RTV0 format {}, bound RTVs {}, DSV format {}, bound DSV {}",kind,count,instances,p?"yes":"no",graphics&&p->pixelShader?"yes":"no",graphics?p->graphicsDesc.NumRenderTargets:0,graphics?static_cast<uint32_t>(p->graphicsDesc.RTVFormats[0]):0,c->boundRtvCount,graphics?static_cast<uint32_t>(p->graphicsDesc.DSVFormat):0,c->boundDsv?"yes":"no"));
+}
+VKAPI_ATTR void VKAPI_CALL ICmdDraw(VkCommandBuffer c,uint32_t vertices,uint32_t instances,uint32_t firstVertex,uint32_t firstInstance){if(c){TraceOperation(c,"Draw");ApplyVertexBufferViews(c);PrepareConvertedVertexBuffers(c,firstVertex+vertices,firstInstance+instances,false);EnsureRenderTargetCompatiblePipeline(c);LogFirstDraw(c,"draw",vertices,instances);c->list->DrawInstanced(vertices,instances,firstVertex,firstInstance);}}
+VKAPI_ATTR void VKAPI_CALL ICmdDrawIndexed(VkCommandBuffer c,uint32_t indices,uint32_t instances,uint32_t firstIndex,int32_t vertexOffset,uint32_t firstInstance){if(c){TraceOperation(c,"DrawIndexed");ApplyVertexBufferViews(c);PrepareConvertedVertexBuffers(c,indices,firstInstance+instances,true);EnsureRenderTargetCompatiblePipeline(c);LogFirstDraw(c,"indexed draw",indices,instances);c->list->DrawIndexedInstanced(indices,instances,firstIndex,vertexOffset,firstInstance);}}
 VKAPI_ATTR VkResult VKAPI_CALL ICreateShaderModule(VkDevice,const VkShaderModuleCreateInfo* info,const VkAllocationCallbacks*,VkShaderModule* out){if(!info||!out||info->codeSize%4)return VK_ERROR_INITIALIZATION_FAILED;auto m=new VkShaderModule_T();m->spirv.assign(info->pCode,info->pCode+info->codeSize/4);*out=m;return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL IDestroyShaderModule(VkDevice,VkShaderModule m,const VkAllocationCallbacks*){delete m;}
 bool AllocateViewDescriptorSlot(VkDevice device,bool depth,uint32_t& slot)
@@ -854,7 +1102,7 @@ VKAPI_ATTR void VKAPI_CALL IUpdateDescriptorSets(VkDevice device,uint32_t count,
 			const uint32_t cls=DescriptorClass(w.descriptorType);if(cls==UINT32_MAX)continue;
 			if(cls==0&&value.buffer.buffer&&value.buffer.buffer->resource)
 			{
-					if(value.buffer.offset>=value.buffer.buffer->size)continue;const VkDeviceSize available=value.buffer.buffer->size-value.buffer.offset;const VkDeviceSize requested=value.buffer.range==VK_WHOLE_SIZE?available:(std::min)(value.buffer.range,available);const VkDeviceSize cbvSize=(std::min)(VkDeviceSize(65536),(requested+255)&~VkDeviceSize(255));if(!cbvSize)continue;D3D12_CONSTANT_BUFFER_VIEW_DESC d{};d.BufferLocation=value.buffer.buffer->resource->GetGPUVirtualAddress()+value.buffer.buffer->memoryOffset+value.buffer.offset;d.SizeInBytes=static_cast<UINT>(cbvSize);device->native->CreateConstantBufferView(&d,cpuHandle(w.dstSet,cls,w.dstBinding,w.dstArrayElement+e));
+					if(value.buffer.offset>=value.buffer.buffer->size)continue;const VkDeviceSize available=value.buffer.buffer->size-value.buffer.offset;const VkDeviceSize requested=value.buffer.range==VK_WHOLE_SIZE?available:(std::min)(value.buffer.range,available);const VkDeviceSize cbvSize=(std::min)(VkDeviceSize(65536),(requested+255)&~VkDeviceSize(255));if(!cbvSize)continue;D3D12_CONSTANT_BUFFER_VIEW_DESC d{};d.BufferLocation=value.buffer.buffer->resource->GetGPUVirtualAddress()+NativeBufferOffset(value.buffer.buffer)+value.buffer.offset;d.SizeInBytes=static_cast<UINT>(cbvSize);device->native->CreateConstantBufferView(&d,cpuHandle(w.dstSet,cls,w.dstBinding,w.dstArrayElement+e));
 			}
 			else if((cls==1||cls==2)&&value.image.imageView&&value.image.imageView->image->resource)
 			{
@@ -864,7 +1112,7 @@ VKAPI_ATTR void VKAPI_CALL IUpdateDescriptorSets(VkDevice device,uint32_t count,
 			}
 			else if(cls==2&&value.buffer.buffer&&value.buffer.buffer->resource)
 			{
-					D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=DXGI_FORMAT_R32_TYPELESS;d.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;d.Buffer.FirstElement=(value.buffer.buffer->memoryOffset+value.buffer.offset)/4;d.Buffer.NumElements=static_cast<UINT>((value.buffer.range==VK_WHOLE_SIZE?value.buffer.buffer->size-value.buffer.offset:value.buffer.range)/4);d.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;device->native->CreateUnorderedAccessView(value.buffer.buffer->resource.Get(),nullptr,&d,cpuHandle(w.dstSet,cls,w.dstBinding,w.dstArrayElement+e));
+					D3D12_UNORDERED_ACCESS_VIEW_DESC d{};d.Format=DXGI_FORMAT_R32_TYPELESS;d.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;d.Buffer.FirstElement=(NativeBufferOffset(value.buffer.buffer)+value.buffer.offset)/4;d.Buffer.NumElements=static_cast<UINT>((value.buffer.range==VK_WHOLE_SIZE?value.buffer.buffer->size-value.buffer.offset:value.buffer.range)/4);d.Buffer.Flags=D3D12_BUFFER_UAV_FLAG_RAW;device->native->CreateUnorderedAccessView(value.buffer.buffer->resource.Get(),nullptr,&d,cpuHandle(w.dstSet,cls,w.dstBinding,w.dstArrayElement+e));
 			}
 			if((w.descriptorType==VK_DESCRIPTOR_TYPE_SAMPLER||w.descriptorType==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)&&value.image.sampler)
 			{
@@ -886,13 +1134,13 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreatePipelineLayout(VkDevice device,const VkPip
 	D3D12_ROOT_SIGNATURE_DESC d{};d.NumParameters=paramCount;d.pParameters=params.data();d.Flags=D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;ComPtr<ID3DBlob> blob,error;if(FAILED(D3D12SerializeRootSignature(&d,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error)))return VK_ERROR_INITIALIZATION_FAILED;auto l=new VkPipelineLayout_T();l->setCount=info->setLayoutCount;l->pushDwords=pushDwords;l->pushRootIndex=pushDwords?0u:UINT32_MAX;if(FAILED(device->native->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&l->root)))){delete l;return VK_ERROR_INITIALIZATION_FAILED;}*out=l;return VK_SUCCESS;
 }
 VKAPI_ATTR void VKAPI_CALL IDestroyPipelineLayout(VkDevice,VkPipelineLayout l,const VkAllocationCallbacks*){delete l;}
-VKAPI_ATTR void VKAPI_CALL ICmdBindPipeline(VkCommandBuffer c,VkPipelineBindPoint,VkPipeline p){if(c&&p){TraceOperation(c,p->compute?"BindComputePipeline":"BindGraphicsPipeline");c->activePipeline=p;c->list->SetPipelineState(p->state.Get());if(p->compute)c->list->SetComputeRootSignature(p->layout->root.Get());else{c->list->SetGraphicsRootSignature(p->layout->root.Get());c->list->IASetPrimitiveTopology(p->topology);}}}
+VKAPI_ATTR void VKAPI_CALL ICmdBindPipeline(VkCommandBuffer c,VkPipelineBindPoint,VkPipeline p){if(c&&p){TraceOperation(c,p->compute?"BindComputePipeline":"BindGraphicsPipeline");c->activePipeline=p;c->activeNativeState=p->state;if(!p->compute)c->activeGraphicsDesc=p->graphicsDesc;c->list->SetPipelineState(p->state.Get());if(p->compute)c->list->SetComputeRootSignature(p->layout->root.Get());else{c->list->SetGraphicsRootSignature(p->layout->root.Get());c->list->IASetPrimitiveTopology(p->topology);ApplyVertexBufferViews(c);}}}
 VKAPI_ATTR void VKAPI_CALL ICmdBindDescriptorSets(VkCommandBuffer c,VkPipelineBindPoint point,VkPipelineLayout layout,uint32_t first,uint32_t count,const VkDescriptorSet* sets,uint32_t dynamicCount,const uint32_t* dynamicOffsets)
 {
 		TraceOperation(c,"BindDescriptorSets");
 		if(!c||!layout)return;ID3D12DescriptorHeap* heaps[]={c->device->resourceHeap.Get(),c->device->samplerHeap.Get()};c->list->SetDescriptorHeaps(2,heaps);
 		for(uint32_t i=0;i<count;i++)if(sets[i])for(const auto& entry:sets[i]->values){const auto& value=entry.second;if(value.buffer.buffer){if(value.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER||value.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)TransitionBuffer(c,value.buffer.buffer,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);else if(value.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||value.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)TransitionBuffer(c,value.buffer.buffer,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);}}
-		uint32_t dynamicIndex=0;for(uint32_t i=0;i<count;i++)if(sets[i]){auto bindings=sets[i]->layout->bindings;std::sort(bindings.begin(),bindings.end(),[](const auto& a,const auto& b){return a.binding<b.binding;});for(const auto& b:bindings)if(b.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)for(uint32_t e=0;e<b.descriptorCount&&dynamicIndex<dynamicCount;e++,dynamicIndex++){auto it=sets[i]->values.find((uint64_t(b.binding)<<32)|e);if(it==sets[i]->values.end()||!it->second.buffer.buffer||!it->second.buffer.buffer->resource)continue;const auto& value=it->second.buffer;const VkDeviceSize dynamicOffset=dynamicOffsets[dynamicIndex];if(value.offset>=value.buffer->size||dynamicOffset>=value.buffer->size-value.offset)continue;const VkDeviceSize totalOffset=value.offset+dynamicOffset;const VkDeviceSize available=value.buffer->size-totalOffset;const VkDeviceSize requested=value.range==VK_WHOLE_SIZE?available:(std::min)(value.range,available);const VkDeviceSize cbvSize=(std::min)(VkDeviceSize(65536),(requested+255)&~VkDeviceSize(255));if(!cbvSize)continue;D3D12_CONSTANT_BUFFER_VIEW_DESC d{};d.BufferLocation=value.buffer->resource->GetGPUVirtualAddress()+value.buffer->memoryOffset+totalOffset;d.SizeInBytes=static_cast<UINT>(cbvSize);auto h=c->device->resourceHeap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(sets[i]->base[0]+b.binding+e)*c->device->resourceStride;c->device->native->CreateConstantBufferView(&d,h);}}
+		uint32_t dynamicIndex=0;for(uint32_t i=0;i<count;i++)if(sets[i]){auto bindings=sets[i]->layout->bindings;std::sort(bindings.begin(),bindings.end(),[](const auto& a,const auto& b){return a.binding<b.binding;});for(const auto& b:bindings)if(b.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)for(uint32_t e=0;e<b.descriptorCount&&dynamicIndex<dynamicCount;e++,dynamicIndex++){auto it=sets[i]->values.find((uint64_t(b.binding)<<32)|e);if(it==sets[i]->values.end()||!it->second.buffer.buffer||!it->second.buffer.buffer->resource)continue;const auto& value=it->second.buffer;const VkDeviceSize dynamicOffset=dynamicOffsets[dynamicIndex];if(value.offset>=value.buffer->size||dynamicOffset>=value.buffer->size-value.offset)continue;const VkDeviceSize totalOffset=value.offset+dynamicOffset;const VkDeviceSize available=value.buffer->size-totalOffset;const VkDeviceSize requested=value.range==VK_WHOLE_SIZE?available:(std::min)(value.range,available);const VkDeviceSize cbvSize=(std::min)(VkDeviceSize(65536),(requested+255)&~VkDeviceSize(255));if(!cbvSize)continue;D3D12_CONSTANT_BUFFER_VIEW_DESC d{};d.BufferLocation=value.buffer->resource->GetGPUVirtualAddress()+NativeBufferOffset(value.buffer)+totalOffset;d.SizeInBytes=static_cast<UINT>(cbvSize);auto h=c->device->resourceHeap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(sets[i]->base[0]+b.binding+e)*c->device->resourceStride;c->device->native->CreateConstantBufferView(&d,h);}}
 	for(uint32_t i=0;i<count&&first+i<layout->setCount;i++)for(uint32_t cls=0;cls<4;cls++)if(sets[i]&&sets[i]->count[cls]){D3D12_GPU_DESCRIPTOR_HANDLE h=(cls==3?c->device->samplerHeap:c->device->resourceHeap)->GetGPUDescriptorHandleForHeapStart();h.ptr+=UINT64(sets[i]->base[cls])*(cls==3?c->device->samplerStride:c->device->resourceStride);const uint32_t rootIndex=(layout->pushDwords?1u:0u)+(first+i)*4+cls;if(point==VK_PIPELINE_BIND_POINT_COMPUTE)c->list->SetComputeRootDescriptorTable(rootIndex,h);else c->list->SetGraphicsRootDescriptorTable(rootIndex,h);}
 }
 VKAPI_ATTR void VKAPI_CALL ICmdPushConstants(VkCommandBuffer c,VkPipelineLayout layout,VkShaderStageFlags stages,uint32_t offset,uint32_t size,const void* data){if(!c||!layout||!c->activePipeline||!c->activePipeline->layout||!data)return;const auto nativeLayout=c->activePipeline->layout;if(nativeLayout->pushRootIndex==UINT32_MAX||offset/4+(size+3)/4>nativeLayout->pushDwords)return;const uint32_t count=(size+3)/4;if(c->activePipeline->compute&&(stages&VK_SHADER_STAGE_COMPUTE_BIT))c->list->SetComputeRoot32BitConstants(nativeLayout->pushRootIndex,count,data,offset/4);else if(!c->activePipeline->compute)c->list->SetGraphicsRoot32BitConstants(nativeLayout->pushRootIndex,count,data,offset/4);}
@@ -901,8 +1149,17 @@ VKAPI_ATTR void VKAPI_CALL IDestroyPipelineCache(VkDevice,VkPipelineCache p,cons
 VKAPI_ATTR VkResult VKAPI_CALL IGetPipelineCacheData(VkDevice,VkPipelineCache p,size_t* size,void* data){if(!p||!size)return VK_ERROR_INITIALIZATION_FAILED;if(!data){*size=p->data.size();return VK_SUCCESS;}const size_t n=(std::min)(*size,p->data.size());std::memcpy(data,p->data.data(),n);*size=n;return n==p->data.size()?VK_SUCCESS:VK_INCOMPLETE;}
 VKAPI_ATTR VkResult VKAPI_CALL IMergePipelineCaches(VkDevice,VkPipelineCache,uint32_t,const VkPipelineCache*){return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL IDestroyPipeline(VkDevice,VkPipeline p,const VkAllocationCallbacks*){delete p;}
-ComPtr<ID3DBlob> CompileStage(VkShaderModule module,VkShaderStageFlagBits stage,const char* entry)
-{spirv_cross::CompilerHLSL compiler(module->spirv);for(const auto& resource:compiler.get_shader_resources().push_constant_buffers){compiler.set_decoration(resource.id,spv::DecorationBinding,0);compiler.set_decoration(resource.id,spv::DecorationDescriptorSet,255);}spirv_cross::CompilerHLSL::Options options;options.shader_model=51;compiler.set_hlsl_options(options);const std::string source=compiler.compile();const char* target=stage==VK_SHADER_STAGE_VERTEX_BIT?"vs_5_1":(stage==VK_SHADER_STAGE_GEOMETRY_BIT?"gs_5_1":(stage==VK_SHADER_STAGE_COMPUTE_BIT?"cs_5_1":"ps_5_1"));ComPtr<ID3DBlob> code,error;if(FAILED(D3DCompile(source.data(),source.size(),nullptr,nullptr,nullptr,"main",target,D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL1,0,&code,&error))){cemuLog_log(LogType::Force,"D3D12 shader compilation failed for entry {}: {}",entry?entry:"main",error?static_cast<const char*>(error->GetBufferPointer()):"unknown error");return {};}return code;}
+ComPtr<ID3DBlob> CompileStage(VkShaderModule module,VkShaderStageFlagBits stage,const char* entry,bool flipVertY=false)
+{
+	try
+	{
+		spirv_cross::CompilerHLSL compiler(module->spirv);for(const auto& resource:compiler.get_shader_resources().push_constant_buffers){compiler.set_decoration(resource.id,spv::DecorationBinding,0);compiler.set_decoration(resource.id,spv::DecorationDescriptorSet,255);}auto common=compiler.get_common_options();common.vertex.flip_vert_y=flipVertY;compiler.set_common_options(common);spirv_cross::CompilerHLSL::Options options;options.shader_model=51;options.point_size_compat=true;options.point_coord_compat=true;compiler.set_hlsl_options(options);const std::string source=compiler.compile();const char* target=stage==VK_SHADER_STAGE_VERTEX_BIT?"vs_5_1":(stage==VK_SHADER_STAGE_GEOMETRY_BIT?"gs_5_1":(stage==VK_SHADER_STAGE_COMPUTE_BIT?"cs_5_1":"ps_5_1"));ComPtr<ID3DBlob> code,error;if(FAILED(D3DCompile(source.data(),source.size(),nullptr,nullptr,nullptr,"main",target,D3DCOMPILE_ENABLE_STRICTNESS|D3DCOMPILE_OPTIMIZATION_LEVEL1,0,&code,&error))){cemuLog_log(LogType::Force,"D3D12 shader compilation failed for entry {}: {}",entry?entry:"main",error?static_cast<const char*>(error->GetBufferPointer()):"unknown error");return {};}return code;
+	}
+	catch(const spirv_cross::CompilerError& error)
+	{
+		cemuLog_log(LogType::Force,"D3D12 SPIR-V translation failed for entry {}: {}",entry?entry:"main",error.what());return {};
+	}
+}
 VKAPI_ATTR VkResult VKAPI_CALL ICreateGraphicsPipelines(VkDevice device,VkPipelineCache,uint32_t count,const VkGraphicsPipelineCreateInfo* infos,const VkAllocationCallbacks*,VkPipeline* out)
 {
 	auto compare=[](VkCompareOp op){return static_cast<D3D12_COMPARISON_FUNC>(op+1);};
@@ -911,11 +1168,11 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreateGraphicsPipelines(VkDevice device,VkPipeli
 	auto blendAlpha=[&](VkBlendFactor f){switch(f){case VK_BLEND_FACTOR_SRC_COLOR:return D3D12_BLEND_SRC_ALPHA;case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:return D3D12_BLEND_INV_SRC_ALPHA;case VK_BLEND_FACTOR_DST_COLOR:return D3D12_BLEND_DEST_ALPHA;case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:return D3D12_BLEND_INV_DEST_ALPHA;case VK_BLEND_FACTOR_SRC1_COLOR:return D3D12_BLEND_SRC1_ALPHA;case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:return D3D12_BLEND_INV_SRC1_ALPHA;default:return blend(f);}};
 	for(uint32_t n=0;n<count;n++)
 	{
-		const auto& i=infos[n];ComPtr<ID3DBlob> vs,ps,gs;for(uint32_t s=0;s<i.stageCount;s++){auto code=CompileStage(i.pStages[s].module,static_cast<VkShaderStageFlagBits>(i.pStages[s].stage),i.pStages[s].pName);if(!code)return VK_ERROR_INVALID_SHADER_NV;if(i.pStages[s].stage==VK_SHADER_STAGE_VERTEX_BIT)vs=code;else if(i.pStages[s].stage==VK_SHADER_STAGE_FRAGMENT_BIT)ps=code;else if(i.pStages[s].stage==VK_SHADER_STAGE_GEOMETRY_BIT)gs=code;}if(!vs)return VK_ERROR_INVALID_SHADER_NV;
+		const auto& i=infos[n];bool hasGeometryStage=false;for(uint32_t s=0;s<i.stageCount;s++)if(i.pStages[s].stage==VK_SHADER_STAGE_GEOMETRY_BIT){hasGeometryStage=true;break;}ComPtr<ID3DBlob> vs,ps,gs;for(uint32_t s=0;s<i.stageCount;s++){const auto stage=static_cast<VkShaderStageFlagBits>(i.pStages[s].stage);const bool flipVertY=stage==VK_SHADER_STAGE_GEOMETRY_BIT||(stage==VK_SHADER_STAGE_VERTEX_BIT&&!hasGeometryStage);auto code=CompileStage(i.pStages[s].module,stage,i.pStages[s].pName,flipVertY);if(!code)return VK_ERROR_INVALID_SHADER_NV;if(stage==VK_SHADER_STAGE_VERTEX_BIT)vs=code;else if(stage==VK_SHADER_STAGE_FRAGMENT_BIT)ps=code;else if(stage==VK_SHADER_STAGE_GEOMETRY_BIT)gs=code;}if(!vs)return VK_ERROR_INVALID_SHADER_NV;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};d.pRootSignature=i.layout->root.Get();d.VS={vs->GetBufferPointer(),vs->GetBufferSize()};if(ps)d.PS={ps->GetBufferPointer(),ps->GetBufferSize()};if(gs)d.GS={gs->GetBufferPointer(),gs->GetBufferSize()};d.SampleMask=i.pMultisampleState?i.pMultisampleState->rasterizationSamples?UINT_MAX:UINT_MAX:UINT_MAX;
-		if(i.pRasterizationState){const auto& r=*i.pRasterizationState;d.RasterizerState.FillMode=r.polygonMode==VK_POLYGON_MODE_LINE?D3D12_FILL_MODE_WIREFRAME:D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=r.cullMode==VK_CULL_MODE_FRONT_BIT?D3D12_CULL_MODE_FRONT:(r.cullMode==VK_CULL_MODE_BACK_BIT?D3D12_CULL_MODE_BACK:D3D12_CULL_MODE_NONE);d.RasterizerState.FrontCounterClockwise=r.frontFace==VK_FRONT_FACE_COUNTER_CLOCKWISE;d.RasterizerState.DepthBias=static_cast<INT>(r.depthBiasConstantFactor);d.RasterizerState.SlopeScaledDepthBias=r.depthBiasSlopeFactor;d.RasterizerState.DepthBiasClamp=r.depthBiasClamp;d.RasterizerState.DepthClipEnable=!r.depthClampEnable;}else{d.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;d.RasterizerState.DepthClipEnable=TRUE;}
+		if(i.pRasterizationState){const auto& r=*i.pRasterizationState;d.RasterizerState.FillMode=r.polygonMode==VK_POLYGON_MODE_LINE?D3D12_FILL_MODE_WIREFRAME:D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=r.cullMode==VK_CULL_MODE_FRONT_BIT?D3D12_CULL_MODE_FRONT:(r.cullMode==VK_CULL_MODE_BACK_BIT?D3D12_CULL_MODE_BACK:D3D12_CULL_MODE_NONE);d.RasterizerState.FrontCounterClockwise=r.frontFace!=VK_FRONT_FACE_COUNTER_CLOCKWISE;d.RasterizerState.DepthBias=static_cast<INT>(r.depthBiasConstantFactor);d.RasterizerState.SlopeScaledDepthBias=r.depthBiasSlopeFactor;d.RasterizerState.DepthBiasClamp=r.depthBiasClamp;d.RasterizerState.DepthClipEnable=!r.depthClampEnable;}else{d.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;d.RasterizerState.DepthClipEnable=TRUE;}
 		if(i.pMultisampleState)d.BlendState.AlphaToCoverageEnable=i.pMultisampleState->alphaToCoverageEnable;
-		if(i.pColorBlendState)for(uint32_t a=0;a<i.pColorBlendState->attachmentCount&&a<8;a++){const auto& v=i.pColorBlendState->pAttachments[a];auto& rt=d.BlendState.RenderTarget[a];rt.BlendEnable=v.blendEnable;rt.SrcBlend=blend(v.srcColorBlendFactor);rt.DestBlend=blend(v.dstColorBlendFactor);rt.BlendOp=static_cast<D3D12_BLEND_OP>(v.colorBlendOp+1);rt.SrcBlendAlpha=blendAlpha(v.srcAlphaBlendFactor);rt.DestBlendAlpha=blendAlpha(v.dstAlphaBlendFactor);rt.BlendOpAlpha=static_cast<D3D12_BLEND_OP>(v.alphaBlendOp+1);rt.RenderTargetWriteMask=static_cast<UINT8>(v.colorWriteMask);}else for(auto& rt:d.BlendState.RenderTarget)rt.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
+		if(i.pColorBlendState)for(uint32_t a=0;a<i.pColorBlendState->attachmentCount&&a<8;a++){const auto& v=i.pColorBlendState->pAttachments[a];auto& rt=d.BlendState.RenderTarget[a];rt.BlendEnable=v.blendEnable;rt.SrcBlend=blend(v.srcColorBlendFactor);rt.DestBlend=blend(v.dstColorBlendFactor);rt.BlendOp=static_cast<D3D12_BLEND_OP>(v.colorBlendOp+1);rt.SrcBlendAlpha=blendAlpha(v.srcAlphaBlendFactor);rt.DestBlendAlpha=blendAlpha(v.dstAlphaBlendFactor);rt.BlendOpAlpha=static_cast<D3D12_BLEND_OP>(v.alphaBlendOp+1);if(rt.BlendOp==D3D12_BLEND_OP_MIN||rt.BlendOp==D3D12_BLEND_OP_MAX){rt.SrcBlend=D3D12_BLEND_ONE;rt.DestBlend=D3D12_BLEND_ONE;}if(rt.BlendOpAlpha==D3D12_BLEND_OP_MIN||rt.BlendOpAlpha==D3D12_BLEND_OP_MAX){rt.SrcBlendAlpha=D3D12_BLEND_ONE;rt.DestBlendAlpha=D3D12_BLEND_ONE;}rt.RenderTargetWriteMask=static_cast<UINT8>(v.colorWriteMask);}else for(auto& rt:d.BlendState.RenderTarget)rt.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
 		if(i.pDepthStencilState){const auto& z=*i.pDepthStencilState;d.DepthStencilState.DepthEnable=z.depthTestEnable;d.DepthStencilState.DepthWriteMask=z.depthWriteEnable?D3D12_DEPTH_WRITE_MASK_ALL:D3D12_DEPTH_WRITE_MASK_ZERO;d.DepthStencilState.DepthFunc=compare(z.depthCompareOp);d.DepthStencilState.StencilEnable=z.stencilTestEnable;d.DepthStencilState.StencilReadMask=static_cast<UINT8>(z.front.compareMask);d.DepthStencilState.StencilWriteMask=static_cast<UINT8>(z.front.writeMask);auto face=[&](const VkStencilOpState& s){D3D12_DEPTH_STENCILOP_DESC o{};o.StencilFailOp=stencilOp(s.failOp);o.StencilDepthFailOp=stencilOp(s.depthFailOp);o.StencilPassOp=stencilOp(s.passOp);o.StencilFunc=compare(s.compareOp);return o;};d.DepthStencilState.FrontFace=face(z.front);d.DepthStencilState.BackFace=face(z.back);}else{d.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;d.DepthStencilState.FrontFace={D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_COMPARISON_FUNC_ALWAYS};d.DepthStencilState.BackFace=d.DepthStencilState.FrontFace;}
 		auto p=new VkPipeline_T();p->layout=i.layout;const auto topology=i.pInputAssemblyState?i.pInputAssemblyState->topology:VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;if(topology==VK_PRIMITIVE_TOPOLOGY_POINT_LIST){d.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;p->topology=D3D_PRIMITIVE_TOPOLOGY_POINTLIST;}else if(topology==VK_PRIMITIVE_TOPOLOGY_LINE_LIST||topology==VK_PRIMITIVE_TOPOLOGY_LINE_STRIP){d.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;p->topology=topology==VK_PRIMITIVE_TOPOLOGY_LINE_LIST?D3D_PRIMITIVE_TOPOLOGY_LINELIST:D3D_PRIMITIVE_TOPOLOGY_LINESTRIP;}else{d.PrimitiveTopologyType=D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;p->topology=topology==VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP?D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP:D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;}
 		if(i.renderPass){const uint32_t colorCount=(std::min)(static_cast<uint32_t>(i.renderPass->colors.size()),8u);for(uint32_t a=0;a<colorCount;a++){const auto attachment=i.renderPass->colors[a].attachment;if(attachment==VK_ATTACHMENT_UNUSED)continue;if(attachment>=i.renderPass->attachments.size()){delete p;return VK_ERROR_INITIALIZATION_FAILED;}const VkFormat vkFormat=i.renderPass->attachments[attachment].format;const DXGI_FORMAT rtvFormat=ToDxgiFormat(vkFormat);if(rtvFormat==DXGI_FORMAT_UNKNOWN){cemuLog_log(LogType::Force,fmt::format("D3D12 graphics pipeline rejected unsupported color attachment format {} at slot {}",static_cast<uint32_t>(vkFormat),a));delete p;return VK_ERROR_FORMAT_NOT_SUPPORTED;}d.RTVFormats[a]=rtvFormat;d.NumRenderTargets=a+1;}if(i.renderPass->depth.attachment!=VK_ATTACHMENT_UNUSED&&i.renderPass->depth.attachment<i.renderPass->attachments.size())d.DSVFormat=ToDxgiFormat(i.renderPass->attachments[i.renderPass->depth.attachment].format);}
@@ -937,17 +1194,30 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreateGraphicsPipelines(VkDevice device,VkPipeli
 				if(depthFormat!=VK_FORMAT_UNDEFINED)d.DSVFormat=ToDxgiFormat(depthFormat);
 			}
 		}
+		if(d.DSVFormat==DXGI_FORMAT_UNKNOWN){d.DepthStencilState.DepthEnable=FALSE;d.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO;d.DepthStencilState.StencilEnable=FALSE;}
 		d.SampleDesc.Count=i.pMultisampleState?static_cast<UINT>(i.pMultisampleState->rasterizationSamples):1;
 		std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements;
 		if(i.pVertexInputState)
 		{
+			std::array<bool,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> usedSlots{};
+			for(uint32_t b=0;b<i.pVertexInputState->vertexBindingDescriptionCount;b++){const auto& binding=i.pVertexInputState->pVertexBindingDescriptions[b];if(binding.binding<D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT){p->vertexStrides[binding.binding]=binding.stride;usedSlots[binding.binding]=true;}}
 			inputElements.reserve(i.pVertexInputState->vertexAttributeDescriptionCount);
 			for(uint32_t a=0;a<i.pVertexInputState->vertexAttributeDescriptionCount;a++)
 			{
 				const auto& attribute=i.pVertexInputState->pVertexAttributeDescriptions[a];
-				D3D12_INPUT_ELEMENT_DESC element{};element.SemanticName="TEXCOORD";element.SemanticIndex=attribute.location;element.Format=ToDxgiFormat(attribute.format);element.InputSlot=attribute.binding;element.AlignedByteOffset=attribute.offset;
+				D3D12_INPUT_ELEMENT_DESC element{};element.SemanticName="TEXCOORD";element.SemanticIndex=attribute.location;element.Format=ToDxgiVertexFormat(attribute.format);element.InputSlot=attribute.binding;element.AlignedByteOffset=attribute.offset;
 				for(uint32_t b=0;b<i.pVertexInputState->vertexBindingDescriptionCount;b++)if(i.pVertexInputState->pVertexBindingDescriptions[b].binding==attribute.binding){element.InputSlotClass=i.pVertexInputState->pVertexBindingDescriptions[b].inputRate==VK_VERTEX_INPUT_RATE_INSTANCE?D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA:D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;element.InstanceDataStepRate=element.InputSlotClass==D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA?1:0;break;}
-				if(element.Format!=DXGI_FORMAT_UNKNOWN)inputElements.push_back(element);
+				uint32_t sourceBytes{},outputStride{},alphaValue{};
+				if(GetVertexConversion(attribute.format,sourceBytes,outputStride,alphaValue))
+				{
+					uint32_t outputSlot=D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;
+					for(uint32_t slot=D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT;slot>0;slot--)if(!usedSlots[slot-1]){outputSlot=slot-1;break;}
+					if(outputSlot==D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT){cemuLog_log(LogType::Force,"D3D12 graphics pipeline has no free input slot for converted three-component attribute");delete p;return VK_ERROR_FORMAT_NOT_SUPPORTED;}
+					usedSlots[outputSlot]=true;
+					VertexConversion conversion{};conversion.sourceBinding=attribute.binding;conversion.sourceOffset=attribute.offset;conversion.sourceStride=attribute.binding<D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT?p->vertexStrides[attribute.binding]:0;conversion.sourceBytes=sourceBytes;conversion.outputSlot=outputSlot;conversion.outputStride=outputStride;conversion.alphaValue=alphaValue;conversion.inputClass=element.InputSlotClass;conversion.instanceStepRate=element.InstanceDataStepRate;p->vertexConversions.push_back(conversion);
+					element.InputSlot=outputSlot;element.AlignedByteOffset=0;
+				}
+				if(element.Format==DXGI_FORMAT_UNKNOWN){cemuLog_log(LogType::Force,fmt::format("D3D12 graphics pipeline rejected unsupported vertex format {} at location {}",static_cast<uint32_t>(attribute.format),attribute.location));delete p;return VK_ERROR_FORMAT_NOT_SUPPORTED;}inputElements.push_back(element);
 			}
 			d.InputLayout={inputElements.data(),static_cast<UINT>(inputElements.size())};
 		}
@@ -960,7 +1230,7 @@ VKAPI_ATTR void VKAPI_CALL IDestroyQueryPool(VkDevice,VkQueryPool q,const VkAllo
 VKAPI_ATTR void VKAPI_CALL ICmdResetQueryPool(VkCommandBuffer,VkQueryPool,uint32_t,uint32_t){}
 VKAPI_ATTR void VKAPI_CALL ICmdBeginQuery(VkCommandBuffer c,VkQueryPool q,uint32_t index,VkQueryControlFlags){if(c&&q)c->list->BeginQuery(q->heap.Get(),D3D12_QUERY_TYPE_OCCLUSION,index);}
 VKAPI_ATTR void VKAPI_CALL ICmdEndQuery(VkCommandBuffer c,VkQueryPool q,uint32_t index){if(c&&q){const auto t=q->type==VK_QUERY_TYPE_OCCLUSION?D3D12_QUERY_TYPE_OCCLUSION:D3D12_QUERY_TYPE_TIMESTAMP;c->list->EndQuery(q->heap.Get(),t,index);}}
-VKAPI_ATTR void VKAPI_CALL ICmdCopyQueryPoolResults(VkCommandBuffer c,VkQueryPool q,uint32_t first,uint32_t count,VkBuffer dst,VkDeviceSize offset,VkDeviceSize stride,VkQueryResultFlags){if(!c||!q||!dst||!dst->resource)return;TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);const auto t=q->type==VK_QUERY_TYPE_OCCLUSION?D3D12_QUERY_TYPE_OCCLUSION:D3D12_QUERY_TYPE_TIMESTAMP;if(stride==8)c->list->ResolveQueryData(q->heap.Get(),t,first,count,dst->resource.Get(),dst->memoryOffset+offset);else for(uint32_t i=0;i<count;i++)c->list->ResolveQueryData(q->heap.Get(),t,first+i,1,dst->resource.Get(),dst->memoryOffset+offset+VkDeviceSize(i)*stride);}
+VKAPI_ATTR void VKAPI_CALL ICmdCopyQueryPoolResults(VkCommandBuffer c,VkQueryPool q,uint32_t first,uint32_t count,VkBuffer dst,VkDeviceSize offset,VkDeviceSize stride,VkQueryResultFlags){if(!c||!q||!dst||!dst->resource)return;TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);const auto t=q->type==VK_QUERY_TYPE_OCCLUSION?D3D12_QUERY_TYPE_OCCLUSION:D3D12_QUERY_TYPE_TIMESTAMP;if(stride==8)c->list->ResolveQueryData(q->heap.Get(),t,first,count,dst->resource.Get(),NativeBufferOffset(dst)+offset);else for(uint32_t i=0;i<count;i++)c->list->ResolveQueryData(q->heap.Get(),t,first+i,1,dst->resource.Get(),NativeBufferOffset(dst)+offset+VkDeviceSize(i)*stride);}
 VKAPI_ATTR VkResult VKAPI_CALL IGetQueryPoolResults(VkDevice device,VkQueryPool q,uint32_t first,uint32_t count,size_t dataSize,void* data,VkDeviceSize stride,VkQueryResultFlags flags)
 {
 	if(!device||!q||!data||first+count>q->count)return VK_ERROR_INITIALIZATION_FAILED;ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;if(FAILED(device->native->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||FAILED(device->native->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))))return VK_ERROR_DEVICE_LOST;const auto type=q->type==VK_QUERY_TYPE_OCCLUSION?D3D12_QUERY_TYPE_OCCLUSION:D3D12_QUERY_TYPE_TIMESTAMP;list->ResolveQueryData(q->heap.Get(),type,first,count,q->readback.Get(),VkDeviceSize(first)*8);list->Close();ID3D12CommandList* lists[]={list.Get()};device->queue.native->ExecuteCommandLists(1,lists);if(IDeviceWaitIdle(device)!=VK_SUCCESS)return VK_ERROR_DEVICE_LOST;void* mapped{};D3D12_RANGE range{SIZE_T(first)*8,SIZE_T(first+count)*8};if(FAILED(q->readback->Map(0,&range,&mapped)))return VK_ERROR_MEMORY_MAP_FAILED;const bool use64=flags&VK_QUERY_RESULT_64_BIT;const size_t valueSize=use64?8:4;for(uint32_t i=0;i<count&&size_t(i)*stride+valueSize<=dataSize;i++){const uint64_t value=static_cast<const uint64_t*>(mapped)[first+i];if(use64)*reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(data)+size_t(i)*stride)=value;else *reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(data)+size_t(i)*stride)=static_cast<uint32_t>(value);}D3D12_RANGE written{0,0};q->readback->Unmap(0,&written);return VK_SUCCESS;
@@ -968,12 +1238,10 @@ VKAPI_ATTR VkResult VKAPI_CALL IGetQueryPoolResults(VkDevice device,VkQueryPool 
 VKAPI_ATTR void VKAPI_CALL ICmdCopyImage(VkCommandBuffer c,VkImage src,VkImageLayout,VkImage dst,VkImageLayout,uint32_t count,const VkImageCopy* regions){if(!c||!src||!dst||!src->resource||!dst->resource)return;TransitionImage(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);TransitionImage(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);for(uint32_t i=0;i<count;i++){D3D12_TEXTURE_COPY_LOCATION s{src->resource.Get(),D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX},d{dst->resource.Get(),D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};s.SubresourceIndex=regions[i].srcSubresource.mipLevel+regions[i].srcSubresource.baseArrayLayer*src->info.mipLevels;d.SubresourceIndex=regions[i].dstSubresource.mipLevel+regions[i].dstSubresource.baseArrayLayer*dst->info.mipLevels;D3D12_BOX box{static_cast<UINT>(regions[i].srcOffset.x),static_cast<UINT>(regions[i].srcOffset.y),static_cast<UINT>(regions[i].srcOffset.z),static_cast<UINT>(regions[i].srcOffset.x+regions[i].extent.width),static_cast<UINT>(regions[i].srcOffset.y+regions[i].extent.height),static_cast<UINT>(regions[i].srcOffset.z+regions[i].extent.depth)};c->list->CopyTextureRegion(&d,regions[i].dstOffset.x,regions[i].dstOffset.y,regions[i].dstOffset.z,&s,&box);}}
 VKAPI_ATTR void VKAPI_CALL ICmdCopyBufferToImage(VkCommandBuffer c,VkBuffer src,VkImage dst,VkImageLayout,uint32_t count,const VkBufferImageCopy* regions)
 {
-	TransitionImage(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);
-	if(!c||!src||!dst||!src->resource||!dst->resource)return;TransitionBuffer(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);const auto desc=dst->resource->GetDesc();for(uint32_t i=0;i<count;i++){const UINT sub=regions[i].imageSubresource.mipLevel+regions[i].imageSubresource.baseArrayLayer*dst->info.mipLevels;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows{};UINT64 rowSize{},total{};c->device->native->GetCopyableFootprints(&desc,sub,1,src->memoryOffset+regions[i].bufferOffset,&fp,&rows,&rowSize,&total);if(regions[i].bufferRowLength)fp.Footprint.RowPitch=(regions[i].bufferRowLength*static_cast<UINT>(rowSize)/(std::max)(1u,regions[i].imageExtent.width)+255)&~255u;D3D12_TEXTURE_COPY_LOCATION s{};s.pResource=src->resource.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;s.PlacedFootprint=fp;D3D12_TEXTURE_COPY_LOCATION d{};d.pResource=dst->resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;d.SubresourceIndex=sub;c->list->CopyTextureRegion(&d,regions[i].imageOffset.x,regions[i].imageOffset.y,regions[i].imageOffset.z,&s,nullptr);}}
+	if(!c||!src||!dst||!regions||!src->resource||!dst->resource)return;TransitionImage(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);TransitionBuffer(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);const auto desc=dst->resource->GetDesc();const bool blockCompressed=IsBlockCompressedFormat(dst->info.format);for(uint32_t i=0;i<count;i++){const auto& r=regions[i];const UINT sub=r.imageSubresource.mipLevel+r.imageSubresource.baseArrayLayer*dst->info.mipLevels;auto footprintDesc=desc;const uint32_t logicalWidth=r.bufferRowLength?r.bufferRowLength:r.imageExtent.width;const uint32_t logicalHeight=r.bufferImageHeight?r.bufferImageHeight:r.imageExtent.height;footprintDesc.Width=blockCompressed?(logicalWidth+3u)&~3u:logicalWidth;footprintDesc.Height=blockCompressed?(logicalHeight+3u)&~3u:logicalHeight;footprintDesc.DepthOrArraySize=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?static_cast<UINT16>(r.imageExtent.depth):1;footprintDesc.MipLevels=1;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows{};UINT64 rowSize{},total{};c->device->native->GetCopyableFootprints(&footprintDesc,0,1,src->memoryOffset+r.bufferOffset,&fp,&rows,&rowSize,&total);D3D12_TEXTURE_COPY_LOCATION s{};s.pResource=src->resource.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;s.PlacedFootprint=fp;D3D12_TEXTURE_COPY_LOCATION d{};d.pResource=dst->resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;d.SubresourceIndex=sub;const uint32_t copyWidth=blockCompressed?(r.imageExtent.width+3u)&~3u:r.imageExtent.width;const uint32_t copyHeight=blockCompressed?(r.imageExtent.height+3u)&~3u:r.imageExtent.height;D3D12_BOX box{0,0,0,copyWidth,copyHeight,r.imageExtent.depth};c->list->CopyTextureRegion(&d,r.imageOffset.x,r.imageOffset.y,r.imageOffset.z,&s,&box);}}
 VKAPI_ATTR void VKAPI_CALL ICmdCopyImageToBuffer(VkCommandBuffer c,VkImage src,VkImageLayout,VkBuffer dst,uint32_t count,const VkBufferImageCopy* regions)
 {
-	TransitionImage(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);
-	if(!c||!src||!dst||!src->resource||!dst->resource)return;TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);const auto desc=src->resource->GetDesc();for(uint32_t i=0;i<count;i++){const UINT sub=regions[i].imageSubresource.mipLevel+regions[i].imageSubresource.baseArrayLayer*src->info.mipLevels;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows{};UINT64 rowSize{},total{};c->device->native->GetCopyableFootprints(&desc,sub,1,dst->memoryOffset+regions[i].bufferOffset,&fp,&rows,&rowSize,&total);D3D12_TEXTURE_COPY_LOCATION s{};s.pResource=src->resource.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;s.SubresourceIndex=sub;D3D12_TEXTURE_COPY_LOCATION d{};d.pResource=dst->resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;d.PlacedFootprint=fp;D3D12_BOX box{static_cast<UINT>(regions[i].imageOffset.x),static_cast<UINT>(regions[i].imageOffset.y),static_cast<UINT>(regions[i].imageOffset.z),static_cast<UINT>(regions[i].imageOffset.x+regions[i].imageExtent.width),static_cast<UINT>(regions[i].imageOffset.y+regions[i].imageExtent.height),static_cast<UINT>(regions[i].imageOffset.z+regions[i].imageExtent.depth)};c->list->CopyTextureRegion(&d,0,0,0,&s,&box);}}
+	if(!c||!src||!dst||!regions||!src->resource||!dst->resource)return;TransitionImage(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);const auto desc=src->resource->GetDesc();for(uint32_t i=0;i<count;i++){const auto& r=regions[i];const UINT sub=r.imageSubresource.mipLevel+r.imageSubresource.baseArrayLayer*src->info.mipLevels;auto footprintDesc=desc;footprintDesc.Width=r.bufferRowLength?r.bufferRowLength:r.imageExtent.width;footprintDesc.Height=r.bufferImageHeight?r.bufferImageHeight:r.imageExtent.height;footprintDesc.DepthOrArraySize=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?static_cast<UINT16>(r.imageExtent.depth):1;footprintDesc.MipLevels=1;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows{};UINT64 rowSize{},total{};c->device->native->GetCopyableFootprints(&footprintDesc,0,1,dst->memoryOffset+r.bufferOffset,&fp,&rows,&rowSize,&total);D3D12_TEXTURE_COPY_LOCATION s{};s.pResource=src->resource.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;s.SubresourceIndex=sub;D3D12_TEXTURE_COPY_LOCATION d{};d.pResource=dst->resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;d.PlacedFootprint=fp;D3D12_BOX box{static_cast<UINT>(r.imageOffset.x),static_cast<UINT>(r.imageOffset.y),static_cast<UINT>(r.imageOffset.z),static_cast<UINT>(r.imageOffset.x+r.imageExtent.width),static_cast<UINT>(r.imageOffset.y+r.imageExtent.height),static_cast<UINT>(r.imageOffset.z+r.imageExtent.depth)};c->list->CopyTextureRegion(&d,0,0,0,&s,&box);}}
 VKAPI_ATTR void VKAPI_CALL ICmdBlitImage(VkCommandBuffer c,VkImage src,VkImageLayout,VkImage dst,VkImageLayout,uint32_t count,const VkImageBlit* regions,VkFilter)
 {
 	if(!c||!src||!dst||!src->resource||!dst->resource)return;for(uint32_t i=0;i<count;i++){const auto& r=regions[i];const int sw=std::abs(r.srcOffsets[1].x-r.srcOffsets[0].x),sh=std::abs(r.srcOffsets[1].y-r.srcOffsets[0].y),dw=std::abs(r.dstOffsets[1].x-r.dstOffsets[0].x),dh=std::abs(r.dstOffsets[1].y-r.dstOffsets[0].y);if(sw==dw&&sh==dh){VkImageCopy copy{};copy.srcSubresource=r.srcSubresource;copy.srcOffset=r.srcOffsets[0];copy.dstSubresource=r.dstSubresource;copy.dstOffset=r.dstOffsets[0];copy.extent={static_cast<uint32_t>(sw),static_cast<uint32_t>(sh),1};ICmdCopyImage(c,src,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);continue;}const uint32_t base=c->device->resourceCursor.fetch_add(2);if(base+2>65536)continue;auto cpu=c->device->resourceHeap->GetCPUDescriptorHandleForHeapStart();auto gpu=c->device->resourceHeap->GetGPUDescriptorHandleForHeapStart();D3D12_CPU_DESCRIPTOR_HANDLE srvCpu{cpu.ptr+SIZE_T(base)*c->device->resourceStride},uavCpu{cpu.ptr+SIZE_T(base+1)*c->device->resourceStride};D3D12_GPU_DESCRIPTOR_HANDLE srvGpu{gpu.ptr+UINT64(base)*c->device->resourceStride},uavGpu{gpu.ptr+UINT64(base+1)*c->device->resourceStride};D3D12_SHADER_RESOURCE_VIEW_DESC sv{};sv.Format=src->resource->GetDesc().Format;sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;sv.Texture2D.MostDetailedMip=r.srcSubresource.mipLevel;sv.Texture2D.MipLevels=1;c->device->native->CreateShaderResourceView(src->resource.Get(),&sv,srvCpu);D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};uv.Format=dst->resource->GetDesc().Format;uv.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;uv.Texture2D.MipSlice=r.dstSubresource.mipLevel;c->device->native->CreateUnorderedAccessView(dst->resource.Get(),nullptr,&uv,uavCpu);D3D12_RESOURCE_BARRIER barriers[2]{};barriers[0].Type=barriers[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barriers[0].Transition={src->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,src->state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};barriers[1].Transition={dst->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,dst->state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};c->list->ResourceBarrier(2,barriers);src->state=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;dst->state=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;ID3D12DescriptorHeap* heaps[]={c->device->resourceHeap.Get()};c->list->SetDescriptorHeaps(1,heaps);c->list->SetComputeRootSignature(c->device->blitRoot.Get());c->list->SetPipelineState(c->device->blitPipeline.Get());c->list->SetComputeRootDescriptorTable(0,srvGpu);c->list->SetComputeRootDescriptorTable(1,uavGpu);const int constants[8]={r.srcOffsets[0].x,r.srcOffsets[0].y,sw,sh,r.dstOffsets[0].x,r.dstOffsets[0].y,dw,dh};c->list->SetComputeRoot32BitConstants(2,8,constants,0);c->list->Dispatch((dw+7)/8,(dh+7)/8,1);}}
@@ -995,16 +1263,18 @@ VKAPI_ATTR void VKAPI_CALL IDestroyFramebuffer(VkDevice,VkFramebuffer f,const Vk
 VKAPI_ATTR void VKAPI_CALL ICmdBeginRenderPass(VkCommandBuffer c,const VkRenderPassBeginInfo* info,VkSubpassContents)
 {
 	TraceOperation(c,"BeginRenderPass");
-	if(!c||!info||!info->renderPass||!info->framebuffer)return;c->activeRenderPass=info->renderPass;c->activeFramebuffer=info->framebuffer;auto pass=info->renderPass;auto fb=info->framebuffer;std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
+	if(!c||!info||!info->renderPass||!info->framebuffer)return;c->activeRenderPass=info->renderPass;c->activeFramebuffer=info->framebuffer;c->boundRtvFormats.fill(DXGI_FORMAT_UNKNOWN);c->boundDsvFormat=DXGI_FORMAT_UNKNOWN;auto pass=info->renderPass;auto fb=info->framebuffer;std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;
 	for(const auto& ref:pass->colors)if(ref.attachment!=VK_ATTACHMENT_UNUSED&&ref.attachment<fb->attachments.size())
 	{
-		auto view=fb->attachments[ref.attachment];if(!view||!view->rtv.ptr)continue;auto image=view->image;const auto target=StateForLayout(image,ref.layout);if(image->state!=target){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&b);image->state=target;}rtvs.push_back(view->rtv);
+		auto view=fb->attachments[ref.attachment];if(!view||!view->rtv.ptr)continue;auto image=view->image;const auto target=StateForLayout(image,ref.layout);if(image->state!=target){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&b);image->state=target;}const uint32_t slot=static_cast<uint32_t>(rtvs.size());rtvs.push_back(view->rtv);if(slot<c->boundRtvFormats.size())c->boundRtvFormats[slot]=ToDxgiFormat(view->info.format!=VK_FORMAT_UNDEFINED?view->info.format:image->info.format);
 	}
 	D3D12_CPU_DESCRIPTOR_HANDLE dsv{};if(pass->depth.attachment!=VK_ATTACHMENT_UNUSED&&pass->depth.attachment<fb->attachments.size())
 	{
-		auto view=fb->attachments[pass->depth.attachment];if(view&&view->dsv.ptr){auto image=view->image;const auto target=StateForLayout(image,pass->depth.layout);if(image->state!=target){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&b);image->state=target;}dsv=view->dsv;}
+		auto view=fb->attachments[pass->depth.attachment];if(view&&view->dsv.ptr){auto image=view->image;const auto target=StateForLayout(image,pass->depth.layout);if(image->state!=target){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&b);image->state=target;}dsv=view->dsv;c->boundDsvFormat=ToDxgiFormat(view->info.format!=VK_FORMAT_UNDEFINED?view->info.format:image->info.format);}
 	}
 	c->list->OMSetRenderTargets(static_cast<UINT>(rtvs.size()),rtvs.data(),FALSE,dsv.ptr?&dsv:nullptr);
+	c->boundRtvCount=static_cast<uint32_t>(rtvs.size());c->boundDsv=dsv.ptr!=0;
+	static std::atomic_bool firstRenderPassTargetsLogged{false};if(!rtvs.empty()&&!firstRenderPassTargetsLogged.exchange(true))cemuLog_log(LogType::Force,fmt::format("D3D12 diagnostic: first render pass bound {} RTV(s), DSV {}",rtvs.size(),dsv.ptr?"yes":"no"));
 	for(uint32_t a=0;a<pass->attachments.size()&&a<info->clearValueCount;a++)
 	{
 		const auto& ad=pass->attachments[a];auto view=a<fb->attachments.size()?fb->attachments[a]:VK_NULL_HANDLE;if(!view)continue;if(ad.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR&&view->rtv.ptr)c->list->ClearRenderTargetView(view->rtv,info->pClearValues[a].color.float32,0,nullptr);if((ad.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR||ad.stencilLoadOp==VK_ATTACHMENT_LOAD_OP_CLEAR)&&view->dsv.ptr){UINT flags=0;if(ad.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR)flags|=D3D12_CLEAR_FLAG_DEPTH;if(ad.stencilLoadOp==VK_ATTACHMENT_LOAD_OP_CLEAR)flags|=D3D12_CLEAR_FLAG_STENCIL;c->list->ClearDepthStencilView(view->dsv,static_cast<D3D12_CLEAR_FLAGS>(flags),info->pClearValues[a].depthStencil.depth,info->pClearValues[a].depthStencil.stencil,0,nullptr);}
@@ -1012,7 +1282,7 @@ VKAPI_ATTR void VKAPI_CALL ICmdBeginRenderPass(VkCommandBuffer c,const VkRenderP
 }
 VKAPI_ATTR void VKAPI_CALL ICmdEndRenderPass(VkCommandBuffer c)
 {
-	if(!c)return;auto pass=c->activeRenderPass;auto fb=c->activeFramebuffer;if(pass&&fb)for(uint32_t i=0;i<pass->attachments.size()&&i<fb->attachments.size();i++){auto view=fb->attachments[i];if(!view||!view->image||!view->image->resource)continue;auto image=view->image;const auto target=StateForLayout(image,pass->attachments[i].finalLayout);if(target==image->state)continue;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&b);image->state=target;}c->activeRenderPass=VK_NULL_HANDLE;c->activeFramebuffer=VK_NULL_HANDLE;
+	if(!c)return;auto pass=c->activeRenderPass;auto fb=c->activeFramebuffer;if(pass&&fb)for(uint32_t i=0;i<pass->attachments.size()&&i<fb->attachments.size();i++){auto view=fb->attachments[i];if(!view||!view->image||!view->image->resource)continue;auto image=view->image;const auto target=StateForLayout(image,pass->attachments[i].finalLayout);if(target==image->state)continue;D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,target};c->list->ResourceBarrier(1,&b);image->state=target;}c->activeRenderPass=VK_NULL_HANDLE;c->activeFramebuffer=VK_NULL_HANDLE;c->boundRtvCount=0;c->boundDsv=false;
 }
 VKAPI_ATTR void VKAPI_CALL ICmdClearAttachments(VkCommandBuffer c,uint32_t attachmentCount,const VkClearAttachment* attachments,uint32_t rectCount,const VkClearRect* rects)
 {
@@ -1046,7 +1316,7 @@ VkResult TransitionSwapchainForPresent(VkQueue q,VkSwapchainKHR swap)
 {
 	if(!q||!swap)return VK_ERROR_OUT_OF_DATE_KHR;const UINT index=swap->native->GetCurrentBackBufferIndex();if(index>=swap->images.size())return VK_ERROR_OUT_OF_DATE_KHR;auto image=swap->images[index];if(!image||!image->resource||image->state==D3D12_RESOURCE_STATE_PRESENT)return VK_SUCCESS;ComPtr<ID3D12CommandAllocator> allocator;ComPtr<ID3D12GraphicsCommandList> list;if(FAILED(q->device->native->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||FAILED(q->device->native->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),nullptr,IID_PPV_ARGS(&list))))return VK_ERROR_DEVICE_LOST;D3D12_RESOURCE_BARRIER barrier{};barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barrier.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,D3D12_RESOURCE_STATE_PRESENT};list->ResourceBarrier(1,&barrier);if(FAILED(list->Close()))return VK_ERROR_DEVICE_LOST;ID3D12CommandList* lists[]={list.Get()};q->native->ExecuteCommandLists(1,lists);image->state=D3D12_RESOURCE_STATE_PRESENT;return VK_SUCCESS;
 }
-VKAPI_ATTR VkResult VKAPI_CALL IQueuePresentKHR(VkQueue q,const VkPresentInfoKHR* info){if(!q||!info)return VK_ERROR_INITIALIZATION_FAILED;const VkPresentIdKHR* ids=nullptr;for(auto* next=static_cast<const VkBaseInStructure*>(info->pNext);next;next=next->pNext)if(next->sType==VK_STRUCTURE_TYPE_PRESENT_ID_KHR)ids=reinterpret_cast<const VkPresentIdKHR*>(next);for(uint32_t i=0;i<info->waitSemaphoreCount;i++)q->native->Wait(info->pWaitSemaphores[i]->native.Get(),info->pWaitSemaphores[i]->value.load());VkResult final=VK_SUCCESS;for(uint32_t i=0;i<info->swapchainCount;i++){auto swap=info->pSwapchains[i];const VkResult transition=TransitionSwapchainForPresent(q,swap);HRESULT hr=S_OK;if(transition!=VK_SUCCESS)final=transition;else hr=swap->native->Present(1,0);if(FAILED(hr))final=hr==DXGI_ERROR_DEVICE_REMOVED?VK_ERROR_DEVICE_LOST:VK_ERROR_OUT_OF_DATE_KHR;else if(transition==VK_SUCCESS){swap->presentValue=ids&&i<ids->swapchainCount?ids->pPresentIds[i]:swap->presentValue+1;q->native->Signal(swap->presentFence.Get(),swap->presentValue);}if(info->pResults)info->pResults[i]=final;}return final;}
+VKAPI_ATTR VkResult VKAPI_CALL IQueuePresentKHR(VkQueue q,const VkPresentInfoKHR* info){if(!q||!info)return VK_ERROR_INITIALIZATION_FAILED;const VkPresentIdKHR* ids=nullptr;for(auto* next=static_cast<const VkBaseInStructure*>(info->pNext);next;next=next->pNext)if(next->sType==VK_STRUCTURE_TYPE_PRESENT_ID_KHR)ids=reinterpret_cast<const VkPresentIdKHR*>(next);for(uint32_t i=0;i<info->waitSemaphoreCount;i++)q->native->Wait(info->pWaitSemaphores[i]->native.Get(),info->pWaitSemaphores[i]->value.load());VkResult final=VK_SUCCESS;for(uint32_t i=0;i<info->swapchainCount;i++){auto swap=info->pSwapchains[i];const VkResult transition=TransitionSwapchainForPresent(q,swap);HRESULT hr=S_OK;if(transition!=VK_SUCCESS)final=transition;else hr=swap->native->Present(1,0);if(FAILED(hr))final=hr==DXGI_ERROR_DEVICE_REMOVED?VK_ERROR_DEVICE_LOST:VK_ERROR_OUT_OF_DATE_KHR;else if(transition==VK_SUCCESS){swap->presentValue=ids&&i<ids->swapchainCount?ids->pPresentIds[i]:swap->presentValue+1;q->native->Signal(swap->presentFence.Get(),swap->presentValue);static std::atomic_bool firstPresentLogged{false};if(!firstPresentLogged.exchange(true))cemuLog_log(LogType::Force,fmt::format("D3D12 diagnostic: first Present succeeded on backbuffer {}",swap->native->GetCurrentBackBufferIndex()));}if(info->pResults)info->pResults[i]=final;}return final;}
 VKAPI_ATTR VkResult VKAPI_CALL IWaitForPresentKHR(VkDevice,VkSwapchainKHR swap,uint64_t presentId,uint64_t timeout){if(!swap)return VK_ERROR_OUT_OF_DATE_KHR;const uint64_t value=presentId?presentId:swap->presentValue;if(swap->presentFence->GetCompletedValue()>=value)return VK_SUCCESS;if(FAILED(swap->presentFence->SetEventOnCompletion(value,swap->presentEvent)))return VK_ERROR_DEVICE_LOST;const DWORD ms=timeout==UINT64_MAX?INFINITE:static_cast<DWORD>((std::min)(timeout/1000000ull,uint64_t(INFINITE-1)));return WaitForSingleObjectEx(swap->presentEvent,ms,FALSE)==WAIT_OBJECT_0?VK_SUCCESS:VK_TIMEOUT;}
 VKAPI_ATTR VkResult VKAPI_CALL ICreateComputePipelines(VkDevice device,VkPipelineCache,uint32_t count,const VkComputePipelineCreateInfo* infos,const VkAllocationCallbacks*,VkPipeline* out)
 {
@@ -1054,9 +1324,10 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreateComputePipelines(VkDevice device,VkPipelin
 }
 VKAPI_ATTR void VKAPI_CALL ICmdBeginRenderingKHR(VkCommandBuffer c,const VkRenderingInfoKHR* info)
 {
-		if(!c||!info)return;std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;for(uint32_t i=0;i<info->colorAttachmentCount;i++){const auto& a=info->pColorAttachments[i];if(!a.imageView||!a.imageView->rtv.ptr)continue;auto image=a.imageView->image;if(image->state!=D3D12_RESOURCE_STATE_RENDER_TARGET){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,D3D12_RESOURCE_STATE_RENDER_TARGET};c->list->ResourceBarrier(1,&b);image->state=D3D12_RESOURCE_STATE_RENDER_TARGET;}rtvs.push_back(a.imageView->rtv);if(a.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR)c->list->ClearRenderTargetView(a.imageView->rtv,a.clearValue.color.float32,0,nullptr);}D3D12_CPU_DESCRIPTOR_HANDLE dsv{};const VkRenderingAttachmentInfoKHR* depth=info->pDepthAttachment?info->pDepthAttachment:info->pStencilAttachment;if(depth&&depth->imageView&&depth->imageView->dsv.ptr){auto image=depth->imageView->image;if(image->state!=D3D12_RESOURCE_STATE_DEPTH_WRITE){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,D3D12_RESOURCE_STATE_DEPTH_WRITE};c->list->ResourceBarrier(1,&b);image->state=D3D12_RESOURCE_STATE_DEPTH_WRITE;}dsv=depth->imageView->dsv;if(depth->loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR){UINT flags=info->pDepthAttachment?D3D12_CLEAR_FLAG_DEPTH:0;if(info->pStencilAttachment)flags|=D3D12_CLEAR_FLAG_STENCIL;c->list->ClearDepthStencilView(dsv,static_cast<D3D12_CLEAR_FLAGS>(flags),depth->clearValue.depthStencil.depth,depth->clearValue.depthStencil.stencil,0,nullptr);}}c->list->OMSetRenderTargets(static_cast<UINT>(rtvs.size()),rtvs.data(),FALSE,dsv.ptr?&dsv:nullptr);
+		if(c&&info){c->boundRtvFormats.fill(DXGI_FORMAT_UNKNOWN);c->boundDsvFormat=DXGI_FORMAT_UNKNOWN;uint32_t slot=0;for(uint32_t i=0;i<info->colorAttachmentCount&&slot<c->boundRtvFormats.size();i++){const auto view=info->pColorAttachments[i].imageView;if(!view||!view->rtv.ptr)continue;c->boundRtvFormats[slot++]=ToDxgiFormat(view->info.format!=VK_FORMAT_UNDEFINED?view->info.format:view->image->info.format);}const auto depthInfo=info->pDepthAttachment?info->pDepthAttachment:info->pStencilAttachment;if(depthInfo&&depthInfo->imageView&&depthInfo->imageView->dsv.ptr){const auto view=depthInfo->imageView;c->boundDsvFormat=ToDxgiFormat(view->info.format!=VK_FORMAT_UNDEFINED?view->info.format:view->image->info.format);}}
+		if(!c||!info)return;std::vector<D3D12_CPU_DESCRIPTOR_HANDLE> rtvs;for(uint32_t i=0;i<info->colorAttachmentCount;i++){const auto& a=info->pColorAttachments[i];if(!a.imageView||!a.imageView->rtv.ptr)continue;auto image=a.imageView->image;if(image->state!=D3D12_RESOURCE_STATE_RENDER_TARGET){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,D3D12_RESOURCE_STATE_RENDER_TARGET};c->list->ResourceBarrier(1,&b);image->state=D3D12_RESOURCE_STATE_RENDER_TARGET;}rtvs.push_back(a.imageView->rtv);if(a.loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR)c->list->ClearRenderTargetView(a.imageView->rtv,a.clearValue.color.float32,0,nullptr);}D3D12_CPU_DESCRIPTOR_HANDLE dsv{};const VkRenderingAttachmentInfoKHR* depth=info->pDepthAttachment?info->pDepthAttachment:info->pStencilAttachment;if(depth&&depth->imageView&&depth->imageView->dsv.ptr){auto image=depth->imageView->image;if(image->state!=D3D12_RESOURCE_STATE_DEPTH_WRITE){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition={image->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,image->state,D3D12_RESOURCE_STATE_DEPTH_WRITE};c->list->ResourceBarrier(1,&b);image->state=D3D12_RESOURCE_STATE_DEPTH_WRITE;}dsv=depth->imageView->dsv;if(depth->loadOp==VK_ATTACHMENT_LOAD_OP_CLEAR){UINT flags=info->pDepthAttachment?D3D12_CLEAR_FLAG_DEPTH:0;if(info->pStencilAttachment)flags|=D3D12_CLEAR_FLAG_STENCIL;c->list->ClearDepthStencilView(dsv,static_cast<D3D12_CLEAR_FLAGS>(flags),depth->clearValue.depthStencil.depth,depth->clearValue.depthStencil.stencil,0,nullptr);}}c->list->OMSetRenderTargets(static_cast<UINT>(rtvs.size()),rtvs.data(),FALSE,dsv.ptr?&dsv:nullptr);c->boundRtvCount=static_cast<uint32_t>(rtvs.size());c->boundDsv=dsv.ptr!=0;static std::atomic_bool firstDynamicTargetsLogged{false};if(!rtvs.empty()&&!firstDynamicTargetsLogged.exchange(true))cemuLog_log(LogType::Force,fmt::format("D3D12 diagnostic: first dynamic rendering bound {} RTV(s), DSV {}",rtvs.size(),dsv.ptr?"yes":"no"));
 }
-VKAPI_ATTR void VKAPI_CALL ICmdEndRenderingKHR(VkCommandBuffer){}
+VKAPI_ATTR void VKAPI_CALL ICmdEndRenderingKHR(VkCommandBuffer c){if(c){c->boundRtvCount=0;c->boundDsv=false;}}
 VKAPI_ATTR void VKAPI_CALL ICmdSetAttachmentFeedbackLoopEnableEXT(VkCommandBuffer, VkImageAspectFlags){}
 VKAPI_ATTR void VKAPI_CALL ICmdDispatch(VkCommandBuffer c,uint32_t x,uint32_t y,uint32_t z){if(c)c->list->Dispatch(x,y,z);}
 VKAPI_ATTR VkResult VKAPI_CALL ICreateWin32SurfaceKHR(VkInstance, const VkWin32SurfaceCreateInfoKHR* info, const VkAllocationCallbacks*, VkSurfaceKHR* out)
@@ -1112,7 +1383,9 @@ bool IsInternalDriverSelected() { return s_selected.load(std::memory_order_acqui
 bool InitializeGlobalDispatch()
 {
 	std::scoped_lock lock(s_dispatchMutex);
+	#if !defined(CEMU_UWP)
 	EnableDeviceRemovedDiagnostics();
+	#endif
 	vkGetInstanceProcAddr=IGetInstanceProcAddr; vkGetDeviceProcAddr=IGetDeviceProcAddr; vkCreateInstance=ICreateInstance;
 	vkEnumerateInstanceExtensionProperties=IEnumerateInstanceExtensionProperties; vkEnumerateDeviceExtensionProperties=IEnumerateDeviceExtensionProperties; vkEnumerateInstanceVersion=IEnumerateInstanceVersion;
 	cemuLog_log(LogType::Force,"Internal Vulkan-to-D3D12 global dispatch initialized (no Vulkan loader or Mesa runtime)"); return true;

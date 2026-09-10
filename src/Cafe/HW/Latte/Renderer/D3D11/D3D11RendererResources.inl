@@ -37,7 +37,6 @@ public:
 	void PrepareForRenderTarget(UINT framebufferWidth, UINT framebufferHeight);
 	ID3D11RenderTargetView* FramebufferRTV(UINT framebufferWidth, UINT framebufferHeight);
 	void CopyAliasToBase();
-	bool IsIncompatibleAlias() const { return m_incompatibleAlias; }
 private:
 	struct AliasStagingResource
 	{

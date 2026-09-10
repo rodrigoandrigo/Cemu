@@ -36,12 +36,6 @@ public:
 	void DrawBackbufferQuad(LatteTextureView*, RendererOutputShader*, bool,
 		sint32, sint32, sint32, sint32, bool, bool) override;
 	bool BeginFrame(bool mainWindow) override;
-	bool UseTFViaSSBO() const override
-	{
-		// Feature Level 11.0 has no all-stage UAV support. UWP uses the dedicated
-		// pixel-UAV replay and desktop uses native D3D11 stream output instead.
-		return false;
-	}
 	void Flush(bool waitIdle) override;
 	void NotifyLatteCommandProcessorIdle() override;
 	bool ImguiBegin(bool mainWindow) override;
@@ -131,13 +125,13 @@ private:
 	void CheckMemoryPressure();
 	bool WaitForGpuIdle();
 	bool EnsureNativeStreamoutBuffers();
+	static bool IsDeviceLostResult(HRESULT result);
 	bool CheckDeviceHealth(const char* operation);
 	bool ExecutePixelStreamoutCapture(uint32 baseVertex, uint32 baseInstance,
 		uint32 instanceCount, uint32 vertexCount, uint32 indexCount,
 		Renderer::INDEX_TYPE indexType, ID3D11Buffer* indexBuffer, UINT indexOffset,
 		const uint8* decodedIndices, UINT decodedIndexBytes);
 	void RecordDeviceLost(HRESULT result, const char* operation);
-	uint64 QueryProcessCommitBytes() const;
 	uint64 CurrentLogicalPipelineKey() const;
 	uint64 ShaderFailureKey(RendererShader::ShaderType type, uint64 baseHash, uint64 auxHash) const;
 
@@ -211,7 +205,6 @@ private:
 	std::array<bool, LATTE_NUM_STREAMOUT_BUFFER> m_streamoutEnabled{};
 	std::array<bool, 8> m_boundColorBlendable{ true, true, true, true, true, true, true, true };
 	bool m_streamoutActive{};
-	bool m_streamoutUsesStorage{};
 	bool m_streamoutUsesPixelCapture{};
 	bool m_streamoutNativeRasterized{};
 	bool m_streamoutDataAvailable{};

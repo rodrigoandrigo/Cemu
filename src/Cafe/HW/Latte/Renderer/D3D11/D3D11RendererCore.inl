@@ -482,7 +482,7 @@ void D3D11Renderer::RecoverFromMemoryPressure(const char* resourceName, bool evi
 	int usageInMB = -1;
 	int budgetInMB = -1;
 	GetVRAMInfo(usageInMB, budgetInMB);
-	const uint64 processCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	const uint64 processCommitMB = QueryProcessPrivateCommitBytes() / (1024 * 1024);
 
 	// Resource-creation retries occur inside an active draw. Clearing SRVs/RTVs or
 	// evicting textures here leaves that draw with null bindings and produces
@@ -519,11 +519,6 @@ void D3D11Renderer::RecoverFromMemoryPressure(const char* resourceName, bool evi
 #if defined(CEMU_UWP)
 	HeapCompact(GetProcessHeap(), 0);
 #endif
-}
-
-uint64 D3D11Renderer::QueryProcessCommitBytes() const
-{
-	return QueryProcessPrivateCommitBytes();
 }
 
 uint64 D3D11Renderer::ShaderFailureKey(RendererShader::ShaderType type, uint64 baseHash,
@@ -572,7 +567,7 @@ void D3D11Renderer::CheckMemoryPressure()
 	// recurring GPU stall.
 	if ((++m_memoryCheckFrame % 10) != 0 && !m_memoryPressureActive)
 		return;
-	const uint64 processCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	const uint64 processCommitMB = QueryProcessPrivateCommitBytes() / (1024 * 1024);
 	int videoUsageMB = -1;
 	int videoBudgetMB = -1;
 	GetVRAMInfo(videoUsageMB, videoBudgetMB);
@@ -628,7 +623,7 @@ void D3D11Renderer::CheckMemoryPressure()
 	if (SUCCEEDED(m_device.As(&dxgiDevice3)))
 		dxgiDevice3->Trim();
 	HeapCompact(GetProcessHeap(), 0);
-	const uint64 postTrimCommitMB = QueryProcessCommitBytes() / (1024 * 1024);
+	const uint64 postTrimCommitMB = QueryProcessPrivateCommitBytes() / (1024 * 1024);
 	m_lastHeavyMemoryRecoveryFrame = m_memoryCheckFrame;
 	m_lastHeavyMemoryRecoveryCommitMB = postTrimCommitMB;
 	if (!m_memoryPressureActive || evictedTextures != 0 || (m_memoryCheckFrame % 60) == 0)

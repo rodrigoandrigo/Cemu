@@ -1,10 +1,5 @@
 namespace
 {
-// OM UAV registers share the output-merger namespace with render targets.
-// Keeping stream-out after all eight RTV slots permits rasterization and
-// transform feedback in the same draw without an overlap at u0.
-constexpr UINT StreamoutUavSlot = D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT;
-
 // Feature level 11.0 permits UAV writes from the pixel shader, but not from
 // VS/GS.  Xbox UWP exposes exactly that feature level.  The compatibility
 // path below therefore replays the vertex stream as points and stores the XFB
@@ -95,12 +90,6 @@ bool IsMemoryPressureResult(HRESULT result)
 	// the same recoverable path without making the build depend on that macro.
 	constexpr HRESULT kDxgiErrorOutOfMemory = static_cast<HRESULT>(0x887A000Eu);
 	return result == E_OUTOFMEMORY || result == kDxgiErrorOutOfMemory;
-}
-
-bool IsDeviceLostResult(HRESULT result)
-{
-	return result == DXGI_ERROR_DEVICE_REMOVED || result == DXGI_ERROR_DEVICE_RESET ||
-		result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
 }
 
 uint64 QueryProcessPrivateCommitBytes()

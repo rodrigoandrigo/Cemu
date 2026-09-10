@@ -5,15 +5,6 @@
 #include <immintrin.h>
 #include <thread>
 
-namespace
-{
-bool IsRemovedResult(HRESULT result)
-{
-	return result == DXGI_ERROR_DEVICE_HUNG || result == DXGI_ERROR_DEVICE_REMOVED ||
-		result == DXGI_ERROR_DEVICE_RESET || result == DXGI_ERROR_DRIVER_INTERNAL_ERROR;
-}
-}
-
 bool D3D11Renderer::WaitForGpuIdle()
 {
 	if (m_deviceLost.load(std::memory_order_relaxed))
@@ -42,7 +33,7 @@ bool D3D11Renderer::WaitForGpuIdle()
 			return true;
 		if (status != S_FALSE)
 		{
-			if (IsRemovedResult(status))
+			if (IsDeviceLostResult(status))
 				RecordDeviceLost(status, "GPU-idle wait");
 			else
 				cemuLog_log(LogType::Force,
