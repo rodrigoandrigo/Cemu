@@ -52,6 +52,9 @@ struct VkDevice_T
 	ComPtr<ID3D12PipelineState> vertexConvertPipeline;
 	UINT resourceStride{}, samplerStride{}, rtvStride{}, dsvStride{};
 	std::atomic_uint32_t resourceCursor{}, samplerCursor{}, rtvCursor{}, dsvCursor{};
+	std::mutex descriptorHeapMutex;
+	std::vector<std::pair<uint32_t,uint32_t>> freeResourceRanges;
+	std::vector<std::pair<uint32_t,uint32_t>> freeSamplerRanges;
 	std::mutex viewDescriptorMutex;
 	std::vector<uint32_t> freeRtvSlots;
 	std::vector<uint32_t> freeDsvSlots;
@@ -146,7 +149,7 @@ struct VkDescriptorSet_T
 	std::array<uint32_t,4> base{};
 	std::array<uint32_t,4> count{};
 };
-struct VkDescriptorPool_T { std::vector<VkDescriptorSet> sets; };
+struct VkDescriptorPool_T { VkDevice device{}; std::vector<VkDescriptorSet> sets; };
 struct VkPipelineLayout_T { ComPtr<ID3D12RootSignature> root; uint32_t setCount{}; uint32_t pushRootIndex{UINT32_MAX}; uint32_t pushDwords{}; };
 struct VertexConversion
 {
@@ -155,7 +158,8 @@ struct VertexConversion
 	D3D12_INPUT_CLASSIFICATION inputClass{D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA};
 	uint32_t instanceStepRate{};
 };
-struct VkPipeline_T { ComPtr<ID3D12PipelineState> state; ComPtr<ID3DBlob> vertexShader,pixelShader,geometryShader; VkPipelineLayout layout{}; D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsDesc{}; std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements; std::vector<VertexConversion> vertexConversions; std::array<uint32_t,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexStrides{}; D3D12_PRIMITIVE_TOPOLOGY topology{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST}; bool compute{}; };
+struct GraphicsPipelineVariant { D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{}; ComPtr<ID3D12PipelineState> state; };
+struct VkPipeline_T { ComPtr<ID3D12PipelineState> state; ComPtr<ID3DBlob> vertexShader,pixelShader,geometryShader; VkPipelineLayout layout{}; D3D12_GRAPHICS_PIPELINE_STATE_DESC graphicsDesc{}; std::vector<D3D12_INPUT_ELEMENT_DESC> inputElements; std::vector<VertexConversion> vertexConversions; std::vector<GraphicsPipelineVariant> variants; std::array<uint32_t,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexStrides{}; D3D12_PRIMITIVE_TOPOLOGY topology{D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST}; bool compute{}; };
 struct VkRenderPass_T
 {
 	std::vector<VkAttachmentDescription> attachments;
@@ -954,6 +958,13 @@ void PrepareConvertedVertexBuffers(VkCommandBuffer c,uint32_t vertexCount,uint32
 	}
 	c->list->SetPipelineState(c->activeNativeState?c->activeNativeState.Get():c->activePipeline->state.Get());c->list->IASetPrimitiveTopology(c->activePipeline->topology);
 }
+bool ActivateGraphicsPipelineDesc(VkCommandBuffer c,const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc)
+{
+	if(!c||!c->activePipeline||c->activePipeline->compute)return false;
+	for(auto& variant:c->activePipeline->variants)if(std::memcmp(&variant.desc,&desc,sizeof(desc))==0){c->activeGraphicsDesc=desc;c->activeNativeState=variant.state;c->list->SetPipelineState(variant.state.Get());return true;}
+	ComPtr<ID3D12PipelineState> state;if(FAILED(c->device->native->CreateGraphicsPipelineState(&desc,IID_PPV_ARGS(&state))))return false;
+	c->activePipeline->variants.push_back({desc,state});c->activeGraphicsDesc=desc;c->activeNativeState=state;c->list->SetPipelineState(state.Get());return true;
+}
 void EnsureRenderTargetCompatiblePipeline(VkCommandBuffer c)
 {
 	if(!c||!c->activePipeline||c->activePipeline->compute)return;
@@ -967,13 +978,11 @@ void EnsureRenderTargetCompatiblePipeline(VkCommandBuffer c)
 	if(!changed)return;
 	desc.NumRenderTargets=c->boundRtvCount;desc.DSVFormat=c->boundDsv?c->boundDsvFormat:DXGI_FORMAT_UNKNOWN;
 	if(c->boundDsv)desc.DepthStencilState=c->activePipeline->graphicsDesc.DepthStencilState;else{desc.DepthStencilState.DepthEnable=FALSE;desc.DepthStencilState.DepthWriteMask=D3D12_DEPTH_WRITE_MASK_ZERO;desc.DepthStencilState.StencilEnable=FALSE;}
-	ComPtr<ID3D12PipelineState> variant;
-	if(FAILED(c->device->native->CreateGraphicsPipelineState(&desc,IID_PPV_ARGS(&variant))))
+	if(!ActivateGraphicsPipelineDesc(c,desc))
 	{
 		cemuLog_log(LogType::Force,"D3D12 failed to specialize graphics pipeline for the bound framebuffer formats");
 		return;
 	}
-	c->activeGraphicsDesc=desc;c->activeNativeState=variant;c->list->SetPipelineState(variant.Get());c->transientStates.push_back(std::move(variant));
 }
 VKAPI_ATTR void VKAPI_CALL ICmdBindVertexBuffers(VkCommandBuffer c,uint32_t first,uint32_t count,const VkBuffer* buffers,const VkDeviceSize* offsets)
 {if(!c||!buffers||!offsets||first>=D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT)return;count=(std::min)(count,D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT-first);for(uint32_t i=0;i<count;i++){c->vertexBuffers[first+i]=buffers[i];c->vertexBufferOffsets[first+i]=offsets[i];if(buffers[i]&&buffers[i]->resource)TransitionBuffer(c,buffers[i],D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);}c->vertexBufferCount=(std::max)(c->vertexBufferCount,first+count);ApplyVertexBufferViews(c);}
@@ -982,7 +991,7 @@ VKAPI_ATTR void VKAPI_CALL ICmdSetViewport(VkCommandBuffer c,uint32_t first,uint
 VKAPI_ATTR void VKAPI_CALL ICmdSetScissor(VkCommandBuffer c,uint32_t first,uint32_t count,const VkRect2D* r)
 {if(!c||first!=0)return;std::vector<D3D12_RECT> out(count);for(uint32_t i=0;i<count;i++)out[i]={r[i].offset.x,r[i].offset.y,r[i].offset.x+static_cast<LONG>(r[i].extent.width),r[i].offset.y+static_cast<LONG>(r[i].extent.height)};c->list->RSSetScissorRects(count,out.data());}
 VKAPI_ATTR void VKAPI_CALL ICmdSetBlendConstants(VkCommandBuffer c,const float values[4]){if(c&&values)c->list->OMSetBlendFactor(values);}
-VKAPI_ATTR void VKAPI_CALL ICmdSetDepthBias(VkCommandBuffer c,float constant,float clamp,float slope){if(!c||!c->activePipeline||c->activePipeline->compute)return;auto d=c->activeGraphicsDesc;d.RasterizerState.DepthBias=static_cast<INT>(constant);d.RasterizerState.DepthBiasClamp=clamp;d.RasterizerState.SlopeScaledDepthBias=slope;ComPtr<ID3D12PipelineState> variant;if(SUCCEEDED(c->device->native->CreateGraphicsPipelineState(&d,IID_PPV_ARGS(&variant)))){c->list->SetPipelineState(variant.Get());c->activeGraphicsDesc=d;c->activeNativeState=variant;c->transientStates.push_back(std::move(variant));}}
+VKAPI_ATTR void VKAPI_CALL ICmdSetDepthBias(VkCommandBuffer c,float constant,float clamp,float slope){if(!c||!c->activePipeline||c->activePipeline->compute)return;auto d=c->activeGraphicsDesc;d.RasterizerState.DepthBias=static_cast<INT>(constant);d.RasterizerState.DepthBiasClamp=clamp;d.RasterizerState.SlopeScaledDepthBias=slope;ActivateGraphicsPipelineDesc(c,d);}
 void LogFirstDraw(VkCommandBuffer c,const char* kind,uint32_t count,uint32_t instances)
 {
 	static std::atomic_bool logged{false};
@@ -1041,11 +1050,27 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreateSampler(VkDevice,const VkSamplerCreateInfo
 VKAPI_ATTR void VKAPI_CALL IDestroySampler(VkDevice,VkSampler s,const VkAllocationCallbacks*){delete s;}
 VKAPI_ATTR VkResult VKAPI_CALL ICreateDescriptorSetLayout(VkDevice,const VkDescriptorSetLayoutCreateInfo* info,const VkAllocationCallbacks*,VkDescriptorSetLayout* out){if(!info||!out)return VK_ERROR_INITIALIZATION_FAILED;auto l=new VkDescriptorSetLayout_T();l->bindings.assign(info->pBindings,info->pBindings+info->bindingCount);*out=l;return VK_SUCCESS;}
 VKAPI_ATTR void VKAPI_CALL IDestroyDescriptorSetLayout(VkDevice,VkDescriptorSetLayout l,const VkAllocationCallbacks*){delete l;}
-VKAPI_ATTR VkResult VKAPI_CALL ICreateDescriptorPool(VkDevice,const VkDescriptorPoolCreateInfo*,const VkAllocationCallbacks*,VkDescriptorPool* out){if(!out)return VK_ERROR_INITIALIZATION_FAILED;*out=new VkDescriptorPool_T();return VK_SUCCESS;}
-VKAPI_ATTR void VKAPI_CALL IDestroyDescriptorPool(VkDevice,VkDescriptorPool p,const VkAllocationCallbacks*){if(p){for(auto s:p->sets)delete s;delete p;}}
+bool AllocateDescriptorRange(VkDevice device,bool sampler,uint32_t count,uint32_t& base)
+{
+	if(!count){base=0;return true;}std::scoped_lock lock(device->descriptorHeapMutex);auto& ranges=sampler?device->freeSamplerRanges:device->freeResourceRanges;
+	for(auto it=ranges.begin();it!=ranges.end();++it)if(it->second>=count){base=it->first;it->first+=count;it->second-=count;if(!it->second)ranges.erase(it);return true;}
+	auto& cursor=sampler?device->samplerCursor:device->resourceCursor;base=cursor.fetch_add(count);return base+count<=(sampler?2048u:65536u);
+}
+void ReleaseDescriptorRange(VkDevice device,bool sampler,uint32_t base,uint32_t count)
+{
+	if(!device||!count)return;std::scoped_lock lock(device->descriptorHeapMutex);auto& ranges=sampler?device->freeSamplerRanges:device->freeResourceRanges;ranges.emplace_back(base,count);std::sort(ranges.begin(),ranges.end());
+	for(size_t i=1;i<ranges.size();)if(ranges[i-1].first+ranges[i-1].second>=ranges[i].first){const uint32_t end=(std::max)(ranges[i-1].first+ranges[i-1].second,ranges[i].first+ranges[i].second);ranges[i-1].second=end-ranges[i-1].first;ranges.erase(ranges.begin()+i);}else i++;
+}
+void ReleaseDescriptorSet(VkDescriptorSet set)
+{
+	if(!set)return;for(uint32_t cls=0;cls<4;cls++)ReleaseDescriptorRange(set->device,cls==3,set->base[cls],set->count[cls]);delete set;
+}
+VKAPI_ATTR VkResult VKAPI_CALL ICreateDescriptorPool(VkDevice device,const VkDescriptorPoolCreateInfo*,const VkAllocationCallbacks*,VkDescriptorPool* out){if(!device||!out)return VK_ERROR_INITIALIZATION_FAILED;auto p=new VkDescriptorPool_T();p->device=device;*out=p;return VK_SUCCESS;}
+VKAPI_ATTR void VKAPI_CALL IDestroyDescriptorPool(VkDevice,VkDescriptorPool p,const VkAllocationCallbacks*){if(p){for(auto s:p->sets)ReleaseDescriptorSet(s);delete p;}}
 VKAPI_ATTR VkResult VKAPI_CALL IAllocateDescriptorSets(VkDevice device,const VkDescriptorSetAllocateInfo* info,VkDescriptorSet* out)
 {
 	if(!device||!info||!out)return VK_ERROR_INITIALIZATION_FAILED;
+	if(!info->descriptorPool)return VK_ERROR_INITIALIZATION_FAILED;const size_t poolStart=info->descriptorPool->sets.size();
 	for(uint32_t i=0;i<info->descriptorSetCount;i++)
 	{
 		auto s=new VkDescriptorSet_T();s->device=device;s->layout=info->pSetLayouts[i];
@@ -1056,19 +1081,38 @@ VKAPI_ATTR VkResult VKAPI_CALL IAllocateDescriptorSets(VkDevice device,const VkD
 		}
 		for(uint32_t cls=0;cls<4;cls++)
 		{
-			auto& cursor=cls==3?device->samplerCursor:device->resourceCursor;
-			s->base[cls]=cursor.fetch_add(s->count[cls]);
-			if((cls==3&&s->base[cls]+s->count[cls]>2048)||(cls!=3&&s->base[cls]+s->count[cls]>65536)){delete s;return VK_ERROR_OUT_OF_POOL_MEMORY;}
+			if(!AllocateDescriptorRange(device,cls==3,s->count[cls],s->base[cls])){for(uint32_t allocated=0;allocated<cls;allocated++)ReleaseDescriptorRange(device,allocated==3,s->base[allocated],s->count[allocated]);delete s;while(info->descriptorPool->sets.size()>poolStart){ReleaseDescriptorSet(info->descriptorPool->sets.back());info->descriptorPool->sets.pop_back();}for(uint32_t allocated=0;allocated<i;allocated++)out[allocated]=VK_NULL_HANDLE;return VK_ERROR_OUT_OF_POOL_MEMORY;}
 		}
 		out[i]=s;info->descriptorPool->sets.push_back(s);
 	}
 	return VK_SUCCESS;
 }
-VKAPI_ATTR VkResult VKAPI_CALL IFreeDescriptorSets(VkDevice,VkDescriptorPool p,uint32_t count,const VkDescriptorSet* sets){for(uint32_t i=0;i<count;i++){auto it=std::find(p->sets.begin(),p->sets.end(),sets[i]);if(it!=p->sets.end())p->sets.erase(it);delete sets[i];}return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL IFreeDescriptorSets(VkDevice,VkDescriptorPool p,uint32_t count,const VkDescriptorSet* sets){if(!p||(!sets&&count))return VK_ERROR_INITIALIZATION_FAILED;for(uint32_t i=0;i<count;i++){auto it=std::find(p->sets.begin(),p->sets.end(),sets[i]);if(it!=p->sets.end()){p->sets.erase(it);ReleaseDescriptorSet(sets[i]);}}return VK_SUCCESS;}
+VKAPI_ATTR VkResult VKAPI_CALL IResetDescriptorPool(VkDevice,VkDescriptorPool p,VkDescriptorPoolResetFlags){if(!p)return VK_ERROR_INITIALIZATION_FAILED;for(auto s:p->sets)ReleaseDescriptorSet(s);p->sets.clear();return VK_SUCCESS;}
 
 void FillShaderResourceViewDesc(const VkImageViewCreateInfo& info, const VkImageCreateInfo& imageInfo, D3D12_SHADER_RESOURCE_VIEW_DESC& d)
 {
-	d.Format=ToDxgiShaderResourceFormat(info.format,info.subresourceRange.aspectMask);d.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;const UINT levels=info.subresourceRange.levelCount==VK_REMAINING_MIP_LEVELS?imageInfo.mipLevels-info.subresourceRange.baseMipLevel:info.subresourceRange.levelCount;
+	auto component=[](VkComponentSwizzle swizzle,UINT identity)->UINT
+	{
+		switch(swizzle)
+		{
+		case VK_COMPONENT_SWIZZLE_ZERO:return D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0;
+		case VK_COMPONENT_SWIZZLE_ONE:return D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1;
+		case VK_COMPONENT_SWIZZLE_R:return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0;
+		case VK_COMPONENT_SWIZZLE_G:return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1;
+		case VK_COMPONENT_SWIZZLE_B:return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2;
+		case VK_COMPONENT_SWIZZLE_A:return D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3;
+		case VK_COMPONENT_SWIZZLE_IDENTITY:
+		default:return identity;
+		}
+	};
+	d.Format=ToDxgiShaderResourceFormat(info.format,info.subresourceRange.aspectMask);
+	d.Shader4ComponentMapping=D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+		component(info.components.r,D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0),
+		component(info.components.g,D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_1),
+		component(info.components.b,D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_2),
+		component(info.components.a,D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_3));
+	const UINT levels=info.subresourceRange.levelCount==VK_REMAINING_MIP_LEVELS?imageInfo.mipLevels-info.subresourceRange.baseMipLevel:info.subresourceRange.levelCount;
 	if(info.viewType==VK_IMAGE_VIEW_TYPE_1D){d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE1D;d.Texture1D.MostDetailedMip=info.subresourceRange.baseMipLevel;d.Texture1D.MipLevels=levels;}
 	else if(info.viewType==VK_IMAGE_VIEW_TYPE_1D_ARRAY){d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE1DARRAY;d.Texture1DArray.MostDetailedMip=info.subresourceRange.baseMipLevel;d.Texture1DArray.MipLevels=levels;d.Texture1DArray.FirstArraySlice=info.subresourceRange.baseArrayLayer;d.Texture1DArray.ArraySize=info.subresourceRange.layerCount;}
 	else if(info.viewType==VK_IMAGE_VIEW_TYPE_CUBE){d.ViewDimension=D3D12_SRV_DIMENSION_TEXTURECUBE;d.TextureCube.MostDetailedMip=info.subresourceRange.baseMipLevel;d.TextureCube.MipLevels=levels;}
@@ -1139,7 +1183,7 @@ VKAPI_ATTR void VKAPI_CALL ICmdBindDescriptorSets(VkCommandBuffer c,VkPipelineBi
 {
 		TraceOperation(c,"BindDescriptorSets");
 		if(!c||!layout)return;ID3D12DescriptorHeap* heaps[]={c->device->resourceHeap.Get(),c->device->samplerHeap.Get()};c->list->SetDescriptorHeaps(2,heaps);
-		for(uint32_t i=0;i<count;i++)if(sets[i])for(const auto& entry:sets[i]->values){const auto& value=entry.second;if(value.buffer.buffer){if(value.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER||value.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)TransitionBuffer(c,value.buffer.buffer,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);else if(value.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||value.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)TransitionBuffer(c,value.buffer.buffer,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);}}
+		for(uint32_t i=0;i<count;i++)if(sets[i])for(const auto& entry:sets[i]->values){const auto& value=entry.second;if(value.buffer.buffer){if(value.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER||value.type==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)TransitionBuffer(c,value.buffer.buffer,D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER);else if(value.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER||value.type==VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC)TransitionBuffer(c,value.buffer.buffer,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);}if(value.image.imageView&&value.image.imageView->image){if(value.type==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)TransitionImage(c,value.image.imageView->image,D3D12_RESOURCE_STATE_UNORDERED_ACCESS);else if(value.type==VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE||value.type==VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER||value.type==VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)TransitionImage(c,value.image.imageView->image,D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE|D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);}}
 		uint32_t dynamicIndex=0;for(uint32_t i=0;i<count;i++)if(sets[i]){auto bindings=sets[i]->layout->bindings;std::sort(bindings.begin(),bindings.end(),[](const auto& a,const auto& b){return a.binding<b.binding;});for(const auto& b:bindings)if(b.descriptorType==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC)for(uint32_t e=0;e<b.descriptorCount&&dynamicIndex<dynamicCount;e++,dynamicIndex++){auto it=sets[i]->values.find((uint64_t(b.binding)<<32)|e);if(it==sets[i]->values.end()||!it->second.buffer.buffer||!it->second.buffer.buffer->resource)continue;const auto& value=it->second.buffer;const VkDeviceSize dynamicOffset=dynamicOffsets[dynamicIndex];if(value.offset>=value.buffer->size||dynamicOffset>=value.buffer->size-value.offset)continue;const VkDeviceSize totalOffset=value.offset+dynamicOffset;const VkDeviceSize available=value.buffer->size-totalOffset;const VkDeviceSize requested=value.range==VK_WHOLE_SIZE?available:(std::min)(value.range,available);const VkDeviceSize cbvSize=(std::min)(VkDeviceSize(65536),(requested+255)&~VkDeviceSize(255));if(!cbvSize)continue;D3D12_CONSTANT_BUFFER_VIEW_DESC d{};d.BufferLocation=value.buffer->resource->GetGPUVirtualAddress()+NativeBufferOffset(value.buffer)+totalOffset;d.SizeInBytes=static_cast<UINT>(cbvSize);auto h=c->device->resourceHeap->GetCPUDescriptorHandleForHeapStart();h.ptr+=SIZE_T(sets[i]->base[0]+b.binding+e)*c->device->resourceStride;c->device->native->CreateConstantBufferView(&d,h);}}
 	for(uint32_t i=0;i<count&&first+i<layout->setCount;i++)for(uint32_t cls=0;cls<4;cls++)if(sets[i]&&sets[i]->count[cls]){D3D12_GPU_DESCRIPTOR_HANDLE h=(cls==3?c->device->samplerHeap:c->device->resourceHeap)->GetGPUDescriptorHandleForHeapStart();h.ptr+=UINT64(sets[i]->base[cls])*(cls==3?c->device->samplerStride:c->device->resourceStride);const uint32_t rootIndex=(layout->pushDwords?1u:0u)+(first+i)*4+cls;if(point==VK_PIPELINE_BIND_POINT_COMPUTE)c->list->SetComputeRootDescriptorTable(rootIndex,h);else c->list->SetGraphicsRootDescriptorTable(rootIndex,h);}
 }
@@ -1168,9 +1212,12 @@ VKAPI_ATTR VkResult VKAPI_CALL ICreateGraphicsPipelines(VkDevice device,VkPipeli
 	auto blendAlpha=[&](VkBlendFactor f){switch(f){case VK_BLEND_FACTOR_SRC_COLOR:return D3D12_BLEND_SRC_ALPHA;case VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR:return D3D12_BLEND_INV_SRC_ALPHA;case VK_BLEND_FACTOR_DST_COLOR:return D3D12_BLEND_DEST_ALPHA;case VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR:return D3D12_BLEND_INV_DEST_ALPHA;case VK_BLEND_FACTOR_SRC1_COLOR:return D3D12_BLEND_SRC1_ALPHA;case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR:return D3D12_BLEND_INV_SRC1_ALPHA;default:return blend(f);}};
 	for(uint32_t n=0;n<count;n++)
 	{
-		const auto& i=infos[n];bool hasGeometryStage=false;for(uint32_t s=0;s<i.stageCount;s++)if(i.pStages[s].stage==VK_SHADER_STAGE_GEOMETRY_BIT){hasGeometryStage=true;break;}ComPtr<ID3DBlob> vs,ps,gs;for(uint32_t s=0;s<i.stageCount;s++){const auto stage=static_cast<VkShaderStageFlagBits>(i.pStages[s].stage);const bool flipVertY=stage==VK_SHADER_STAGE_GEOMETRY_BIT||(stage==VK_SHADER_STAGE_VERTEX_BIT&&!hasGeometryStage);auto code=CompileStage(i.pStages[s].module,stage,i.pStages[s].pName,flipVertY);if(!code)return VK_ERROR_INVALID_SHADER_NV;if(stage==VK_SHADER_STAGE_VERTEX_BIT)vs=code;else if(stage==VK_SHADER_STAGE_FRAGMENT_BIT)ps=code;else if(stage==VK_SHADER_STAGE_GEOMETRY_BIT)gs=code;}if(!vs)return VK_ERROR_INVALID_SHADER_NV;
+		const auto& i=infos[n];
+		bool presentsToSwapchain=false;
+		if(i.renderPass)for(const auto& ref:i.renderPass->colors)if(ref.attachment!=VK_ATTACHMENT_UNUSED&&ref.attachment<i.renderPass->attachments.size()&&i.renderPass->attachments[ref.attachment].finalLayout==VK_IMAGE_LAYOUT_PRESENT_SRC_KHR){presentsToSwapchain=true;break;}
+		bool hasGeometryStage=false;for(uint32_t s=0;s<i.stageCount;s++)if(i.pStages[s].stage==VK_SHADER_STAGE_GEOMETRY_BIT){hasGeometryStage=true;break;}ComPtr<ID3DBlob> vs,ps,gs;for(uint32_t s=0;s<i.stageCount;s++){const auto stage=static_cast<VkShaderStageFlagBits>(i.pStages[s].stage);const bool flipVertY=!presentsToSwapchain&&(stage==VK_SHADER_STAGE_GEOMETRY_BIT||(stage==VK_SHADER_STAGE_VERTEX_BIT&&!hasGeometryStage));auto code=CompileStage(i.pStages[s].module,stage,i.pStages[s].pName,flipVertY);if(!code)return VK_ERROR_INVALID_SHADER_NV;if(stage==VK_SHADER_STAGE_VERTEX_BIT)vs=code;else if(stage==VK_SHADER_STAGE_FRAGMENT_BIT)ps=code;else if(stage==VK_SHADER_STAGE_GEOMETRY_BIT)gs=code;}if(!vs)return VK_ERROR_INVALID_SHADER_NV;
 		D3D12_GRAPHICS_PIPELINE_STATE_DESC d{};d.pRootSignature=i.layout->root.Get();d.VS={vs->GetBufferPointer(),vs->GetBufferSize()};if(ps)d.PS={ps->GetBufferPointer(),ps->GetBufferSize()};if(gs)d.GS={gs->GetBufferPointer(),gs->GetBufferSize()};d.SampleMask=i.pMultisampleState?i.pMultisampleState->rasterizationSamples?UINT_MAX:UINT_MAX:UINT_MAX;
-		if(i.pRasterizationState){const auto& r=*i.pRasterizationState;d.RasterizerState.FillMode=r.polygonMode==VK_POLYGON_MODE_LINE?D3D12_FILL_MODE_WIREFRAME:D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=r.cullMode==VK_CULL_MODE_FRONT_BIT?D3D12_CULL_MODE_FRONT:(r.cullMode==VK_CULL_MODE_BACK_BIT?D3D12_CULL_MODE_BACK:D3D12_CULL_MODE_NONE);d.RasterizerState.FrontCounterClockwise=r.frontFace!=VK_FRONT_FACE_COUNTER_CLOCKWISE;d.RasterizerState.DepthBias=static_cast<INT>(r.depthBiasConstantFactor);d.RasterizerState.SlopeScaledDepthBias=r.depthBiasSlopeFactor;d.RasterizerState.DepthBiasClamp=r.depthBiasClamp;d.RasterizerState.DepthClipEnable=!r.depthClampEnable;}else{d.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;d.RasterizerState.DepthClipEnable=TRUE;}
+		if(i.pRasterizationState){const auto& r=*i.pRasterizationState;d.RasterizerState.FillMode=r.polygonMode==VK_POLYGON_MODE_LINE?D3D12_FILL_MODE_WIREFRAME:D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=r.cullMode==VK_CULL_MODE_FRONT_BIT?D3D12_CULL_MODE_FRONT:(r.cullMode==VK_CULL_MODE_BACK_BIT?D3D12_CULL_MODE_BACK:D3D12_CULL_MODE_NONE);d.RasterizerState.FrontCounterClockwise=presentsToSwapchain?r.frontFace!=VK_FRONT_FACE_COUNTER_CLOCKWISE:r.frontFace==VK_FRONT_FACE_COUNTER_CLOCKWISE;d.RasterizerState.DepthBias=static_cast<INT>(r.depthBiasConstantFactor);d.RasterizerState.SlopeScaledDepthBias=r.depthBiasSlopeFactor;d.RasterizerState.DepthBiasClamp=r.depthBiasClamp;d.RasterizerState.DepthClipEnable=!r.depthClampEnable;}else{d.RasterizerState.FillMode=D3D12_FILL_MODE_SOLID;d.RasterizerState.CullMode=D3D12_CULL_MODE_NONE;d.RasterizerState.DepthClipEnable=TRUE;}
 		if(i.pMultisampleState)d.BlendState.AlphaToCoverageEnable=i.pMultisampleState->alphaToCoverageEnable;
 		if(i.pColorBlendState)for(uint32_t a=0;a<i.pColorBlendState->attachmentCount&&a<8;a++){const auto& v=i.pColorBlendState->pAttachments[a];auto& rt=d.BlendState.RenderTarget[a];rt.BlendEnable=v.blendEnable;rt.SrcBlend=blend(v.srcColorBlendFactor);rt.DestBlend=blend(v.dstColorBlendFactor);rt.BlendOp=static_cast<D3D12_BLEND_OP>(v.colorBlendOp+1);rt.SrcBlendAlpha=blendAlpha(v.srcAlphaBlendFactor);rt.DestBlendAlpha=blendAlpha(v.dstAlphaBlendFactor);rt.BlendOpAlpha=static_cast<D3D12_BLEND_OP>(v.alphaBlendOp+1);if(rt.BlendOp==D3D12_BLEND_OP_MIN||rt.BlendOp==D3D12_BLEND_OP_MAX){rt.SrcBlend=D3D12_BLEND_ONE;rt.DestBlend=D3D12_BLEND_ONE;}if(rt.BlendOpAlpha==D3D12_BLEND_OP_MIN||rt.BlendOpAlpha==D3D12_BLEND_OP_MAX){rt.SrcBlendAlpha=D3D12_BLEND_ONE;rt.DestBlendAlpha=D3D12_BLEND_ONE;}rt.RenderTargetWriteMask=static_cast<UINT8>(v.colorWriteMask);}else for(auto& rt:d.BlendState.RenderTarget)rt.RenderTargetWriteMask=D3D12_COLOR_WRITE_ENABLE_ALL;
 		if(i.pDepthStencilState){const auto& z=*i.pDepthStencilState;d.DepthStencilState.DepthEnable=z.depthTestEnable;d.DepthStencilState.DepthWriteMask=z.depthWriteEnable?D3D12_DEPTH_WRITE_MASK_ALL:D3D12_DEPTH_WRITE_MASK_ZERO;d.DepthStencilState.DepthFunc=compare(z.depthCompareOp);d.DepthStencilState.StencilEnable=z.stencilTestEnable;d.DepthStencilState.StencilReadMask=static_cast<UINT8>(z.front.compareMask);d.DepthStencilState.StencilWriteMask=static_cast<UINT8>(z.front.writeMask);auto face=[&](const VkStencilOpState& s){D3D12_DEPTH_STENCILOP_DESC o{};o.StencilFailOp=stencilOp(s.failOp);o.StencilDepthFailOp=stencilOp(s.depthFailOp);o.StencilPassOp=stencilOp(s.passOp);o.StencilFunc=compare(s.compareOp);return o;};d.DepthStencilState.FrontFace=face(z.front);d.DepthStencilState.BackFace=face(z.back);}else{d.DepthStencilState.DepthFunc=D3D12_COMPARISON_FUNC_ALWAYS;d.DepthStencilState.FrontFace={D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_STENCIL_OP_KEEP,D3D12_COMPARISON_FUNC_ALWAYS};d.DepthStencilState.BackFace=d.DepthStencilState.FrontFace;}
@@ -1238,10 +1285,161 @@ VKAPI_ATTR VkResult VKAPI_CALL IGetQueryPoolResults(VkDevice device,VkQueryPool 
 VKAPI_ATTR void VKAPI_CALL ICmdCopyImage(VkCommandBuffer c,VkImage src,VkImageLayout,VkImage dst,VkImageLayout,uint32_t count,const VkImageCopy* regions){if(!c||!src||!dst||!src->resource||!dst->resource)return;TransitionImage(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);TransitionImage(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);for(uint32_t i=0;i<count;i++){D3D12_TEXTURE_COPY_LOCATION s{src->resource.Get(),D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX},d{dst->resource.Get(),D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};s.SubresourceIndex=regions[i].srcSubresource.mipLevel+regions[i].srcSubresource.baseArrayLayer*src->info.mipLevels;d.SubresourceIndex=regions[i].dstSubresource.mipLevel+regions[i].dstSubresource.baseArrayLayer*dst->info.mipLevels;D3D12_BOX box{static_cast<UINT>(regions[i].srcOffset.x),static_cast<UINT>(regions[i].srcOffset.y),static_cast<UINT>(regions[i].srcOffset.z),static_cast<UINT>(regions[i].srcOffset.x+regions[i].extent.width),static_cast<UINT>(regions[i].srcOffset.y+regions[i].extent.height),static_cast<UINT>(regions[i].srcOffset.z+regions[i].extent.depth)};c->list->CopyTextureRegion(&d,regions[i].dstOffset.x,regions[i].dstOffset.y,regions[i].dstOffset.z,&s,&box);}}
 VKAPI_ATTR void VKAPI_CALL ICmdCopyBufferToImage(VkCommandBuffer c,VkBuffer src,VkImage dst,VkImageLayout,uint32_t count,const VkBufferImageCopy* regions)
 {
-	if(!c||!src||!dst||!regions||!src->resource||!dst->resource)return;TransitionImage(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);TransitionBuffer(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);const auto desc=dst->resource->GetDesc();const bool blockCompressed=IsBlockCompressedFormat(dst->info.format);for(uint32_t i=0;i<count;i++){const auto& r=regions[i];const UINT sub=r.imageSubresource.mipLevel+r.imageSubresource.baseArrayLayer*dst->info.mipLevels;auto footprintDesc=desc;const uint32_t logicalWidth=r.bufferRowLength?r.bufferRowLength:r.imageExtent.width;const uint32_t logicalHeight=r.bufferImageHeight?r.bufferImageHeight:r.imageExtent.height;footprintDesc.Width=blockCompressed?(logicalWidth+3u)&~3u:logicalWidth;footprintDesc.Height=blockCompressed?(logicalHeight+3u)&~3u:logicalHeight;footprintDesc.DepthOrArraySize=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?static_cast<UINT16>(r.imageExtent.depth):1;footprintDesc.MipLevels=1;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows{};UINT64 rowSize{},total{};c->device->native->GetCopyableFootprints(&footprintDesc,0,1,src->memoryOffset+r.bufferOffset,&fp,&rows,&rowSize,&total);D3D12_TEXTURE_COPY_LOCATION s{};s.pResource=src->resource.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;s.PlacedFootprint=fp;D3D12_TEXTURE_COPY_LOCATION d{};d.pResource=dst->resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;d.SubresourceIndex=sub;const uint32_t copyWidth=blockCompressed?(r.imageExtent.width+3u)&~3u:r.imageExtent.width;const uint32_t copyHeight=blockCompressed?(r.imageExtent.height+3u)&~3u:r.imageExtent.height;D3D12_BOX box{0,0,0,copyWidth,copyHeight,r.imageExtent.depth};c->list->CopyTextureRegion(&d,r.imageOffset.x,r.imageOffset.y,r.imageOffset.z,&s,&box);}}
+	if(!c||!src||!dst||!regions||!src->resource||!dst->resource)return;
+	TransitionImage(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);
+	TransitionBuffer(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);
+	const auto imageDesc=dst->resource->GetDesc();
+	const bool blockCompressed=IsBlockCompressedFormat(dst->info.format);
+	for(uint32_t i=0;i<count;i++)
+	{
+		const auto& r=regions[i];
+		const uint32_t logicalWidth=r.bufferRowLength?r.bufferRowLength:r.imageExtent.width;
+		const uint32_t logicalHeight=r.bufferImageHeight?r.bufferImageHeight:r.imageExtent.height;
+		auto footprintDesc=imageDesc;
+		footprintDesc.Width=blockCompressed?(logicalWidth+3u)&~3u:logicalWidth;
+		footprintDesc.Height=blockCompressed?(logicalHeight+3u)&~3u:logicalHeight;
+		footprintDesc.DepthOrArraySize=imageDesc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?static_cast<UINT16>(r.imageExtent.depth):1;
+		footprintDesc.MipLevels=1;
+
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+		UINT sourceRows{};
+		UINT64 sourceRowPitch{},temporarySize{};
+		c->device->native->GetCopyableFootprints(&footprintDesc,0,1,0,&footprint,&sourceRows,&sourceRowPitch,&temporarySize);
+		if(!sourceRows||!sourceRowPitch||!temporarySize)continue;
+
+		D3D12_HEAP_PROPERTIES heap{};
+		heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC bufferDesc{};
+		bufferDesc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufferDesc.Width=(std::max)(UINT64(4),temporarySize);
+		bufferDesc.Height=1;
+		bufferDesc.DepthOrArraySize=1;
+		bufferDesc.MipLevels=1;
+		bufferDesc.SampleDesc.Count=1;
+		bufferDesc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		ComPtr<ID3D12Resource> temporary;
+		if(FAILED(c->device->native->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&bufferDesc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&temporary))))
+		{
+			cemuLog_log(LogType::Force,"D3D12 failed to allocate aligned staging buffer for buffer-to-image copy");
+			continue;
+		}
+
+		const UINT copyRows=blockCompressed?(r.imageExtent.height+3u)/4u:r.imageExtent.height;
+		const UINT copyDepth=(std::max)(1u,r.imageExtent.depth);
+		const UINT64 sourceBase=NativeBufferOffset(src)+r.bufferOffset;
+		const UINT64 sourceSlicePitch=sourceRowPitch*sourceRows;
+		const UINT64 destinationSlicePitch=UINT64(footprint.Footprint.RowPitch)*sourceRows;
+		const UINT64 nativeBufferSize=src->resource->GetDesc().Width;
+		bool valid=true;
+		for(UINT z=0;z<copyDepth&&valid;z++)
+			for(UINT y=0;y<copyRows;y++)
+			{
+				const UINT64 sourceOffset=sourceBase+UINT64(z)*sourceSlicePitch+UINT64(y)*sourceRowPitch;
+				const UINT64 destinationOffset=footprint.Offset+UINT64(z)*destinationSlicePitch+UINT64(y)*footprint.Footprint.RowPitch;
+				if(sourceOffset>nativeBufferSize||sourceRowPitch>nativeBufferSize-sourceOffset||destinationOffset>temporarySize||sourceRowPitch>temporarySize-destinationOffset){valid=false;break;}
+				c->list->CopyBufferRegion(temporary.Get(),destinationOffset,src->resource.Get(),sourceOffset,sourceRowPitch);
+			}
+		if(!valid)
+		{
+			cemuLog_log(LogType::Force,"D3D12 skipped out-of-range buffer-to-image copy");
+			continue;
+		}
+
+		D3D12_RESOURCE_BARRIER barrier{};
+		barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition={temporary.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE};
+		c->list->ResourceBarrier(1,&barrier);
+		D3D12_TEXTURE_COPY_LOCATION source{};
+		source.pResource=temporary.Get();
+		source.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		source.PlacedFootprint=footprint;
+		D3D12_TEXTURE_COPY_LOCATION destination{};
+		destination.pResource=dst->resource.Get();
+		destination.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		destination.SubresourceIndex=r.imageSubresource.mipLevel+r.imageSubresource.baseArrayLayer*dst->info.mipLevels;
+		const uint32_t copyWidth=blockCompressed?(r.imageExtent.width+3u)&~3u:r.imageExtent.width;
+		const uint32_t copyHeight=blockCompressed?(r.imageExtent.height+3u)&~3u:r.imageExtent.height;
+		D3D12_BOX box{0,0,0,copyWidth,copyHeight,r.imageExtent.depth};
+		c->list->CopyTextureRegion(&destination,r.imageOffset.x,r.imageOffset.y,r.imageOffset.z,&source,&box);
+		c->transientResources.push_back(std::move(temporary));
+	}
+}
 VKAPI_ATTR void VKAPI_CALL ICmdCopyImageToBuffer(VkCommandBuffer c,VkImage src,VkImageLayout,VkBuffer dst,uint32_t count,const VkBufferImageCopy* regions)
 {
-	if(!c||!src||!dst||!regions||!src->resource||!dst->resource)return;TransitionImage(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);const auto desc=src->resource->GetDesc();for(uint32_t i=0;i<count;i++){const auto& r=regions[i];const UINT sub=r.imageSubresource.mipLevel+r.imageSubresource.baseArrayLayer*src->info.mipLevels;auto footprintDesc=desc;footprintDesc.Width=r.bufferRowLength?r.bufferRowLength:r.imageExtent.width;footprintDesc.Height=r.bufferImageHeight?r.bufferImageHeight:r.imageExtent.height;footprintDesc.DepthOrArraySize=desc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?static_cast<UINT16>(r.imageExtent.depth):1;footprintDesc.MipLevels=1;D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};UINT rows{};UINT64 rowSize{},total{};c->device->native->GetCopyableFootprints(&footprintDesc,0,1,dst->memoryOffset+r.bufferOffset,&fp,&rows,&rowSize,&total);D3D12_TEXTURE_COPY_LOCATION s{};s.pResource=src->resource.Get();s.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;s.SubresourceIndex=sub;D3D12_TEXTURE_COPY_LOCATION d{};d.pResource=dst->resource.Get();d.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;d.PlacedFootprint=fp;D3D12_BOX box{static_cast<UINT>(r.imageOffset.x),static_cast<UINT>(r.imageOffset.y),static_cast<UINT>(r.imageOffset.z),static_cast<UINT>(r.imageOffset.x+r.imageExtent.width),static_cast<UINT>(r.imageOffset.y+r.imageExtent.height),static_cast<UINT>(r.imageOffset.z+r.imageExtent.depth)};c->list->CopyTextureRegion(&d,0,0,0,&s,&box);}}
+	if(!c||!src||!dst||!regions||!src->resource||!dst->resource)return;
+	if(dst->memory&&dst->memory->type==1){cemuLog_log(LogType::Force,"D3D12 cannot copy an image into an upload-heap buffer");return;}
+	TransitionImage(c,src,D3D12_RESOURCE_STATE_COPY_SOURCE);
+	TransitionBuffer(c,dst,D3D12_RESOURCE_STATE_COPY_DEST);
+	const auto imageDesc=src->resource->GetDesc();
+	const bool blockCompressed=IsBlockCompressedFormat(src->info.format);
+	for(uint32_t i=0;i<count;i++)
+	{
+		const auto& r=regions[i];
+		const uint32_t logicalWidth=r.bufferRowLength?r.bufferRowLength:r.imageExtent.width;
+		const uint32_t logicalHeight=r.bufferImageHeight?r.bufferImageHeight:r.imageExtent.height;
+		auto footprintDesc=imageDesc;
+		footprintDesc.Width=blockCompressed?(logicalWidth+3u)&~3u:logicalWidth;
+		footprintDesc.Height=blockCompressed?(logicalHeight+3u)&~3u:logicalHeight;
+		footprintDesc.DepthOrArraySize=imageDesc.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE3D?static_cast<UINT16>(r.imageExtent.depth):1;
+		footprintDesc.MipLevels=1;
+
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
+		UINT destinationRows{};
+		UINT64 destinationRowPitch{},temporarySize{};
+		c->device->native->GetCopyableFootprints(&footprintDesc,0,1,0,&footprint,&destinationRows,&destinationRowPitch,&temporarySize);
+		if(!destinationRows||!destinationRowPitch||!temporarySize)continue;
+
+		D3D12_HEAP_PROPERTIES heap{};
+		heap.Type=D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC bufferDesc{};
+		bufferDesc.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;
+		bufferDesc.Width=(std::max)(UINT64(4),temporarySize);
+		bufferDesc.Height=1;
+		bufferDesc.DepthOrArraySize=1;
+		bufferDesc.MipLevels=1;
+		bufferDesc.SampleDesc.Count=1;
+		bufferDesc.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+		ComPtr<ID3D12Resource> temporary;
+		if(FAILED(c->device->native->CreateCommittedResource(&heap,D3D12_HEAP_FLAG_NONE,&bufferDesc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&temporary))))
+		{
+			cemuLog_log(LogType::Force,"D3D12 failed to allocate aligned staging buffer for image-to-buffer copy");
+			continue;
+		}
+
+		D3D12_TEXTURE_COPY_LOCATION source{};
+		source.pResource=src->resource.Get();
+		source.Type=D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		source.SubresourceIndex=r.imageSubresource.mipLevel+r.imageSubresource.baseArrayLayer*src->info.mipLevels;
+		D3D12_TEXTURE_COPY_LOCATION destination{};
+		destination.pResource=temporary.Get();
+		destination.Type=D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+		destination.PlacedFootprint=footprint;
+		D3D12_BOX box{static_cast<UINT>(r.imageOffset.x),static_cast<UINT>(r.imageOffset.y),static_cast<UINT>(r.imageOffset.z),static_cast<UINT>(r.imageOffset.x+r.imageExtent.width),static_cast<UINT>(r.imageOffset.y+r.imageExtent.height),static_cast<UINT>(r.imageOffset.z+r.imageExtent.depth)};
+		c->list->CopyTextureRegion(&destination,0,0,0,&source,&box);
+
+		D3D12_RESOURCE_BARRIER barrier{};
+		barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier.Transition={temporary.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,D3D12_RESOURCE_STATE_COPY_DEST,D3D12_RESOURCE_STATE_COPY_SOURCE};
+		c->list->ResourceBarrier(1,&barrier);
+		const UINT copyRows=blockCompressed?(r.imageExtent.height+3u)/4u:r.imageExtent.height;
+		const UINT copyDepth=(std::max)(1u,r.imageExtent.depth);
+		const UINT64 sourceSlicePitch=UINT64(footprint.Footprint.RowPitch)*destinationRows;
+		const UINT64 destinationSlicePitch=destinationRowPitch*destinationRows;
+		const UINT64 destinationBase=NativeBufferOffset(dst)+r.bufferOffset;
+		const UINT64 nativeBufferSize=dst->resource->GetDesc().Width;
+		bool valid=true;
+		for(UINT z=0;z<copyDepth&&valid;z++)
+			for(UINT y=0;y<copyRows;y++)
+			{
+				const UINT64 sourceOffset=footprint.Offset+UINT64(z)*sourceSlicePitch+UINT64(y)*footprint.Footprint.RowPitch;
+				const UINT64 destinationOffset=destinationBase+UINT64(z)*destinationSlicePitch+UINT64(y)*destinationRowPitch;
+				if(sourceOffset>temporarySize||destinationRowPitch>temporarySize-sourceOffset||destinationOffset>nativeBufferSize||destinationRowPitch>nativeBufferSize-destinationOffset){valid=false;break;}
+				c->list->CopyBufferRegion(dst->resource.Get(),destinationOffset,temporary.Get(),sourceOffset,destinationRowPitch);
+			}
+		if(!valid)cemuLog_log(LogType::Force,"D3D12 skipped out-of-range image-to-buffer row copy");
+		c->transientResources.push_back(std::move(temporary));
+	}
+}
 VKAPI_ATTR void VKAPI_CALL ICmdBlitImage(VkCommandBuffer c,VkImage src,VkImageLayout,VkImage dst,VkImageLayout,uint32_t count,const VkImageBlit* regions,VkFilter)
 {
 	if(!c||!src||!dst||!src->resource||!dst->resource)return;for(uint32_t i=0;i<count;i++){const auto& r=regions[i];const int sw=std::abs(r.srcOffsets[1].x-r.srcOffsets[0].x),sh=std::abs(r.srcOffsets[1].y-r.srcOffsets[0].y),dw=std::abs(r.dstOffsets[1].x-r.dstOffsets[0].x),dh=std::abs(r.dstOffsets[1].y-r.dstOffsets[0].y);if(sw==dw&&sh==dh){VkImageCopy copy{};copy.srcSubresource=r.srcSubresource;copy.srcOffset=r.srcOffsets[0];copy.dstSubresource=r.dstSubresource;copy.dstOffset=r.dstOffsets[0];copy.extent={static_cast<uint32_t>(sw),static_cast<uint32_t>(sh),1};ICmdCopyImage(c,src,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,dst,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&copy);continue;}const uint32_t base=c->device->resourceCursor.fetch_add(2);if(base+2>65536)continue;auto cpu=c->device->resourceHeap->GetCPUDescriptorHandleForHeapStart();auto gpu=c->device->resourceHeap->GetGPUDescriptorHandleForHeapStart();D3D12_CPU_DESCRIPTOR_HANDLE srvCpu{cpu.ptr+SIZE_T(base)*c->device->resourceStride},uavCpu{cpu.ptr+SIZE_T(base+1)*c->device->resourceStride};D3D12_GPU_DESCRIPTOR_HANDLE srvGpu{gpu.ptr+UINT64(base)*c->device->resourceStride},uavGpu{gpu.ptr+UINT64(base+1)*c->device->resourceStride};D3D12_SHADER_RESOURCE_VIEW_DESC sv{};sv.Format=src->resource->GetDesc().Format;sv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;sv.ViewDimension=D3D12_SRV_DIMENSION_TEXTURE2D;sv.Texture2D.MostDetailedMip=r.srcSubresource.mipLevel;sv.Texture2D.MipLevels=1;c->device->native->CreateShaderResourceView(src->resource.Get(),&sv,srvCpu);D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};uv.Format=dst->resource->GetDesc().Format;uv.ViewDimension=D3D12_UAV_DIMENSION_TEXTURE2D;uv.Texture2D.MipSlice=r.dstSubresource.mipLevel;c->device->native->CreateUnorderedAccessView(dst->resource.Get(),nullptr,&uv,uavCpu);D3D12_RESOURCE_BARRIER barriers[2]{};barriers[0].Type=barriers[1].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barriers[0].Transition={src->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,src->state,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};barriers[1].Transition={dst->resource.Get(),D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,dst->state,D3D12_RESOURCE_STATE_UNORDERED_ACCESS};c->list->ResourceBarrier(2,barriers);src->state=D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;dst->state=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;ID3D12DescriptorHeap* heaps[]={c->device->resourceHeap.Get()};c->list->SetDescriptorHeaps(1,heaps);c->list->SetComputeRootSignature(c->device->blitRoot.Get());c->list->SetPipelineState(c->device->blitPipeline.Get());c->list->SetComputeRootDescriptorTable(0,srvGpu);c->list->SetComputeRootDescriptorTable(1,uavGpu);const int constants[8]={r.srcOffsets[0].x,r.srcOffsets[0].y,sw,sh,r.dstOffsets[0].x,r.dstOffsets[0].y,dw,dh};c->list->SetComputeRoot32BitConstants(2,8,constants,0);c->list->Dispatch((dw+7)/8,(dh+7)/8,1);}}
@@ -1371,7 +1569,7 @@ PFN_vkVoidFunction Lookup(std::string_view n)
 	P(AllocateMemory); P(FreeMemory); P(CreateBuffer); P(DestroyBuffer); P(GetBufferMemoryRequirements); P(BindBufferMemory); P(MapMemory); P(UnmapMemory); P(FlushMappedMemoryRanges); P(InvalidateMappedMemoryRanges);
 	P(CreateImage); P(DestroyImage); P(GetImageMemoryRequirements); P(BindImageMemory); P(CreateCommandPool); P(DestroyCommandPool); P(AllocateCommandBuffers); P(FreeCommandBuffers); P(BeginCommandBuffer); P(EndCommandBuffer); P(ResetCommandBuffer); P(QueueSubmit);
 	P(CreateFence); P(DestroyFence); P(GetFenceStatus); P(ResetFences); P(WaitForFences); P(CreateSemaphore); P(DestroySemaphore); P(CreateEvent); P(DestroyEvent); P(GetEventStatus); P(CmdSetEvent); P(CmdWaitEvents); P(CmdPipelineBarrier); P(CmdPipelineBarrier2KHR); P(CmdCopyBuffer); P(CmdBindIndexBuffer); P(CmdBindVertexBuffers); P(CmdSetViewport); P(CmdSetScissor); P(CmdSetBlendConstants); P(CmdSetDepthBias); P(CmdDraw); P(CmdDrawIndexed);
-	P(CreateShaderModule);P(DestroyShaderModule);P(CreateImageView);P(DestroyImageView);P(CreateSampler);P(DestroySampler);P(CreateDescriptorSetLayout);P(DestroyDescriptorSetLayout);P(CreateDescriptorPool);P(DestroyDescriptorPool);P(AllocateDescriptorSets);P(FreeDescriptorSets);P(UpdateDescriptorSets);P(CreatePipelineLayout);P(DestroyPipelineLayout);P(CreateGraphicsPipelines);P(CreateComputePipelines);P(DestroyPipeline);P(CmdBindPipeline);P(CmdBindDescriptorSets);P(CmdPushConstants);P(CmdDispatch);P(CreatePipelineCache);P(DestroyPipelineCache);P(GetPipelineCacheData);P(MergePipelineCaches);
+	P(CreateShaderModule);P(DestroyShaderModule);P(CreateImageView);P(DestroyImageView);P(CreateSampler);P(DestroySampler);P(CreateDescriptorSetLayout);P(DestroyDescriptorSetLayout);P(CreateDescriptorPool);P(DestroyDescriptorPool);P(ResetDescriptorPool);P(AllocateDescriptorSets);P(FreeDescriptorSets);P(UpdateDescriptorSets);P(CreatePipelineLayout);P(DestroyPipelineLayout);P(CreateGraphicsPipelines);P(CreateComputePipelines);P(DestroyPipeline);P(CmdBindPipeline);P(CmdBindDescriptorSets);P(CmdPushConstants);P(CmdDispatch);P(CreatePipelineCache);P(DestroyPipelineCache);P(GetPipelineCacheData);P(MergePipelineCaches);
 	P(CreateQueryPool);P(DestroyQueryPool);P(GetQueryPoolResults);P(CmdResetQueryPool);P(CmdBeginQuery);P(CmdEndQuery);P(CmdCopyQueryPoolResults);P(CmdCopyImage);P(CmdCopyBufferToImage);P(CmdCopyImageToBuffer);P(CmdBlitImage);P(CmdClearColorImage);P(CmdClearDepthStencilImage);P(CmdClearAttachments);P(CreateRenderPass);P(DestroyRenderPass);P(CreateFramebuffer);P(DestroyFramebuffer);P(CmdBeginRenderPass);P(CmdEndRenderPass);P(CmdBeginRenderingKHR);P(CmdEndRenderingKHR);P(CmdSetAttachmentFeedbackLoopEnableEXT);P(CreateSwapchainKHR);P(DestroySwapchainKHR);P(GetSwapchainImagesKHR);P(AcquireNextImageKHR);P(QueuePresentKHR);P(WaitForPresentKHR);
 #undef P
 	return nullptr;
@@ -1408,7 +1606,7 @@ bool InitializeDeviceDispatch(VkDevice)
 	vkCreateFence=ICreateFence;vkDestroyFence=IDestroyFence;vkGetFenceStatus=IGetFenceStatus;vkResetFences=IResetFences;vkWaitForFences=IWaitForFences;vkCreateSemaphore=ICreateSemaphore;vkDestroySemaphore=IDestroySemaphore;vkCreateEvent=ICreateEvent;vkDestroyEvent=IDestroyEvent;vkGetEventStatus=IGetEventStatus;vkCmdSetEvent=ICmdSetEvent;vkCmdWaitEvents=ICmdWaitEvents;
 	vkCmdPipelineBarrier=ICmdPipelineBarrier;vkCmdPipelineBarrier2KHR=ICmdPipelineBarrier2KHR;vkCmdCopyBuffer=ICmdCopyBuffer;vkCmdBindIndexBuffer=ICmdBindIndexBuffer;vkCmdBindVertexBuffers=ICmdBindVertexBuffers;vkCmdSetViewport=ICmdSetViewport;vkCmdSetScissor=ICmdSetScissor;vkCmdSetBlendConstants=ICmdSetBlendConstants;vkCmdSetDepthBias=ICmdSetDepthBias;vkCmdDraw=ICmdDraw;vkCmdDrawIndexed=ICmdDrawIndexed;
 	vkCreateShaderModule=ICreateShaderModule;vkDestroyShaderModule=IDestroyShaderModule;vkCreateImageView=ICreateImageView;vkDestroyImageView=IDestroyImageView;vkCreateSampler=ICreateSampler;vkDestroySampler=IDestroySampler;
-	vkCreateDescriptorSetLayout=ICreateDescriptorSetLayout;vkDestroyDescriptorSetLayout=IDestroyDescriptorSetLayout;vkCreateDescriptorPool=ICreateDescriptorPool;vkDestroyDescriptorPool=IDestroyDescriptorPool;vkAllocateDescriptorSets=IAllocateDescriptorSets;vkFreeDescriptorSets=IFreeDescriptorSets;vkUpdateDescriptorSets=IUpdateDescriptorSets;
+	vkCreateDescriptorSetLayout=ICreateDescriptorSetLayout;vkDestroyDescriptorSetLayout=IDestroyDescriptorSetLayout;vkCreateDescriptorPool=ICreateDescriptorPool;vkDestroyDescriptorPool=IDestroyDescriptorPool;vkResetDescriptorPool=IResetDescriptorPool;vkAllocateDescriptorSets=IAllocateDescriptorSets;vkFreeDescriptorSets=IFreeDescriptorSets;vkUpdateDescriptorSets=IUpdateDescriptorSets;
 	vkCreatePipelineLayout=ICreatePipelineLayout;vkDestroyPipelineLayout=IDestroyPipelineLayout;vkCreateGraphicsPipelines=ICreateGraphicsPipelines;vkCreateComputePipelines=ICreateComputePipelines;vkDestroyPipeline=IDestroyPipeline;vkCmdBindPipeline=ICmdBindPipeline;vkCmdBindDescriptorSets=ICmdBindDescriptorSets;vkCmdPushConstants=ICmdPushConstants;vkCmdDispatch=ICmdDispatch;vkCreatePipelineCache=ICreatePipelineCache;vkDestroyPipelineCache=IDestroyPipelineCache;vkGetPipelineCacheData=IGetPipelineCacheData;vkMergePipelineCaches=IMergePipelineCaches;
 	vkCreateQueryPool=ICreateQueryPool;vkDestroyQueryPool=IDestroyQueryPool;vkGetQueryPoolResults=IGetQueryPoolResults;vkCmdResetQueryPool=ICmdResetQueryPool;vkCmdBeginQuery=ICmdBeginQuery;vkCmdEndQuery=ICmdEndQuery;vkCmdCopyQueryPoolResults=ICmdCopyQueryPoolResults;vkCmdCopyImage=ICmdCopyImage;vkCmdCopyBufferToImage=ICmdCopyBufferToImage;vkCmdCopyImageToBuffer=ICmdCopyImageToBuffer;vkCmdBlitImage=ICmdBlitImage;vkCmdClearColorImage=ICmdClearColorImage;vkCmdClearDepthStencilImage=ICmdClearDepthStencilImage;vkCmdClearAttachments=ICmdClearAttachments;
 	vkCreateRenderPass=ICreateRenderPass;vkDestroyRenderPass=IDestroyRenderPass;vkCreateFramebuffer=ICreateFramebuffer;vkDestroyFramebuffer=IDestroyFramebuffer;vkCmdBeginRenderPass=ICmdBeginRenderPass;vkCmdEndRenderPass=ICmdEndRenderPass;vkCmdBeginRenderingKHR=ICmdBeginRenderingKHR;vkCmdEndRenderingKHR=ICmdEndRenderingKHR;vkCmdSetAttachmentFeedbackLoopEnableEXT=ICmdSetAttachmentFeedbackLoopEnableEXT;

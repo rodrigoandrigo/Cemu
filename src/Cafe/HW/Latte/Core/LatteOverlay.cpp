@@ -312,7 +312,10 @@ void LatteOverlay_RenderNotifications(ImVec2& position, ImVec2& pivot, sint32 di
 		}
 	}
 
-	if (config.notification.shader_compiling)
+	// Shader and pipeline counters are global. Rendering them for both the TV and
+	// GamePad views consumes the counters twice and, on the single-surface UWP
+	// host, leaves two different progress windows visible in the same output.
+	if (!pad && config.notification.shader_compiling)
 	{
 		static int32_t s_shader_count = 0;
 		static int32_t s_shader_count_async = 0;

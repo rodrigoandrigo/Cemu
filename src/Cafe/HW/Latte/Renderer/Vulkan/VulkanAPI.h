@@ -238,6 +238,7 @@ VKFUNC_DEVICE(vkDestroySampler);
 VKFUNC_DEVICE(vkCreateDescriptorSetLayout);
 VKFUNC_DEVICE(vkAllocateDescriptorSets);
 VKFUNC_DEVICE(vkFreeDescriptorSets);
+VKFUNC_DEVICE(vkResetDescriptorPool);
 VKFUNC_DEVICE(vkUpdateDescriptorSets);
 VKFUNC_DEVICE(vkCreateDescriptorPool);
 VKFUNC_DEVICE(vkDestroyDescriptorPool);
